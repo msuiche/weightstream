@@ -103,8 +103,7 @@ pub struct ModelConfig {
 impl ModelConfig {
     pub fn from_file(path: &Path) -> std::io::Result<Self> {
         let text = std::fs::read_to_string(path)?;
-        Self::from_str(&text)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        Self::from_str(&text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
     pub fn from_str(text: &str) -> Result<Self, serde_json::Error> {

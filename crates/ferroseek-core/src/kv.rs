@@ -71,7 +71,12 @@ pub fn window_bytes(cfg: &ModelConfig, dtype_bytes: u64) -> Option<u64> {
 
 /// Tokens that fit in `budget_bytes`, after `reserve_bytes` for activation
 /// workspace and the memory guard. Window rings are charged once.
-pub fn pool_tokens(cfg: &ModelConfig, dtype_bytes: u64, budget_bytes: u64, reserve_bytes: u64) -> Option<u64> {
+pub fn pool_tokens(
+    cfg: &ModelConfig,
+    dtype_bytes: u64,
+    budget_bytes: u64,
+    reserve_bytes: u64,
+) -> Option<u64> {
     let per = kv_bytes_per_token(cfg, dtype_bytes)?;
     let windows = window_bytes(cfg, dtype_bytes)?;
     Some(budget_bytes.saturating_sub(reserve_bytes + windows) / per)
@@ -134,7 +139,10 @@ pub(crate) mod tests {
         assert_eq!(cfg.num_hidden_layers, 40);
         assert!(cfg.is_dsa());
         assert_eq!(cfg.kv_width(), Some(512));
-        assert!(cfg.extra.contains_key("vision_config") || cfg.extra.contains_key("quantization_config"));
+        assert!(
+            cfg.extra.contains_key("vision_config")
+                || cfg.extra.contains_key("quantization_config")
+        );
     }
 
     #[test]

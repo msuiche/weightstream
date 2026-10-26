@@ -40,7 +40,14 @@ fn push_ffn(set: &mut BTreeSet<String>, prefix: &str, n_experts: u32) {
 }
 
 fn push_layer_extras(set: &mut BTreeSet<String>, prefix: &str) {
-    for hc in ["hc_attn_base", "hc_attn_fn", "hc_attn_scale", "hc_ffn_base", "hc_ffn_fn", "hc_ffn_scale"] {
+    for hc in [
+        "hc_attn_base",
+        "hc_attn_fn",
+        "hc_attn_scale",
+        "hc_ffn_base",
+        "hc_ffn_fn",
+        "hc_ffn_scale",
+    ] {
         set.insert(format!("{prefix}.{hc}"));
     }
     set.insert(format!("{prefix}.attn_norm.weight"));
@@ -90,7 +97,11 @@ pub fn expected_tensors(cfg: &ModelConfig) -> BTreeSet<String> {
         let prefix = format!("mtp.{k}");
         push_attn(&mut set, &prefix);
         // the drafter has its own, smaller expert pool (128 on DS4.1F)
-        push_ffn(&mut set, &prefix, cfg.dspark_n_routed_experts.unwrap_or(n_experts));
+        push_ffn(
+            &mut set,
+            &prefix,
+            cfg.dspark_n_routed_experts.unwrap_or(n_experts),
+        );
         push_layer_extras(&mut set, &prefix);
         if k == 0 {
             // only the first drafter block carries main_norm
