@@ -70,9 +70,18 @@ impl Prof {
             ..Default::default()
         }
     }
-    fn add(&mut self, slot: &mut u64, t: Instant) {
-        if self.on {
-            *slot += t.elapsed().as_micros() as u64;
+    fn add_us(&mut self, slot: usize, t: Instant) {
+        if !self.on {
+            return;
+        }
+        let us = t.elapsed().as_micros() as u64;
+        match slot {
+            0 => self.attn_us += us,
+            1 => self.moe_us += us,
+            2 => self.gate_us += us,
+            3 => self.engram_us += us,
+            4 => self.head_us += us,
+            _ => self.other_us += us,
         }
     }
     pub fn summary(&self) -> String {
@@ -1388,7 +1397,7 @@ impl GpuModel<'static> {
                     );
                 }
             }
-            prof.add(&mut prof.engram_us, t_eng);
+            prof.add_us(3, t_eng);
 
             // attention sublayer wiring (spec §2, model.py:970-996)
             let hc_dim = hc * dim;
@@ -1439,7 +1448,7 @@ impl GpuModel<'static> {
                 sharding,
                 comm_opt.as_deref_mut(),
             )?;
-            prof.add(&mut prof.attn_us, t_att);
+            prof.add_us(0, t_att);
 
             {
                 let h_next = 1 - h_cur;
@@ -1499,7 +1508,7 @@ impl GpuModel<'static> {
                 comm_opt.as_deref_mut(),
                 prof,
             )?;
-            prof.add(&mut prof.moe_us, t_moe);
+            prof.add_us(1, t_moe);
 
             {
                 let h_next = 1 - h_cur;
@@ -1559,7 +1568,7 @@ impl GpuModel<'static> {
         let mut out = vec![0.0f32; cfg.vocab as usize];
         s.logits.copy_to(&mut out).map_err(cuda_err)?;
         prof.steps += 1;
-        prof.add(&mut prof.head_us, t_head);
+        prof.add_us(4, t_head);
         Ok(out)
     }
 
@@ -2597,7 +2606,7 @@ fn moe_step(
     let mut i_host = vec![0i32; top_k];
     s.gate_w_out.copy_to(&mut w_host).map_err(cuda_err)?;
     s.gate_i_out.copy_to(&mut i_host).map_err(cuda_err)?;
-    prof.add(&mut prof.gate_us, t_gate);
+    prof.add_us(2, t_gate);
 
     crate::dump::i32s(
         format!("d_pos{}_gorder{l}.i32", crate::dump::pos()),
