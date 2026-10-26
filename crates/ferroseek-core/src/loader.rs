@@ -58,7 +58,10 @@ impl Checkpoint {
             .clone();
         let shard = self.shard(&shard)?;
         shard.header.tensors.get(tensor).cloned().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{tensor} not in shard header"))
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{tensor} not in shard header"),
+            )
         })
     }
 
@@ -71,11 +74,66 @@ impl Checkpoint {
             .clone();
         let shard = self.shard(&shard_name)?;
         let meta = shard.header.tensors.get(tensor).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{tensor} not in shard header"))
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{tensor} not in shard header"),
+            )
         })?;
         let start = shard.header.data_start + meta.data_offsets[0];
         let end = shard.header.data_start + meta.data_offsets[1];
         Ok(&shard.mmap[start as usize..end as usize])
+    }
+
+    /// Zero-copy payload bytes for two tensors at once (e.g. a quantized
+    /// weight and its scale tensor, which may live in different shards).
+    pub fn bytes2(&mut self, a: &str, b: &str) -> std::io::Result<(&[u8], &[u8])> {
+        let shard_a = self
+            .index
+            .get(a)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, a))?
+            .clone();
+        let shard_b = self
+            .index
+            .get(b)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, b))?
+            .clone();
+        // map both shards first (mutable), then take two immutable borrows
+        self.shard(&shard_a)?;
+        self.shard(&shard_b)?;
+        let bounds = |map: &BTreeMap<String, Shard>,
+                      shard: &str,
+                      name: &str|
+         -> std::io::Result<(usize, usize)> {
+            let shard = map
+                .get(shard)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, shard))?;
+            let meta = shard.header.tensors.get(name).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{name} not in shard header"),
+                )
+            })?;
+            Ok((
+                (shard.header.data_start + meta.data_offsets[0]) as usize,
+                (shard.header.data_start + meta.data_offsets[1]) as usize,
+            ))
+        };
+        let (sa, ea) = bounds(&self.shards, &shard_a, a)?;
+        let (sb, eb) = bounds(&self.shards, &shard_b, b)?;
+        let (a_slice, b_slice) = match (
+            &shard_a == &shard_b,
+            (&self.shards.get(&shard_a), &self.shards.get(&shard_b)),
+        ) {
+            (true, (Some(x), _)) => (&x.mmap[sa..ea], &x.mmap[sb..eb]),
+            (false, (Some(x), Some(y))) => (&x.mmap[sa..ea], &y.mmap[sb..eb]),
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "shard vanished",
+                ))
+            }
+        };
+        Ok((a_slice, b_slice))
     }
 }
 
@@ -99,8 +157,11 @@ mod tests {
             "metadata": {"total_size": 16},
             "weight_map": {"embed.weight": "model-00001-of-00001.safetensors"}
         });
-        std::fs::write(dir.join("model.safetensors.index.json"), serde_json::to_vec(&idx).unwrap())
-            .unwrap();
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&idx).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
