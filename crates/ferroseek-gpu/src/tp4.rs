@@ -88,7 +88,9 @@ pub struct Session {
 impl Session {
     /// Hand the ring to the engine (once).
     pub fn take_comm(&mut self) -> Box<dyn Collectives> {
-        self.comm.take().expect("tp4 comm handed to the engine once")
+        self.comm
+            .take()
+            .expect("tp4 comm handed to the engine once")
     }
 }
 
@@ -169,7 +171,10 @@ pub fn join(
     let cfg = map
         .ring_cfg(me)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    eprintln!("tp4: rank {me} ({}) elems {elems} wait {wait_ms} ms", my_node.name);
+    eprintln!(
+        "tp4: rank {me} ({}) elems {elems} wait {wait_ms} ms",
+        my_node.name
+    );
 
     let verbs = Verbs::open().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
     let (mut ring, my_ep) = Ring::new(verbs, &cfg, elems, Duration::from_millis(wait_ms))

@@ -15,12 +15,9 @@ use std::path::Path;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (Some(cfg_path), Some(tokens), Some(map_path), Some(out)) = (
-        args.first(),
-        args.get(1),
-        args.get(2),
-        args.get(3),
-    ) else {
+    let (Some(cfg_path), Some(tokens), Some(map_path), Some(out)) =
+        (args.first(), args.get(1), args.get(2), args.get(3))
+    else {
         eprintln!("usage: dump-engram-hash <config.json> <tokens.csv> <token-map.i32> <out-dir>");
         std::process::exit(2);
     };
@@ -42,18 +39,10 @@ fn main() {
     std::fs::create_dir_all(out).expect("mkdir");
     let mut cache: Vec<i64> = Vec::new();
     for (p, &t) in tokens.iter().enumerate() {
-        let per_layer = hash_ids(
-            &rcfg,
-            &layout,
-            &mut cache,
-            Some(&token_map),
-            t,
-            p as u64,
-        );
+        let per_layer = hash_ids(&rcfg, &layout, &mut cache, Some(&token_map), t, p as u64);
         for (l, hashes) in per_layer.iter().enumerate() {
             let bytes: Vec<u8> = hashes.iter().flat_map(|&v| v.to_le_bytes()).collect();
-            std::fs::write(out.join(format!("hash_pos{p}_l{l}.i64")), bytes)
-                .expect("write");
+            std::fs::write(out.join(format!("hash_pos{p}_l{l}.i64")), bytes).expect("write");
         }
     }
     eprintln!(

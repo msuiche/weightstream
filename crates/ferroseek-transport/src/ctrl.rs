@@ -32,7 +32,10 @@ pub enum Msg {
     /// worker -> head, first message on connect
     Hello { rank: u8 },
     /// head -> worker: run this phase (cmd carries per-phase parameters)
-    Go { phase: Phase, cmd: serde_json::Value },
+    Go {
+        phase: Phase,
+        cmd: serde_json::Value,
+    },
     /// worker -> head: phase done; data always carries "rank"
     Ready { data: serde_json::Value },
     /// either way: something failed; every rank must fail-stop
@@ -142,7 +145,11 @@ impl Head {
                     if self.workers.iter().any(|w| w.rank == rank) {
                         return Err(CtrlError(format!("duplicate rank {rank}")));
                     }
-                    self.workers.push(WorkerConn { rank, stream, reader });
+                    self.workers.push(WorkerConn {
+                        rank,
+                        stream,
+                        reader,
+                    });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(100));
@@ -156,7 +163,13 @@ impl Head {
 
     pub fn send_go(&mut self, phase: Phase, cmd: serde_json::Value) -> CtrlResult<()> {
         for w in &mut self.workers {
-            send(&mut w.stream, &Msg::Go { phase, cmd: cmd.clone() })?;
+            send(
+                &mut w.stream,
+                &Msg::Go {
+                    phase,
+                    cmd: cmd.clone(),
+                },
+            )?;
         }
         Ok(())
     }
@@ -200,7 +213,12 @@ impl Head {
 
     pub fn abort_all(&mut self, reason: &str) -> CtrlResult<()> {
         for w in &mut self.workers {
-            let _ = send(&mut w.stream, &Msg::Abort { reason: reason.to_string() });
+            let _ = send(
+                &mut w.stream,
+                &Msg::Abort {
+                    reason: reason.to_string(),
+                },
+            );
         }
         Ok(())
     }
@@ -232,7 +250,11 @@ impl Worker {
         stream.set_nodelay(true).ok();
         stream.set_read_timeout(Some(wait)).ok();
         let reader = BufReader::new(stream.try_clone()?);
-        let mut w = Worker { rank, stream, reader };
+        let mut w = Worker {
+            rank,
+            stream,
+            reader,
+        };
         send(&mut w.stream, &Msg::Hello { rank })?;
         Ok(w)
     }
@@ -254,7 +276,12 @@ impl Worker {
     }
 
     pub fn send_abort(&mut self, reason: &str) -> CtrlResult<()> {
-        send(&mut self.stream, &Msg::Abort { reason: reason.to_string() })
+        send(
+            &mut self.stream,
+            &Msg::Abort {
+                reason: reason.to_string(),
+            },
+        )
     }
 }
 
@@ -279,7 +306,13 @@ mod tests {
         };
         let s = serde_json::to_string(&m).unwrap();
         let back: Msg = serde_json::from_str(&s).unwrap();
-        assert!(matches!(back, Msg::Go { phase: Phase::Probe, .. }));
+        assert!(matches!(
+            back,
+            Msg::Go {
+                phase: Phase::Probe,
+                ..
+            }
+        ));
         let r: Msg = serde_json::from_str(r#"{"type":"ready","data":{"ok":true}}"#).unwrap();
         assert!(matches!(r, Msg::Ready { .. }));
         let a: Msg = serde_json::from_str(r#"{"type":"abort","reason":"x"}"#).unwrap();
@@ -298,7 +331,8 @@ mod tests {
         head.wait_workers(3, Duration::from_secs(5)).unwrap();
         let t = std::thread::spawn(move || {
             let mut head = head;
-            head.send_go(Phase::Gate, serde_json::json!({"x": 1})).unwrap();
+            head.send_go(Phase::Gate, serde_json::json!({"x": 1}))
+                .unwrap();
             let ready = head.collect_ready(Duration::from_secs(5)).unwrap();
             assert_eq!(ready.len(), 2);
             head.send_bye();

@@ -34,8 +34,15 @@ mod linux_tests {
 
         // qp1 writes 8 bytes of buf into qp2's view of the same buffer,
         // with imm 7
-        qp1.write_imm(buf.as_ptr() as u64, 8, mr.lkey, buf.as_ptr() as u64, mr.rkey, 7)
-            .expect("write");
+        qp1.write_imm(
+            buf.as_ptr() as u64,
+            8,
+            mr.lkey,
+            buf.as_ptr() as u64,
+            mr.rkey,
+            7,
+        )
+        .expect("write");
 
         let mut batch = PollBatch::default();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);

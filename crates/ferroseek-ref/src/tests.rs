@@ -321,7 +321,11 @@ fn release_config_json_parses_with_release_key_spellings() {
     // the engram layout the release table row counts must cover
     let layout = crate::engram::EngramLayout::build(&r).unwrap();
     assert_eq!(layout.layer_ids, vec![1, 14]);
-    for (need, have) in layout.required_rows().iter().zip(r.engram_num_embeddings.iter()) {
+    for (need, have) in layout
+        .required_rows()
+        .iter()
+        .zip(r.engram_num_embeddings.iter())
+    {
         assert!(have >= need, "engram rows {have} < required {need}");
     }
 }

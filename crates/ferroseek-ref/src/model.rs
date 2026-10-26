@@ -368,9 +368,7 @@ impl<'a> RefModel<'a> {
         let snap_bf16 = |v: &mut [f32]| {
             if bf16_stream {
                 for x in v.iter_mut() {
-                    *x = ferroseek_core::quant::bf16_to_f32(ferroseek_core::quant::f32_to_bf16(
-                        *x,
-                    ));
+                    *x = ferroseek_core::quant::bf16_to_f32(ferroseek_core::quant::f32_to_bf16(*x));
                 }
             }
         };
@@ -522,7 +520,9 @@ pub fn validate_dims(cfg: &RefConfig) -> io::Result<()> {
         return Err(err("head_dim must be 32-divisible (fp8 act blocks)".into()));
     }
     if heads * hd % cfg.o_groups as usize != 0 {
-        return Err(err("n_heads * head_dim must be divisible by o_groups".into()));
+        return Err(err(
+            "n_heads * head_dim must be divisible by o_groups".into()
+        ));
     }
     if heads * hd / cfg.o_groups as usize % 32 != 0 {
         return Err(err("wo_a group row must be 32-divisible".into()));

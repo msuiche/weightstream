@@ -219,7 +219,14 @@ pub fn hash_step(
     pos: u64,
 ) -> Vec<Vec<u64>> {
     let token_map = rt.token_map.clone();
-    hash_ids(cfg, layout, &mut rt.engram_ids, token_map.as_deref(), token, pos)
+    hash_ids(
+        cfg,
+        layout,
+        &mut rt.engram_ids,
+        token_map.as_deref(),
+        token,
+        pos,
+    )
 }
 
 /// Merge the n-gram embeddings into the stream `h` (model.py:328-365):

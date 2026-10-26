@@ -41,16 +41,23 @@ impl Tokenizer {
         let path = dir.join("tokenizer.json");
         let inner = tokenizers::Tokenizer::from_file(&path)
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        let config: Option<TokenizerConfig> = std::fs::read_to_string(dir.join("tokenizer_config.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok());
+        let config: Option<TokenizerConfig> =
+            std::fs::read_to_string(dir.join("tokenizer_config.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok());
         let id_of = |entry: Option<&TokenEntry>, inner: &tokenizers::Tokenizer| {
             entry.and_then(|e| inner.token_to_id(e.content()))
         };
         Ok(Self {
-            bos_token_id: config.as_ref().and_then(|c| id_of(c.bos_token.as_ref(), &inner)),
-            eos_token_id: config.as_ref().and_then(|c| id_of(c.eos_token.as_ref(), &inner)),
-            pad_token_id: config.as_ref().and_then(|c| id_of(c.pad_token.as_ref(), &inner)),
+            bos_token_id: config
+                .as_ref()
+                .and_then(|c| id_of(c.bos_token.as_ref(), &inner)),
+            eos_token_id: config
+                .as_ref()
+                .and_then(|c| id_of(c.eos_token.as_ref(), &inner)),
+            pad_token_id: config
+                .as_ref()
+                .and_then(|c| id_of(c.pad_token.as_ref(), &inner)),
             inner,
         })
     }

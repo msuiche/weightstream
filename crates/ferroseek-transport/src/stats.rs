@@ -30,14 +30,28 @@ pub struct Summary {
 
 pub fn summarize(mut samples: Vec<f64>) -> Summary {
     if samples.is_empty() {
-        return Summary { n: 0, min_us: f64::NAN, p50_us: f64::NAN, p99_us: f64::NAN, max_us: f64::NAN, mean_us: f64::NAN };
+        return Summary {
+            n: 0,
+            min_us: f64::NAN,
+            p50_us: f64::NAN,
+            p99_us: f64::NAN,
+            max_us: f64::NAN,
+            mean_us: f64::NAN,
+        };
     }
     let min = samples.iter().cloned().fold(f64::INFINITY, f64::min);
     let max = samples.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let p50 = percentile(&mut samples, 50.0);
     let p99 = percentile(&mut samples, 99.0);
     let mean = samples.iter().sum::<f64>() / samples.len() as f64;
-    Summary { n: samples.len(), min_us: min, p50_us: p50, p99_us: p99, max_us: max, mean_us: mean }
+    Summary {
+        n: samples.len(),
+        min_us: min,
+        p50_us: p50,
+        p99_us: p99,
+        max_us: max,
+        mean_us: mean,
+    }
 }
 
 #[cfg(test)]

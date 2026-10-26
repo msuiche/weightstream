@@ -9,14 +9,14 @@
 mod ffi;
 
 pub use ffi::{
-    ibv_ah_attr, ibv_global_route, ibv_gid, ibv_qp_attr, ibv_qp_init_attr, ibv_sge, ibv_send_wr,
+    ibv_ah_attr, ibv_gid, ibv_global_route, ibv_qp_attr, ibv_qp_init_attr, ibv_send_wr, ibv_sge,
     IBV_ACCESS_LOCAL_WRITE, IBV_ACCESS_REMOTE_WRITE, IBV_LINK_LAYER_ETHERNET, IBV_MTU_4096,
-    IBV_PORT_ACTIVE, IBV_QP_ACCESS_FLAGS, IBV_QP_AV, IBV_QP_DEST_QPN, IBV_QP_MAX_DEST_RD_ATOMIC,
-    IBV_QP_MAX_QP_RD_ATOMIC, IBV_QP_MIN_RNR_TIMER, IBV_QP_PATH_MTU, IBV_QP_PKEY_INDEX, IBV_QP_PORT,
-    IBV_QP_RETRY_CNT, IBV_QP_RNR_RETRY, IBV_QP_RQ_PSN, IBV_QP_SQ_PSN, IBV_QP_STATE, IBV_QP_TIMEOUT,
-    IBV_QPS_INIT,
-    IBV_QPS_RTR, IBV_QPS_RTS, IBV_QPT_RC, IBV_SEND_SIGNALED, IBV_WC_RECV, IBV_WC_RECV_RDMA_WITH_IMM,
-    IBV_WC_SEND, IBV_WC_WITH_IMM, IBV_WR_RDMA_WRITE_WITH_IMM,
+    IBV_PORT_ACTIVE, IBV_QPS_INIT, IBV_QPS_RTR, IBV_QPS_RTS, IBV_QPT_RC, IBV_QP_ACCESS_FLAGS,
+    IBV_QP_AV, IBV_QP_DEST_QPN, IBV_QP_MAX_DEST_RD_ATOMIC, IBV_QP_MAX_QP_RD_ATOMIC,
+    IBV_QP_MIN_RNR_TIMER, IBV_QP_PATH_MTU, IBV_QP_PKEY_INDEX, IBV_QP_PORT, IBV_QP_RETRY_CNT,
+    IBV_QP_RNR_RETRY, IBV_QP_RQ_PSN, IBV_QP_SQ_PSN, IBV_QP_STATE, IBV_QP_TIMEOUT,
+    IBV_SEND_SIGNALED, IBV_WC_RECV, IBV_WC_RECV_RDMA_WITH_IMM, IBV_WC_SEND, IBV_WC_WITH_IMM,
+    IBV_WR_RDMA_WRITE_WITH_IMM,
 };
 
 use std::collections::BTreeMap;
@@ -104,7 +104,8 @@ impl Verbs {
                     continue;
                 }
                 let pd = ffi::ibv_alloc_pd(ctx);
-                let cq = ffi::ibv_create_cq(ctx, 4096, std::ptr::null_mut(), std::ptr::null_mut(), 0);
+                let cq =
+                    ffi::ibv_create_cq(ctx, 4096, std::ptr::null_mut(), std::ptr::null_mut(), 0);
                 if pd.is_null() || cq.is_null() {
                     if !cq.is_null() {
                         ffi::ibv_destroy_cq(cq);
@@ -156,7 +157,9 @@ impl Verbs {
                         if ffi::ibv_query_gid(d.ctx, port, gi, &mut gid) != 0 {
                             continue;
                         }
-                        let Some(ip) = gid_roce_v2_ip(&gid) else { continue };
+                        let Some(ip) = gid_roce_v2_ip(&gid) else {
+                            continue;
+                        };
                         if !crate::nodes::in_subnet(&ip.to_string(), subnet) {
                             continue;
                         }
@@ -297,7 +300,11 @@ impl Verbs {
                 qpn: (*qp).qp_num,
                 local_port: p.port,
                 local_gid_index: p.gid_index,
-                path_mtu: if p.active_mtu >= 1 { p.active_mtu } else { IBV_MTU_4096 },
+                path_mtu: if p.active_mtu >= 1 {
+                    p.active_mtu
+                } else {
+                    IBV_MTU_4096
+                },
                 qp,
             })
         }
@@ -409,14 +416,13 @@ impl Qp {
             wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
             wr.send_flags = IBV_SEND_SIGNALED;
             wr.imm_data = imm.to_be();
-            wr.wr.rdma = ffi::IbvSendRdma {
-                remote_addr,
-                rkey,
-            };
+            wr.wr.rdma = ffi::IbvSendRdma { remote_addr, rkey };
             let mut bad: *mut ibv_send_wr = std::ptr::null_mut();
             // rdma-core 50: ibv_post_send is an inline wrapper over the
             // context ops table
-            let post_send = (*(*self.qp).context).ops.post_send
+            let post_send = (*(*self.qp).context)
+                .ops
+                .post_send
                 .ok_or_else(|| VerbsError("provider has no post_send op".into()))?;
             if post_send(self.qp, &mut wr, &mut bad) != 0 {
                 return err("ibv_post_send RDMA_WRITE_WITH_IMM");
@@ -434,7 +440,9 @@ impl Qp {
             wr.sg_list = std::ptr::null_mut();
             wr.num_sge = 0;
             let mut bad: *mut ffi::ibv_recv_wr = std::ptr::null_mut();
-            let post_recv = (*(*self.qp).context).ops.post_recv
+            let post_recv = (*(*self.qp).context)
+                .ops
+                .post_recv
                 .ok_or_else(|| VerbsError("provider has no post_recv op".into()))?;
             for _ in 0..n {
                 if post_recv(self.qp, &mut wr, &mut bad) != 0 {
@@ -484,7 +492,9 @@ impl PollBatch {
         unsafe {
             // rdma-core 50: ibv_poll_cq is an inline wrapper over the
             // context ops table
-            let poll_cq = (*(*cq).context).ops.poll_cq
+            let poll_cq = (*(*cq).context)
+                .ops
+                .poll_cq
                 .ok_or_else(|| VerbsError("provider has no poll_cq op".into()))?;
             let n = poll_cq(cq, self.wcs.len() as c_int, self.wcs.as_mut_ptr());
             if n < 0 {
@@ -527,7 +537,9 @@ impl Default for PollBatch {
 #[derive(Debug, Clone, Copy)]
 pub enum PollKind {
     /// receive completion; imm already converted to host order
-    Recv { imm: u32 },
+    Recv {
+        imm: u32,
+    },
     Send,
 }
 

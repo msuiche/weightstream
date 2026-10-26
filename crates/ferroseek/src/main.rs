@@ -233,6 +233,7 @@ fn build_engine_tp4(
     port: u16,
     max_seq: u64,
     wait_ms: u64,
+    stream: bool,
 ) -> std::io::Result<(Box<dyn Decoder>, ferroseek_gpu::tp4::Session)> {
     // largest collective payload the engine issues: attention/moe partials
     // (dim), the head's vocab shard (vocab/4), index scores (max_seq/ratio)
@@ -246,14 +247,19 @@ fn build_engine_tp4(
         }
     }
     let mut session = ferroseek_gpu::tp4::join(ring_path, rank, port, elems, wait_ms)?;
-    let sharding =
-        ferroseek_gpu::engine::Sharding { world_size: 4, rank: session.rank as u32 };
+    let sharding = ferroseek_gpu::engine::Sharding {
+        world_size: 4,
+        rank: session.rank as u32,
+    };
     let comm = session.take_comm();
     let ckpt: &'static mut ferroseek_core::Checkpoint = Box::leak(Box::new(ckpt));
-    let model = ferroseek_gpu::engine::GpuModel::from_checkpoint_streaming_tp4(
-        ckpt, sharding, comm,
-    )?
-    .with_max_seq_len(max_seq);
+    let model = if stream {
+        ferroseek_gpu::engine::GpuModel::from_checkpoint_streaming_tp4(ckpt, sharding, comm)?
+            .with_max_seq_len(max_seq)
+    } else {
+        ferroseek_gpu::engine::GpuModel::from_checkpoint_tp4(ckpt, sharding, comm)?
+            .with_max_seq_len(max_seq)
+    };
     Ok((Box::new(model), session))
 }
 
@@ -381,7 +387,9 @@ fn cmd_decode(args: &[String]) -> ExitCode {
                 eprintln!("--tp4 needs --ring <nodes-ring4.local.json>");
                 return ExitCode::from(2);
             }
-            match build_engine_tp4(ckpt, &tp_ring, tp_rank, tp_port, max_seq, tp_wait_ms) {
+            match build_engine_tp4(
+                ckpt, &tp_ring, tp_rank, tp_port, max_seq, tp_wait_ms, stream,
+            ) {
                 Ok((m, mut sess)) => {
                     if let Err(e) = sess.start_barrier() {
                         eprintln!("tp4 start barrier: {e}");

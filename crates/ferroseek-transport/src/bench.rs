@@ -9,8 +9,8 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use crate::ctrl::{Head, Phase, Worker};
 use crate::counter;
+use crate::ctrl::{Head, Phase, Worker};
 use crate::nodes::{Node, NodesFile};
 use crate::ring::Ring;
 use crate::stats::summarize;
@@ -67,10 +67,7 @@ pub fn parse_args(args: &[String]) -> Result<BenchArgs, String> {
         match args[i].as_str() {
             "--ring" => {
                 i += 1;
-                a.ring_path = args
-                    .get(i)
-                    .ok_or("--ring needs a path")?
-                    .clone();
+                a.ring_path = args.get(i).ok_or("--ring needs a path")?.clone();
             }
             "--port" => {
                 i += 1;
@@ -135,9 +132,8 @@ fn splitmix64(seed: u64) -> u64 {
 /// subnormal, 2^93-scale), guaranteed never to overflow the 4-rank
 /// rank-ordered sum.
 pub fn gate_input(round: usize, rank: u8, i: usize) -> f32 {
-    let h = splitmix64(
-        (round as u64) << 48 ^ (rank as u64) << 40 ^ (i as u64).wrapping_mul(0x9E37),
-    );
+    let h =
+        splitmix64((round as u64) << 48 ^ (rank as u64) << 40 ^ (i as u64).wrapping_mul(0x9E37));
     let carrier = rank as usize == round % 4;
     if i == 0 {
         if carrier {
@@ -261,7 +257,11 @@ fn run_gate(ring: &mut Ring, rounds: usize) -> Result<serde_json::Value, String>
     }))
 }
 
-fn run_soak(ring: &mut Ring, iters: usize, verify_every: usize) -> Result<serde_json::Value, String> {
+fn run_soak(
+    ring: &mut Ring,
+    iters: usize,
+    verify_every: usize,
+) -> Result<serde_json::Value, String> {
     let (elems, nranks, me) = (ring.elems, ring.nranks, ring.me);
     let targets: Vec<(String, u8)> = ring
         .links
@@ -317,7 +317,9 @@ pub fn run(args: &BenchArgs) -> Result<(), String> {
     let json = std::fs::read_to_string(&args.ring_path)
         .map_err(|e| format!("read {}: {e}", args.ring_path))?;
     let map = NodesFile::parse(&json).map_err(|e| e.to_string())?;
-    let me = map.my_rank(&hostname(), args.rank).map_err(|e| e.to_string())?;
+    let me = map
+        .my_rank(&hostname(), args.rank)
+        .map_err(|e| e.to_string())?;
     let my_node = map.node_of(me).map_err(|e| e.to_string())?.clone();
     let cfg = map.ring_cfg(me).map_err(|e| e.to_string())?;
     eprintln!(
@@ -326,14 +328,17 @@ pub fn run(args: &BenchArgs) -> Result<(), String> {
     );
 
     let verbs = Verbs::open().map_err(|e| e.to_string())?;
-    let (mut ring, my_ep) =
-        Ring::new(verbs, &cfg, args.elems, Duration::from_millis(args.wait_ms))
-            .map_err(|e| e.to_string())?;
+    let (mut ring, my_ep) = Ring::new(verbs, &cfg, args.elems, Duration::from_millis(args.wait_ms))
+        .map_err(|e| e.to_string())?;
     eprintln!(
         "rank {me}: {} QPs (succ {} on {} / {}, pred {} on {} / {})",
         ring.qp_count(),
-        cfg.succ.rank, cfg.succ.rails[0].subnet, cfg.succ.rails[1].subnet,
-        cfg.pred.rank, cfg.pred.rails[0].subnet, cfg.pred.rails[1].subnet
+        cfg.succ.rank,
+        cfg.succ.rails[0].subnet,
+        cfg.succ.rails[1].subnet,
+        cfg.pred.rank,
+        cfg.pred.rails[0].subnet,
+        cfg.pred.rails[1].subnet
     );
 
     if my_node.head {
@@ -352,8 +357,7 @@ fn run_head(
     my_ep: serde_json::Value,
 ) -> Result<(), String> {
     let _ = cfg;
-    let mut head = Head::bind(&my_node.management_ip, args.port, me)
-        .map_err(|e| e.to_string())?;
+    let mut head = Head::bind(&my_node.management_ip, args.port, me).map_err(|e| e.to_string())?;
     head.wait_workers(4, Duration::from_secs(180))
         .map_err(|e| e.to_string())?;
     eprintln!("head {me}: all 4 ranks rendezvoused over the management net");
@@ -368,7 +372,9 @@ fn run_head(
         .collect_ready(Duration::from_secs(phase_secs))
         .map_err(|e| e.to_string())?
     {
-        let rank = data["rank"].as_u64().ok_or("endpoint payload without rank")? as u8;
+        let rank = data["rank"]
+            .as_u64()
+            .ok_or("endpoint payload without rank")? as u8;
         all.push((rank, data));
     }
     all.sort_by_key(|(r, _)| *r);
@@ -393,7 +399,10 @@ fn run_head(
     println!("QP bring-up: 4 links x 2 rails, RoCE v2 RC, path MTU 4096 — OK");
 
     // ---- probe: ping/pong per link per rail
-    println!("\nRoCE link probe (RDMA ping/pong, 8-byte write-with-imm, {} iters):", args.ping_iters);
+    println!(
+        "\nRoCE link probe (RDMA ping/pong, 8-byte write-with-imm, {} iters):",
+        args.ping_iters
+    );
     println!(
         "{:<8} {:>4} {:>12} {:>12} {:>10} {:>12}",
         "link", "rail", "rtt p50 us", "rtt p99 us", "min us", "1-way p50 us"
@@ -457,8 +466,11 @@ fn run_head(
         "\nBit-exactness gate ({} rounds, 4 KB, denormals + f32::MAX extremes):",
         args.gate_rounds
     );
-    head.send_go(Phase::Gate, serde_json::json!({ "rounds": args.gate_rounds }))
-        .map_err(|e| e.to_string())?;
+    head.send_go(
+        Phase::Gate,
+        serde_json::json!({ "rounds": args.gate_rounds }),
+    )
+    .map_err(|e| e.to_string())?;
     let my_gate = run_gate(ring, args.gate_rounds)?;
     let datas = head
         .collect_ready(Duration::from_secs(120))
@@ -525,7 +537,10 @@ fn run_head(
         per_rank.insert(rank, d["soak"]["latency"].clone());
     }
     println!("\nAll-reduce latency per rank (us, includes the rank-ordered sum):");
-    println!("{:>6} {:>10} {:>12} {:>12} {:>10}", "rank", "n", "p50", "p99", "max");
+    println!(
+        "{:>6} {:>10} {:>12} {:>12} {:>10}",
+        "rank", "n", "p50", "p99", "max"
+    );
     let mut worst_p99 = 0.0f64;
     for (rank, p) in &per_rank {
         let p50 = p["p50_us"].as_f64().unwrap_or(f64::NAN);
@@ -552,16 +567,25 @@ fn run_head(
         for (k, v) in s["loss"].as_object().unwrap_or(&serde_json::Map::new()) {
             *all_loss.entry(k.clone()).or_insert(0) += v.as_i64().unwrap_or(0);
         }
-        for (k, v) in s["congestion"].as_object().unwrap_or(&serde_json::Map::new()) {
+        for (k, v) in s["congestion"]
+            .as_object()
+            .unwrap_or(&serde_json::Map::new())
+        {
             *all_cong.entry(k.clone()).or_insert(0) += v.as_i64().unwrap_or(0);
         }
     }
     for d in &datas {
         mismatches += d["soak"]["mismatches"].as_u64().unwrap_or(0);
-        for (k, v) in d["soak"]["loss"].as_object().unwrap_or(&serde_json::Map::new()) {
+        for (k, v) in d["soak"]["loss"]
+            .as_object()
+            .unwrap_or(&serde_json::Map::new())
+        {
             *all_loss.entry(k.clone()).or_insert(0) += v.as_i64().unwrap_or(0);
         }
-        for (k, v) in d["soak"]["congestion"].as_object().unwrap_or(&serde_json::Map::new()) {
+        for (k, v) in d["soak"]["congestion"]
+            .as_object()
+            .unwrap_or(&serde_json::Map::new())
+        {
             *all_cong.entry(k.clone()).or_insert(0) += v.as_i64().unwrap_or(0);
         }
     }

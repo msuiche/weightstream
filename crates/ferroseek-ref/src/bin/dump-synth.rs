@@ -161,10 +161,7 @@ fn st_entry(view: &ferroseek_ref::TensorView<'_>) -> (String, Vec<usize>) {
     }
 }
 
-fn write_safetensors(
-    out: &Path,
-    weights: &mut SyntheticWeights,
-) -> std::io::Result<()> {
+fn write_safetensors(out: &Path, weights: &mut SyntheticWeights) -> std::io::Result<()> {
     let mut header = serde_json::Map::new();
     let mut payload = Vec::new();
     let names: Vec<String> = weights.names().cloned().collect();
@@ -221,5 +218,10 @@ fn main() {
         let logits = model.decode(t, p as u64).expect("decode");
         assert!(logits.iter().all(|v| v.is_finite()), "pos {p}");
     }
-    println!("dumped {} layers x {} positions to {}", 5, TOKENS.len(), out.display());
+    println!(
+        "dumped {} layers x {} positions to {}",
+        5,
+        TOKENS.len(),
+        out.display()
+    );
 }

@@ -19,9 +19,9 @@ pub mod nodes;
 pub mod stats;
 
 #[cfg(target_os = "linux")]
-pub mod counter;
-#[cfg(target_os = "linux")]
 pub mod bench;
+#[cfg(target_os = "linux")]
+pub mod counter;
 #[cfg(target_os = "linux")]
 pub mod ring;
 #[cfg(target_os = "linux")]

@@ -237,7 +237,10 @@ impl SyntheticWeights {
                 .map(|n| (n.clone(), shard_name.to_string()))
                 .collect::<BTreeMap<_, _>>()
         });
-        std::fs::write(dir.join("model.safetensors.index.json"), serde_json::to_vec(&idx).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?)?;
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&idx).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+        )?;
         Ok(())
     }
 }
@@ -454,9 +457,7 @@ impl DenseLru {
                 Some(prefix) => {
                     let scale_name = format!("{prefix}.scale");
                     match store.get2(name, &scale_name) {
-                        Ok((w, s))
-                            if w.dtype == DType::Fp8E4m3 && s.dtype == DType::E8m0 =>
-                        {
+                        Ok((w, s)) if w.dtype == DType::Fp8E4m3 && s.dtype == DType::E8m0 => {
                             let (rows, cols) = match w.shape.as_slice() {
                                 [r, c] => (*r, *c),
                                 _ => {

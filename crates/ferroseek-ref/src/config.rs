@@ -177,8 +177,11 @@ impl RefConfig {
             kv_sources,
             index_sources,
             // the release export names this `candidate_source_layer_id`
-            candidate_source: opt_i64(extra, &["candidate_source_layer", "candidate_source_layer_id"])
-                .unwrap_or(-1),
+            candidate_source: opt_i64(
+                extra,
+                &["candidate_source_layer", "candidate_source_layer_id"],
+            )
+            .unwrap_or(-1),
             candidate_topk_blocks: opt_u32(extra, &["candidate_topk_blocks"]).unwrap_or(0),
             candidate_block_size: opt_u32(extra, &["candidate_block_size"]).unwrap_or(0),
             index_n_heads,
@@ -242,10 +245,7 @@ fn get<'a>(extra: &'a BTreeMap<String, Value>, keys: &[&str]) -> Option<&'a Valu
 
 /// Read one field out of the nested HF `rope_scaling` object
 /// ({rope_type, factor, beta_fast, beta_slow, original_max_position_embeddings}).
-fn rope_scaling_value<'a>(
-    extra: &'a BTreeMap<String, Value>,
-    key: &str,
-) -> Option<&'a Value> {
+fn rope_scaling_value<'a>(extra: &'a BTreeMap<String, Value>, key: &str) -> Option<&'a Value> {
     extra.get("rope_scaling").and_then(|v| v.get(key))
 }
 

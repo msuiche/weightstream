@@ -7,7 +7,9 @@ use std::process::Command;
 
 fn nvcc() -> Option<PathBuf> {
     for cand in [
-        std::env::var("CUDA_HOME").ok().map(|h| PathBuf::from(h).join("bin/nvcc")),
+        std::env::var("CUDA_HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join("bin/nvcc")),
         Some(PathBuf::from("/usr/local/cuda/bin/nvcc")),
     ]
     .into_iter()
@@ -53,12 +55,7 @@ fn main() {
             let ptx = out_dir.join(format!("{stem}.ptx"));
             // sm_121 = GB10 (DGX Spark). PTX lets the driver JIT forward.
             let status = Command::new(&nvcc)
-                .args([
-                    "-ptx",
-                    "-arch=compute_121",
-                    "-O3",
-                    "-o",
-                ])
+                .args(["-ptx", "-arch=compute_121", "-O3", "-o"])
                 .arg(&ptx)
                 .arg(&path)
                 .status()

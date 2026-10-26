@@ -64,7 +64,8 @@ impl Cuda {
             let rope = Module::from_ptx(ROPE_PTX, &[]).expect("rope module");
             let actquant = Module::from_ptx(ACTQUANT_PTX, &[]).expect("actquant module");
             let fp8_gemm = Module::from_ptx(FP8_GEMM_PTX, &[]).expect("fp8_gemm module");
-            let fp4_actquant = Module::from_ptx(FP4_ACTQUANT_PTX, &[]).expect("fp4_actquant module");
+            let fp4_actquant =
+                Module::from_ptx(FP4_ACTQUANT_PTX, &[]).expect("fp4_actquant module");
             let fp4_expert_gemm =
                 Module::from_ptx(FP4_EXPERT_GEMM_PTX, &[]).expect("fp4_expert_gemm module");
             let hc = Module::from_ptx(HC_PTX, &[]).expect("hc module");
@@ -183,7 +184,9 @@ mod tests {
         let mut s = seed;
         (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((s >> 33) as f32 / (1u64 << 31) as f32) - 0.5
             })
             .collect()
@@ -572,7 +575,10 @@ mod tests {
             }
             stream.synchronize().unwrap();
             d_x.copy_to(&mut x).unwrap();
-            assert_eq!(x, expected, "fp4 snap block={block_size} e4m3={scale_e4m3} not exact");
+            assert_eq!(
+                x, expected,
+                "fp4 snap block={block_size} e4m3={scale_e4m3} not exact"
+            );
         }
     }
 
@@ -582,7 +588,10 @@ mod tests {
         let mut q = vec![0u8; x.len() / 2];
         let mut s = vec![0u8; kb];
         for (b, g) in x.chunks_exact(32).enumerate() {
-            let amax = g.iter().fold(0.0f32, |a, v| a.max(v.abs())).max(6.0 * 2f32.powi(-126));
+            let amax = g
+                .iter()
+                .fold(0.0f32, |a, v| a.max(v.abs()))
+                .max(6.0 * 2f32.powi(-126));
             let scale = 2f32.powf((amax / 6.0).log2().ceil());
             s[b] = (scale.log2() + 127.0) as u8;
             for k in 0..16 {
@@ -622,7 +631,8 @@ mod tests {
                     let mut dot = 0.0f32;
                     for k in 0..16 {
                         let byte = b_q[n * (k_dim / 2) + b * 16 + k];
-                        let av0 = ferroseek_core::quant::e4m3_to_f32(a_q[m * k_dim + b * 32 + 2 * k]);
+                        let av0 =
+                            ferroseek_core::quant::e4m3_to_f32(a_q[m * k_dim + b * 32 + 2 * k]);
                         let av1 =
                             ferroseek_core::quant::e4m3_to_f32(a_q[m * k_dim + b * 32 + 2 * k + 1]);
                         dot += av0 * ferroseek_core::quant::FP4_TABLE[(byte & 0x0F) as usize];
@@ -641,7 +651,10 @@ mod tests {
         let d_b = DeviceBuffer::from_slice(&b_q).unwrap();
         let d_bs = DeviceBuffer::from_slice(&b_s).unwrap();
         let mut d_c = DeviceBuffer::from_slice(&vec![0.0f32; m_dim * n_dim]).unwrap();
-        let func = cuda.fp4_expert_gemm.get_function("fp4_expert_gemm").unwrap();
+        let func = cuda
+            .fp4_expert_gemm
+            .get_function("fp4_expert_gemm")
+            .unwrap();
         let stream = &cuda.stream;
         unsafe {
             launch!(
@@ -708,7 +721,9 @@ mod tests {
                 }
             }
             for j in 0..4 {
-                let mx = (0..4).map(|k| comb[j * 4 + k]).fold(f32::NEG_INFINITY, f32::max);
+                let mx = (0..4)
+                    .map(|k| comb[j * 4 + k])
+                    .fold(f32::NEG_INFINITY, f32::max);
                 let sum: f32 = (0..4).map(|k| (comb[j * 4 + k] - mx).exp()).sum();
                 for k in 0..4 {
                     comb[j * 4 + k] = (comb[j * 4 + k] - mx).exp() / sum + eps;
@@ -823,7 +838,11 @@ mod tests {
                 s = s * corr + w;
                 for d in 0..dim {
                     acc[d] = acc[d] * corr
-                        + w * if idx >= 0 { kv[idx as usize * dim + d] } else { 0.0 };
+                        + w * if idx >= 0 {
+                            kv[idx as usize * dim + d]
+                        } else {
+                            0.0
+                        };
                 }
                 m = mnew;
             }
@@ -889,7 +908,11 @@ mod tests {
                 let dot: f32 = (0..dim)
                     .map(|d| x[d] * ferroseek_core::quant::bf16_to_f32(gate_bf16[e * dim + d]))
                     .sum();
-                let sp = if dot > 20.0 { dot } else { (dot.exp() + 1.0).ln() };
+                let sp = if dot > 20.0 {
+                    dot
+                } else {
+                    (dot.exp() + 1.0).ln()
+                };
                 sp.sqrt()
             })
             .collect();
@@ -1139,7 +1162,11 @@ mod tests {
             stream.synchronize().unwrap();
             let mut got = vec![0.0f32; rows];
             d_y.copy_to(&mut got).unwrap();
-            let e: f32 = got.iter().zip(&expected).map(|(g, e)| (g - e).abs()).fold(0.0, f32::max);
+            let e: f32 = got
+                .iter()
+                .zip(&expected)
+                .map(|(g, e)| (g - e).abs())
+                .fold(0.0, f32::max);
             assert!(e < 1e-4, "f32_gemv max err {e}");
 
             launch!(bfg<<<rows as u32, 256, 0, stream>>>(
@@ -1152,7 +1179,11 @@ mod tests {
             .unwrap();
             stream.synchronize().unwrap();
             d_y.copy_to(&mut got).unwrap();
-            let e: f32 = got.iter().zip(&expected_bf).map(|(g, e)| (g - e).abs()).fold(0.0, f32::max);
+            let e: f32 = got
+                .iter()
+                .zip(&expected_bf)
+                .map(|(g, e)| (g - e).abs())
+                .fold(0.0, f32::max);
             assert!(e < 1e-4, "bf16_gemv max err {e}");
         }
     }
@@ -1166,17 +1197,19 @@ mod tests {
         // fp8 table: random f32 -> quantize per row
         let table_f32 = rand_vec(table_rows * cols, 6001);
         let (table_q, table_s) = quantize_fp8(&table_f32);
-        let idxs: Vec<i64> = (0..n_sel as i64).map(|i| (i * 37 + 11) % table_rows as i64).collect();
+        let idxs: Vec<i64> = (0..n_sel as i64)
+            .map(|i| (i * 37 + 11) % table_rows as i64)
+            .collect();
 
         // CPU gather mirror
         let mut exp_rows = vec![0.0f32; n_sel * cols];
         for (r, &idx) in idxs.iter().enumerate() {
             for c in 0..cols {
-                exp_rows[r * cols + c] = ferroseek_core::quant::e4m3_to_f32(
-                    table_q[idx as usize * cols + c],
-                ) * ferroseek_core::quant::e8m0_to_f32(
-                    table_s[idx as usize * (cols / 32) + c / 32],
-                );
+                exp_rows[r * cols + c] =
+                    ferroseek_core::quant::e4m3_to_f32(table_q[idx as usize * cols + c])
+                        * ferroseek_core::quant::e8m0_to_f32(
+                            table_s[idx as usize * (cols / 32) + c / 32],
+                        );
             }
         }
 

@@ -7,9 +7,7 @@
 
 use crate::Tokenizer;
 use tokenizers::normalizers::replace::ReplacePattern;
-use tokenizers::normalizers::{
-    Lowercase, NFD, NFKC, Replace, Sequence, Strip, StripAccents,
-};
+use tokenizers::normalizers::{Lowercase, Replace, Sequence, Strip, StripAccents, NFD, NFKC};
 use tokenizers::{NormalizedString, Normalizer};
 
 /// The expected compressed vocab size on DS4.1F-1017 (config:
@@ -48,8 +46,7 @@ pub fn build_compressed_token_map(tk: &Tokenizer) -> Result<Vec<i64>, String> {
     let normalizer = build_normalizer();
     let inner = tk.inner();
     let n = inner.get_vocab_size(true);
-    let mut key_to_new: std::collections::HashMap<String, i64> =
-        std::collections::HashMap::new();
+    let mut key_to_new: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut lookup = vec![0i64; n];
     for id in 0..n as u32 {
         let text = inner

@@ -112,12 +112,17 @@ fn shard_weight<'b>(view: &'b [u8], shape: &[usize], shard: WShard) -> io::Resul
     }
     let (rows, cols) = (shape[0], shape[1]);
     if view.len() != rows * cols {
-        return ioerr(format!("weight bytes {} do not tile [{rows}, {cols}]", view.len()));
+        return ioerr(format!(
+            "weight bytes {} do not tile [{rows}, {cols}]",
+            view.len()
+        ));
     }
     match shard {
         WShard::Rows { start, len } => {
             if start % 32 != 0 || len % 32 != 0 || start + len > rows {
-                return ioerr(format!("row shard [{start}, {start}+{len}) not 32-aligned in [{rows}]"));
+                return ioerr(format!(
+                    "row shard [{start}, {start}+{len}) not 32-aligned in [{rows}]"
+                ));
             }
             Ok(Sharded::Owned(
                 view[start * cols..(start + len) * cols].to_vec(),
@@ -125,7 +130,9 @@ fn shard_weight<'b>(view: &'b [u8], shape: &[usize], shard: WShard) -> io::Resul
         }
         WShard::Cols { start, len } => {
             if start % 32 != 0 || len % 32 != 0 || start + len > cols {
-                return ioerr(format!("col shard [{start}, {start}+{len}) not 32-aligned in [{cols}]"));
+                return ioerr(format!(
+                    "col shard [{start}, {start}+{len}) not 32-aligned in [{cols}]"
+                ));
             }
             let mut out = Vec::with_capacity(rows * len);
             for r in 0..rows {
@@ -145,7 +152,10 @@ fn shard_scale<'b>(view: &'b [u8], shape: &[usize], shard: WShard) -> io::Result
     }
     let (srows, scols) = (shape[0], shape[1]);
     if view.len() != srows * scols {
-        return ioerr(format!("scale bytes {} do not tile [{srows}, {scols}]", view.len()));
+        return ioerr(format!(
+            "scale bytes {} do not tile [{srows}, {scols}]",
+            view.len()
+        ));
     }
     match shard {
         WShard::Rows { start, len } => {
@@ -216,14 +226,8 @@ fn prefault(bytes: &[u8]) {
 /// ranges at ~130 MB/s) — so when the arena can resolve the payload back
 /// to its shard file, read it with one sequential `read()` into anon
 /// memory and copy from there (measured: anon-to-device at ~10 GB/s).
-fn read_up(
-    c: &Cuda,
-    arena: Option<&crate::stream::HostArena>,
-    bytes: &[u8],
-) -> io::Result<D<u8>> {
-    if let Some((path, off)) =
-        arena.and_then(|a| a.file_range(bytes.as_ptr(), bytes.len()))
-    {
+fn read_up(c: &Cuda, arena: Option<&crate::stream::HostArena>, bytes: &[u8]) -> io::Result<D<u8>> {
+    if let Some((path, off)) = arena.and_then(|a| a.file_range(bytes.as_ptr(), bytes.len())) {
         use std::io::{Read, Seek, SeekFrom};
         let mut f = std::fs::File::open(&path)?;
         f.seek(SeekFrom::Start(off))?;
@@ -282,11 +286,18 @@ impl W8 {
                 host: None,
             })
         } else {
-            Ok(Self {
-                ptr: None,
-                _own: None,
-                host: Some((bytes.as_ptr(), bytes.len())),
-            })
+            Ok(Self::host_backed(bytes))
+        }
+    }
+
+    /// Unconditionally host-backed, never device-resident: the engram
+    /// embed tables (a 98 GB fp8 slab on the real checkpoint) are gathered
+    /// row-by-row host-side in every mode, including upload mode.
+    fn host_backed(bytes: &[u8]) -> Self {
+        Self {
+            ptr: None,
+            _own: None,
+            host: Some((bytes.as_ptr(), bytes.len())),
         }
     }
 
@@ -759,35 +770,15 @@ fn upload_layer(
         }
         let prod: Vec<f32> = qw.iter().zip(&kw).map(|(&a, &b)| a * b).collect();
         Some(GpuEngram {
-            embed_w: match arena {
-                Some(a) => W8::streamed_or_host(
-                    store.get(&format!("{p}.engram.embed.weight"))?.bytes,
-                    Some(a),
-                    c,
-                )?,
-                None => W8::device(up_u8(
-                    c,
-                    &view_bytes(store, &format!("{p}.engram.embed.weight"))?,
-                )?),
-            },
-            embed_s: match arena {
-                Some(a) => W8::streamed_or_host(
-                    store.get(&format!("{p}.engram.embed.scale"))?.bytes,
-                    Some(a),
-                    c,
-                )?,
-                None => W8::device(up_u8(
-                    c,
-                    &view_bytes(store, &format!("{p}.engram.embed.scale"))?,
-                )?),
-            },
+            embed_w: W8::host_backed(store.get(&format!("{p}.engram.embed.weight"))?.bytes),
+            embed_s: W8::host_backed(store.get(&format!("{p}.engram.embed.scale"))?.bytes),
             wkv: load_q8(
                 store,
                 c,
                 arena,
                 &format!("{p}.engram.wkv.weight"),
                 &format!("{p}.engram.wkv.scale"),
-            WShard::All,
+                WShard::All,
             )?,
             w_prod: up_f32(c, &prod)?,
         })
@@ -829,7 +820,10 @@ fn upload_layer(
                 arena,
                 &format!("{p}.attn.indexer.wq_b.weight"),
                 &format!("{p}.attn.indexer.wq_b.scale"),
-                WShard::Rows { start: rank * inh_l * ihd, len: inh_l * ihd },
+                WShard::Rows {
+                    start: rank * inh_l * ihd,
+                    len: inh_l * ihd,
+                },
             )?,
             weights_proj: {
                 // head shard: rows [rank*inh_l, +inh_l) of [inh, dim],
@@ -908,7 +902,7 @@ fn upload_layer(
         arena,
         &format!("{p}.attn.wq_a.weight"),
         &format!("{p}.attn.wq_a.scale"),
-    WShard::All,
+        WShard::All,
     )?;
     let q_norm_w = up_f32(c, &view_f32(store, &format!("{p}.attn.q_norm.weight"))?)?;
     let wq_b = load_q8(
@@ -917,7 +911,10 @@ fn upload_layer(
         arena,
         &format!("{p}.attn.wq_b.weight"),
         &format!("{p}.attn.wq_b.scale"),
-        WShard::Rows { start: rank * heads_l * hd, len: heads_l * hd },
+        WShard::Rows {
+            start: rank * heads_l * hd,
+            len: heads_l * hd,
+        },
     )?;
     let wkv = load_q8(
         store,
@@ -925,7 +922,7 @@ fn upload_layer(
         arena,
         &format!("{p}.attn.wkv.weight"),
         &format!("{p}.attn.wkv.scale"),
-    WShard::All,
+        WShard::All,
     )?;
     let kv_norm_w = up_f32(c, &view_f32(store, &format!("{p}.attn.kv_norm.weight"))?)?;
     let attn_sink = {
@@ -974,7 +971,7 @@ fn upload_layer(
             arena,
             &format!("{p}.ffn.shared_experts.w1.weight"),
             &format!("{p}.ffn.shared_experts.w1.scale"),
-        WShard::All,
+            WShard::All,
         )?,
         load_q8(
             store,
@@ -982,7 +979,7 @@ fn upload_layer(
             arena,
             &format!("{p}.ffn.shared_experts.w2.weight"),
             &format!("{p}.ffn.shared_experts.w2.scale"),
-        WShard::All,
+            WShard::All,
         )?,
         load_q8(
             store,
@@ -990,7 +987,7 @@ fn upload_layer(
             arena,
             &format!("{p}.ffn.shared_experts.w3.weight"),
             &format!("{p}.ffn.shared_experts.w3.scale"),
-        WShard::All,
+            WShard::All,
         )?,
     ];
 
@@ -1437,7 +1434,15 @@ impl GpuModel<'static> {
                 eps,
             );
 
-            moe_step(c, cfg, layer, s, arena_opt, sharding, comm_opt.as_deref_mut())?;
+            moe_step(
+                c,
+                cfg,
+                layer,
+                s,
+                arena_opt,
+                sharding,
+                comm_opt.as_deref_mut(),
+            )?;
 
             {
                 let h_next = 1 - h_cur;
@@ -1486,7 +1491,10 @@ impl GpuModel<'static> {
         );
         if let Some(comm) = comm_opt.as_deref_mut() {
             let mut part = vec![0.0f32; vocab_l];
-            s.logits.index(0..vocab_l).copy_to(&mut part).map_err(cuda_err)?;
+            s.logits
+                .index(0..vocab_l)
+                .copy_to(&mut part)
+                .map_err(cuda_err)?;
             let full = comm.allgather(&part)?;
             s.logits.copy_from(&full).map_err(cuda_err)?;
         }
@@ -1535,7 +1543,13 @@ impl GpuModel<'static> {
         let mut store: Box<dyn WeightStore> = Box::new(CkptStore::new(ckpt));
         validate_dims(&cfg)?;
         validate_layout(&cfg, store.as_mut())?;
-        Self::build(cfg, store.as_mut(), DEFAULT_MAX_SEQ_LEN, None, &Sharding::default())
+        Self::build(
+            cfg,
+            store.as_mut(),
+            DEFAULT_MAX_SEQ_LEN,
+            None,
+            &Sharding::default(),
+        )
     }
 
     /// Load from deterministically generated synthetic weights — the gate:
@@ -1592,8 +1606,13 @@ impl<'a> GpuModel<'a> {
         validate_layout(&cfg, store.as_mut())?;
         eprintln!("streaming: layout validated in {:?}", t_v.elapsed());
         let t_b = std::time::Instant::now();
-        let mut model =
-            Self::build(cfg, store.as_mut(), DEFAULT_MAX_SEQ_LEN, Some(&arena), &Sharding::default())?;
+        let mut model = Self::build(
+            cfg,
+            store.as_mut(),
+            DEFAULT_MAX_SEQ_LEN,
+            Some(&arena),
+            &Sharding::default(),
+        )?;
         eprintln!("streaming: weight pass in {:?}", t_b.elapsed());
         // the borrow above ended when build returned, so the arena and
         // store can move into the model; both keep the shard mmaps alive
@@ -1645,10 +1664,57 @@ impl<'a> GpuModel<'a> {
         let mut store: Box<dyn WeightStore + 'a> = Box::new(CkptStore::new(ckpt));
         validate_layout(&cfg, store.as_mut())?;
         let t_b = std::time::Instant::now();
-        let mut model =
-            Self::build(cfg, store.as_mut(), DEFAULT_MAX_SEQ_LEN, Some(&arena), &sharding)?;
-        eprintln!("tp4 rank {}: weight pass in {:?}", sharding.rank, t_b.elapsed());
+        let mut model = Self::build(
+            cfg,
+            store.as_mut(),
+            DEFAULT_MAX_SEQ_LEN,
+            Some(&arena),
+            &sharding,
+        )?;
+        eprintln!(
+            "tp4 rank {}: weight pass in {:?}",
+            sharding.rank,
+            t_b.elapsed()
+        );
         model.arena = Some(arena);
+        model.store_keepalive = Some(store);
+        model.sharding = sharding;
+        model.comm = Some(comm);
+        Ok(model)
+    }
+
+    /// TP4 upload mode: the rank's whole slice lives on the device as
+    /// ordinary cudaMalloc memory (GB10: device memory IS unified DRAM,
+    /// 226 GB/s measured — docs/streaming.md). The routed-expert slice is
+    /// ~69 GB fp4/rank, projections/head/shared expert a few more GB, the
+    /// engram tables (189 GB) stay host-backed and gather rows host-side,
+    /// so the 475 GB checkpoint fits 4 x 128 GB with zero registration and
+    /// zero per-use staging. This is the production path: the DEVICEMAP
+    /// registration ceiling (~64-70 GB on driver 580.178.04, above which
+    /// the RM wedges in an unhandled-interrupt storm) can never cover the
+    /// slice, and per-use staging leaves decode 50x off the streaming
+    /// floor.
+    pub fn from_checkpoint_tp4(
+        ckpt: &'a mut Checkpoint,
+        sharding: Sharding,
+        comm: Box<dyn Collectives>,
+    ) -> io::Result<GpuModel<'a>> {
+        if sharding.world_size != 4 {
+            return ioerr("TP4 needs world_size 4".into());
+        }
+        let cfg = RefConfig::from_model_config(&ckpt.config)?;
+        validate_dims(&cfg)?;
+        let mut store: Box<dyn WeightStore + 'a> = Box::new(CkptStore::new(ckpt));
+        validate_layout(&cfg, store.as_mut())?;
+        let t_b = std::time::Instant::now();
+        let mut model = Self::build(cfg, store.as_mut(), DEFAULT_MAX_SEQ_LEN, None, &sharding)?;
+        eprintln!(
+            "tp4 rank {}: upload weight pass in {:?} ({}/{} experts device-resident)",
+            sharding.rank,
+            t_b.elapsed(),
+            cfg.n_routed / sharding.world_size,
+            cfg.n_routed
+        );
         model.store_keepalive = Some(store);
         model.sharding = sharding;
         model.comm = Some(comm);
@@ -2393,7 +2459,10 @@ fn attention_step(
     // wo_b is row-parallel: fp32 partial-sum all-reduce (spec §3)
     if let Some(comm) = comm.as_deref_mut() {
         let mut part = vec![0.0f32; dim];
-        s.attn_out.index(0..dim).copy_to(&mut part).map_err(cuda_err)?;
+        s.attn_out
+            .index(0..dim)
+            .copy_to(&mut part)
+            .map_err(cuda_err)?;
         let red = comm.allreduce(&part)?;
         s.attn_out.copy_from(&red).map_err(cuda_err)?;
     }

@@ -49,7 +49,10 @@ pub fn moe(cfg: &RefConfig, ctx: &mut Ctx<'_>, layer: u32, x: &[f32]) -> io::Res
     order.sort_by(|&a, &b| biased[b].total_cmp(&biased[a]).then(a.cmp(&b)));
     order.truncate(topk);
     let mut weights: Vec<f32> = order.iter().map(|&i| scores[i]).collect();
-    crate::dump::f32s(format!("d_pos{}_gscores{layer}.f32", crate::dump::pos()), &scores);
+    crate::dump::f32s(
+        format!("d_pos{}_gscores{layer}.f32", crate::dump::pos()),
+        &scores,
+    );
     crate::dump::i32s(
         format!("d_pos{}_gorder{layer}.i32", crate::dump::pos()),
         &order.iter().map(|&i| i as i32).collect::<Vec<_>>(),
@@ -63,7 +66,10 @@ pub fn moe(cfg: &RefConfig, ctx: &mut Ctx<'_>, layer: u32, x: &[f32]) -> io::Res
     for w in weights.iter_mut() {
         *w *= cfg.route_scale;
     }
-    crate::dump::f32s(format!("d_pos{}_gweights{layer}.f32", crate::dump::pos()), &weights);
+    crate::dump::f32s(
+        format!("d_pos{}_gweights{layer}.f32", crate::dump::pos()),
+        &weights,
+    );
 
     // fp32 accumulator, experts added in expert-id order (model.py:895)
     let mut y = vec![0.0f32; dim];
@@ -208,11 +214,17 @@ mod tests {
             *v = ((i % 7) as f32 - 3.0) * 0.11;
         }
 
-        let mut ctx = Ctx { store: store.as_mut(), lru: &mut lru };
+        let mut ctx = Ctx {
+            store: store.as_mut(),
+            lru: &mut lru,
+        };
         let a = expert_hidden(&cfg, &mut ctx, "layers.0.ffn", 0, &x, 1.0).unwrap();
         let b = expert_hidden(&cfg, &mut ctx, "layers.0.ffn", 0, &x, 1.5).unwrap();
         let exact_scale: Vec<f32> = a.iter().map(|&v| 1.5 * v).collect();
-        assert_ne!(b, exact_scale, "routing weight looks post-w2 (pure scaling)");
+        assert_ne!(
+            b, exact_scale,
+            "routing weight looks post-w2 (pure scaling)"
+        );
         assert!(b.iter().all(|v| v.is_finite()));
     }
 }

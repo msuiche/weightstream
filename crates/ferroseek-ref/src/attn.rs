@@ -431,7 +431,12 @@ fn indexer(
     }
 
     let topk = (cfg.index_topk as usize).min(compress_len);
-    Ok(select_topk(&score, topk, compress_len, cfg.window_size as i32))
+    Ok(select_topk(
+        &score,
+        topk,
+        compress_len,
+        cfg.window_size as i32,
+    ))
 }
 
 /// Decode-path top-k over indexer scores (model.py:579-581): deterministic

@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::nodes::RingCfg;
-use crate::verbs::{PortRef, PollBatch, PollEvent, PollKind, Qp, Verbs, VerbsError, VerbsResult};
+use crate::verbs::{PollBatch, PollEvent, PollKind, PortRef, Qp, Verbs, VerbsError, VerbsResult};
 
 const RECV_BACKLOG: usize = 128;
 // ping tag: the low byte of an all-reduce imm is a source rank (0..3), so
@@ -45,7 +45,12 @@ pub struct RailEnd {
 
 impl Clone for RailEnd {
     fn clone(&self) -> Self {
-        RailEnd { qpn: self.qpn, gid: self.gid, rkey: self.rkey, slots_addr: self.slots_addr }
+        RailEnd {
+            qpn: self.qpn,
+            gid: self.gid,
+            rkey: self.rkey,
+            slots_addr: self.slots_addr,
+        }
     }
 }
 
@@ -180,32 +185,35 @@ impl Ring {
         }
 
         let endpoints = serde_json::json!({ "rank": cfg.me, "eps": eps });
-        Ok((Ring {
-            nranks: 4,
-            me: cfg.me,
-            elems,
-            verbs,
-            buf,
-            base,
-            mrs,
-            qp_dev,
-            links,
-            qps,
-            qpn_map,
-            peers: BTreeMap::new(),
-            recv_posted,
-            pending_sends,
-            step: 0,
-            cur_seq: u16::MAX, // first step uses seq 0
-            cur_mask: 0,
-            next_mask: 0,
-            wait,
-            out_off,
-            ping_off,
-            gather_off,
-            coll_us: 0.0,
-            coll_count: 0,
-        }, endpoints))
+        Ok((
+            Ring {
+                nranks: 4,
+                me: cfg.me,
+                elems,
+                verbs,
+                buf,
+                base,
+                mrs,
+                qp_dev,
+                links,
+                qps,
+                qpn_map,
+                peers: BTreeMap::new(),
+                recv_posted,
+                pending_sends,
+                step: 0,
+                cur_seq: u16::MAX, // first step uses seq 0
+                cur_mask: 0,
+                next_mask: 0,
+                wait,
+                out_off,
+                ping_off,
+                gather_off,
+                coll_us: 0.0,
+                coll_count: 0,
+            },
+            endpoints,
+        ))
     }
 
     /// Apply the head's aggregate endpoint map and connect every QP (RTR).
@@ -219,8 +227,7 @@ impl Ring {
             let eps = entries
                 .iter()
                 .find(|ep| ep["rank"].as_u64() == Some(peer as u64))
-                .ok_or_else(|| format!("endpoint map missing rank {peer}"))?
-                ["eps"]
+                .ok_or_else(|| format!("endpoint map missing rank {peer}"))?["eps"]
                 .as_array()
                 .ok_or("eps missing")?;
             let e = eps
@@ -230,7 +237,10 @@ impl Ring {
                         && e["rail"].as_u64() == Some(rail as u64)
                 })
                 .ok_or_else(|| {
-                    format!("rank {peer} has no endpoint toward rank {} rail {rail}", self.me)
+                    format!(
+                        "rank {peer} has no endpoint toward rank {} rail {rail}",
+                        self.me
+                    )
                 })?;
             let mut end = RailEnd {
                 qpn: e["qpn"].as_u64().ok_or("qpn")? as u32,
@@ -524,9 +534,7 @@ impl Ring {
                             }
                             PollKind::Recv { .. } => {
                                 if k != key {
-                                    return Err(
-                                        "unexpected recv on non-ping QP during ping".into()
-                                    );
+                                    return Err("unexpected recv on non-ping QP during ping".into());
                                 }
                                 let posted = ring.recv_posted.get_mut(&k).unwrap();
                                 *posted = posted.saturating_sub(1);
