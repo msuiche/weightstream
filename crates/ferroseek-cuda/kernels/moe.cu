@@ -46,7 +46,7 @@ extern "C" __global__ void moe_gate(
 // Thread 0 over the gate's scores: bias-steered top-k, unbiased weights,
 // 1e-20 norm, route_scale — identical arithmetic to the old inline loop.
 extern "C" __global__ void moe_select(
-    const float* __restrict__ scores,     // [n_experts]
+    float* __restrict__ scores,           // [n_experts] scratch: taken entries neutralized
     const float* __restrict__ bias,       // [n_experts]
     float* __restrict__ out_weights,      // [top_k]
     int* __restrict__ out_indices,        // [top_k]
