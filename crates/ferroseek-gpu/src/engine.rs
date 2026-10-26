@@ -495,7 +495,12 @@ struct Scratch {
     y_moe: D<f32>,
     gate_buf: D<f32>,
     up_buf: D<f32>,
-    // grouped-expert path (moe_grouped.cu): slot-strided buffers
+    // grouped-expert path (moe_grouped.cu): slot-strided buffers; h_e/
+    // expert_y/latent/krow serve the host-dispatch path (streaming mode)
+    h_e: D<f32>,
+    expert_y: D<f32>,
+    latent: D<f32>,
+    krow: D<f32>,
     local_slots: D<i32>,
     local_count: D<i32>,
     h_slots: D<f32>,
