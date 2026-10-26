@@ -16,3 +16,4 @@ cust = { version = "0.3", optional = true }
 serde_json = "1"
 libc = "0.2"
 ferroseek-transport = { path = "../ferroseek-transport" }
+rayon = "1.12.0"

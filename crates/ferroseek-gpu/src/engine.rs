@@ -44,6 +44,7 @@ use ferroseek_ref::config::RefConfig;
 use ferroseek_ref::engram::{hash_ids, EngramLayout};
 use ferroseek_ref::model::{validate_dims, validate_layout};
 use ferroseek_ref::store::{bytes_to_f32, CkptStore, DType, SyntheticWeights, WeightStore};
+use rayon::prelude::*;
 use std::io;
 use std::time::Instant;
 
@@ -1414,9 +1415,21 @@ impl GpuModel<'static> {
                                 std::slice::from_raw_parts(sp, slen),
                             )
                         };
-                        let mut flat = Vec::with_capacity(ncols * ehd);
-                        for &id in ids.iter().take(ncols) {
-                            let r = id as usize;
+                        // Rows are gathered in parallel: each row starts a
+                        // distinct page of the 98 GB slab, and with ~80 GB
+                        // of device allocations in the same unified RAM the
+                        // slab is mostly cold — a serial gather pays one
+                        // NVMe fault per row (~650 us each, 31 ms of a
+                        // 125 ms step). Chunked rayon (par_chunks) faults
+                        // 24 pages concurrently through the page cache.
+                        // Row values are written to disjoint slices, so
+                        // the fp32 results are identical to the serial
+                        // gather.
+                        let rows: Vec<usize> =
+                            ids.iter().take(ncols).map(|&id| id as usize).collect();
+                        let mut flat = vec![0.0f32; rows.len() * ehd];
+                        for (chunk, r) in flat.par_chunks_mut(ehd).zip(rows.iter()) {
+                            let r = *r;
                             if r * ehd + ehd > wt.len() {
                                 return Err(io::Error::new(
                                     io::ErrorKind::InvalidInput,
@@ -1426,7 +1439,8 @@ impl GpuModel<'static> {
                                     ),
                                 ));
                             }
-                            flat.extend(ferroseek_ref::store::fp8_row_scaled(wt, st, r, ehd));
+                            let row = ferroseek_ref::store::fp8_row_scaled(wt, st, r, ehd);
+                            chunk.copy_from_slice(&row);
                         }
                         // pinned async staging: the two pageable copy_from
                         // calls each drained the queue (engram measured
