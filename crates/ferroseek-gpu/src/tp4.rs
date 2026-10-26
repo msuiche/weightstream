@@ -142,7 +142,7 @@ impl Session {
         match &mut self.ctrl {
             Ctrl::Head(h) => match request {
                 Some(req) => {
-                    h.send_go(Phase::Next, req)
+                    h.send_go(Phase::Next, req.clone())
                         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
                     h.collect_ready(Duration::from_secs(600))
                         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
