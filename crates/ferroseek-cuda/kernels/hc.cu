@@ -29,25 +29,17 @@ extern "C" __global__ void hc_block(
     __shared__ float s_mix[24];
     if (mix_hc > 24) return; // spec constant: (2+4)*4
 
-    // rstd over the whole flattened stream (one statistic per token) —
-    // warp shuffle reduce, then one lane 0 per warp sums in shared
-    // (blockDim may exceed 256: block_reduce_sum's buf[256] would OOB)
+    // rstd over the whole flattened stream — the original 256-thread
+    // block_reduce_sum (strided partials + tree). Round 2's warp-shuffle
+    // variant changed the fp32 reduction shape and flipped generated
+    // tokens (the hc sigmoid/Sinkhorn amplifies rstd rounding); blockDim
+    // returns to 256 so buf[256] is in-bounds again.
     float acc = 0.0f;
     for (int i = threadIdx.x; i < hc_dim; i += blockDim.x) {
         float v = x[i];
         acc += v * v;
     }
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
-    __shared__ float s_warp[32];
-    if ((threadIdx.x & 31) == 0) s_warp[threadIdx.x >> 5] = acc;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float t = 0.0f;
-        for (int w = 0; w < (int)(blockDim.x >> 5); w++) t += s_warp[w];
-        s_sumsq = t;
-    }
+    block_reduce_sum(acc, &s_sumsq);
     __syncthreads();
     float rstd = rsqrtf(s_sumsq / (float)hc_dim + 1e-20f);
 
