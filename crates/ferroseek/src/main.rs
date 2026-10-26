@@ -8,6 +8,7 @@ USAGE:
     ferroseek info <model-dir>     Parse config.json, print shape and KV sizing
     ferroseek weights <model-dir>  Validate shard coverage against the DS4.1F census
     ferroseek tokens <model-dir> <text>  Encode text, print token ids
+    ferroseek decode <model-dir> <prompt> [max-tokens]  Greedy decode on the CPU reference engine
     ferroseek serve <model-dir>    OpenAI-compatible endpoint (phase 3)
     ferroseek bench <model-dir>    Decode/prefill microbench (phase 4)
 
@@ -20,6 +21,7 @@ fn main() -> ExitCode {
         Some("info") => cmd_info(args.get(1)),
         Some("weights") => cmd_weights(args.get(1)),
         Some("tokens") => cmd_tokens(args.get(1), args.get(2)),
+        Some("decode") => cmd_decode(args.get(1), args.get(2), args.get(3)),
         Some("serve") | Some("bench") => {
             eprintln!(
                 "{}: not yet — phases and kernel strategy in docs/architecture.md",
@@ -136,6 +138,82 @@ fn cmd_weights(dir: Option<&String>) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+fn cmd_decode(dir: Option<&String>, prompt: Option<&String>, max_tokens: Option<&String>) -> ExitCode {
+    let (Some(dir), Some(prompt)) = (dir, prompt) else {
+        eprint!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    let max_tokens: u32 = max_tokens.and_then(|s| s.parse().ok()).unwrap_or(16);
+    let dir = Path::new(dir);
+
+    let tk = match ferroseek_tokenizer::Tokenizer::from_model_dir(dir) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("tokenizer: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut ckpt = match ferroseek_core::Checkpoint::open(dir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("checkpoint: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("loading model (mmap, dequant on demand)…");
+    let mut model = match ferroseek_ref::RefModel::from_checkpoint(&mut ckpt) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("model: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("note: engram token_map is identity (compressed map not built yet)");
+
+    let ids = tk.encode(prompt);
+    if ids.is_empty() {
+        eprintln!("empty prompt");
+        return ExitCode::from(2);
+    }
+    let t0 = std::time::Instant::now();
+    let mut logits = Vec::new();
+    let mut pos = 0u64;
+    for &t in &ids {
+        match model.decode(t, pos) {
+            Ok(l) => logits = l,
+            Err(e) => {
+                eprintln!("decode@{pos}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        pos += 1;
+    }
+    eprintln!("prefill: {} tokens in {:?}", ids.len(), t0.elapsed());
+
+    let mut generated = Vec::new();
+    for _ in 0..max_tokens {
+        let next = ferroseek_ref::sample::argmax(&logits);
+        generated.push(next);
+        let t1 = std::time::Instant::now();
+        let hit_eos = Some(next) == tk.eos_token_id;
+        if hit_eos {
+            break;
+        }
+        match model.decode(next, pos) {
+            Ok(l) => logits = l,
+            Err(e) => {
+                eprintln!("decode@{pos}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        pos += 1;
+        eprintln!("  [{}] {} ( {:?} )", pos, tk.decode(&[next]), t1.elapsed());
+    }
+
+    println!("---\n{}", tk.decode(&generated));
+    ExitCode::SUCCESS
 }
 
 fn cmd_tokens(dir: Option<&String>, text: Option<&String>) -> ExitCode {

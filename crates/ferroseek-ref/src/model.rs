@@ -267,7 +267,14 @@ impl<'a> RefModel<'a> {
         let specs = crate::layout::layout(&self.cfg);
         for (name, spec) in &specs {
             let view = self.store.get(name)?;
-            if view.shape != spec.shape {
+            // FP4 weights pack two values per byte: on disk [rows, cols/2];
+            // synthetic stores keep the logical shape. Accept both.
+            let shape_ok = view.shape == spec.shape
+                || (spec.kind == crate::layout::TKind::Fp4
+                    && view.shape.len() == 2
+                    && view.shape[0] == spec.shape[0]
+                    && view.shape[1] * 2 == spec.shape[1]);
+            if !shape_ok {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -283,7 +290,22 @@ impl<'a> RefModel<'a> {
                 crate::layout::TKind::Fp4 => crate::store::DType::Fp4Packed,
                 crate::layout::TKind::E8m0 => crate::store::DType::E8m0,
             };
-            if view.dtype != want {
+            // The raw HF export keeps wo_a quantized (fp8+ue8m0) — convert.py
+            // host-dequantizes it for the reference stack. Accept both; the
+            // dense path dequantizes on read (spec §11).
+            let want = if want == crate::store::DType::Bf16
+                && view.dtype == crate::store::DType::Fp8E4m3
+                && name.ends_with(".weight")
+            {
+                crate::store::DType::Fp8E4m3
+            } else {
+                want
+            };
+            // Small fp32-routine tensors (compressor wkv/wgate) are exported
+            // bf16 and upcast at load; the dense path already decodes to f32.
+            let dtype_ok = view.dtype == want
+                || (want == crate::store::DType::F32 && view.dtype == crate::store::DType::Bf16);
+            if !dtype_ok {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("{name}: dtype {:?} != expected {:?}", view.dtype, want),

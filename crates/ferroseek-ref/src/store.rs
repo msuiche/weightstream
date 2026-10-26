@@ -402,11 +402,42 @@ impl DenseLru {
         }
     }
 
-    /// f32 values of a bf16/f32 tensor, converting on first use.
+    /// f32 values of a dense tensor, converting on first use. Raw-export
+    /// fp8+ue8m0 tensors (wo_a in the 1017 export) are dequantized here —
+    /// convert.py does the same host-side for the reference stack.
     pub fn get(&mut self, store: &mut dyn WeightStore, name: &str) -> io::Result<&[f32]> {
         if !self.map.contains_key(name) {
-            let view = store.get(name)?;
-            let data = bytes_to_f32(&view)?;
+            let data = match name.strip_suffix(".weight") {
+                Some(prefix) => {
+                    let scale_name = format!("{prefix}.scale");
+                    match store.get2(name, &scale_name) {
+                        Ok((w, s))
+                            if w.dtype == DType::Fp8E4m3 && s.dtype == DType::E8m0 =>
+                        {
+                            let (rows, cols) = match w.shape.as_slice() {
+                                [r, c] => (*r, *c),
+                                _ => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!("{name}: fp8 weight not 2-D: {:?}", w.shape),
+                                    ))
+                                }
+                            };
+                            ferroseek_core::quant::dequant_fp8_blockwise(
+                                w.bytes, s.bytes, rows, cols,
+                            )
+                        }
+                        _ => {
+                            let view = store.get(name)?;
+                            bytes_to_f32(&view)?
+                        }
+                    }
+                }
+                None => {
+                    let view = store.get(name)?;
+                    bytes_to_f32(&view)?
+                }
+            };
             let sz = data.len() * 4;
             if self.bytes + sz > self.budget {
                 self.evict(self.bytes + sz - self.budget);

@@ -11,4 +11,5 @@ path = "src/main.rs"
 
 [dependencies]
 ferroseek-core = { path = "../ferroseek-core" }
+ferroseek-ref = { path = "../ferroseek-ref" }
 ferroseek-tokenizer = { path = "../ferroseek-tokenizer" }
