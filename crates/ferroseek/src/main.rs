@@ -8,7 +8,10 @@ USAGE:
     ferroseek info <model-dir>     Parse config.json, print shape and KV sizing
     ferroseek weights <model-dir>  Validate shard coverage against the DS4.1F census
     ferroseek tokens <model-dir> <text>  Encode text, print token ids
-    ferroseek decode <model-dir> <prompt> [max-tokens]  Greedy decode on the CPU reference engine
+    ferroseek decode <model-dir> <prompt> [max-tokens] [--engine cpu|gpu] [--stream]
+                                   Greedy decode (default: cpu reference engine;
+                                   gpu + --stream reads weights straight from the
+                                   registered checkpoint mmaps, docs/streaming.md)
     ferroseek serve <model-dir>    OpenAI-compatible endpoint (phase 3)
     ferroseek bench <model-dir>    Decode/prefill microbench (phase 4)
 
@@ -140,6 +143,87 @@ fn cmd_weights(dir: Option<&String>) -> ExitCode {
     }
 }
 
+/// A decode engine behind the CLI: the CPU reference (default) or the GPU
+/// engine with cuda-gated construction.
+trait Decoder {
+    fn decode(&mut self, token: u32, position: u64) -> std::io::Result<Vec<f32>>;
+    fn set_token_map(&mut self, map: Vec<i64>);
+}
+
+impl Decoder for ferroseek_ref::RefModel<'_> {
+    fn decode(&mut self, token: u32, position: u64) -> std::io::Result<Vec<f32>> {
+        self.decode(token, position)
+    }
+    fn set_token_map(&mut self, map: Vec<i64>) {
+        self.set_token_map(map)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Decoder for ferroseek_gpu::engine::GpuModel<'static> {
+    // the CLI leaks the checkpoint for process lifetime, so the streaming
+    // model is always 'static here
+    fn decode(&mut self, token: u32, position: u64) -> std::io::Result<Vec<f32>> {
+        self.decode(token, position)
+    }
+    fn set_token_map(&mut self, map: Vec<i64>) {
+        self.set_token_map(map)
+    }
+}
+
+fn ferroseek_gpu_stream_env() -> bool {
+    std::env::var("FERROSEEK_STREAM").map(|v| v == "1").unwrap_or(false)
+}
+
+#[cfg(feature = "cuda")]
+fn build_engine(
+    engine: &str,
+    ckpt: ferroseek_core::Checkpoint,
+    stream: bool,
+) -> std::io::Result<Box<dyn Decoder>> {
+    match engine {
+        "gpu" => {
+            if stream {
+                // Streaming weights live in the checkpoint's shard mmaps,
+                // so the model borrows it: leak one box for the process
+                // lifetime of this CLI run (mappings stay registered until
+                // exit).
+                let ckpt: &'static mut ferroseek_core::Checkpoint = Box::leak(Box::new(ckpt));
+                let model = ferroseek_gpu::engine::GpuModel::from_checkpoint_streaming(ckpt)?;
+                Ok(Box::new(model))
+            } else {
+                let ckpt: &'static mut ferroseek_core::Checkpoint = Box::leak(Box::new(ckpt));
+                let model = ferroseek_gpu::engine::GpuModel::from_checkpoint(ckpt)?;
+                Ok(Box::new(model))
+            }
+        }
+        _ => {
+            let ckpt: &'static mut ferroseek_core::Checkpoint = Box::leak(Box::new(ckpt));
+            let model = ferroseek_ref::RefModel::from_checkpoint(ckpt)?;
+            Ok(Box::new(model))
+        }
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn build_engine(
+    engine: &str,
+    mut ckpt: ferroseek_core::Checkpoint,
+    _stream: bool,
+) -> std::io::Result<Box<dyn Decoder>> {
+    if engine == "gpu" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "built without --features cuda; rebuild with `cargo build --features ferroseek/cuda`",
+        ));
+    }
+    // the CPU ref engine borrows the checkpoint (mmap-backed weights); the
+    // CLI runs one decode and exits, so leak one box for process lifetime
+    let ckpt: &'static mut ferroseek_core::Checkpoint = Box::leak(Box::new(ckpt));
+    let model = ferroseek_ref::RefModel::from_checkpoint(ckpt)?;
+    Ok(Box::new(model))
+}
+
 /// `decode <model-dir> <prompt> [max-tokens] [--force-ids "1,2,3"] [--logits-out path]`
 fn cmd_decode(args: &[String]) -> ExitCode {
     let (Some(dir), Some(prompt)) = (args.get(1), args.get(2)) else {
@@ -149,6 +233,9 @@ fn cmd_decode(args: &[String]) -> ExitCode {
     let max_tokens: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(16);
     let mut force_ids: Vec<u32> = Vec::new();
     let mut logits_out: Option<String> = None;
+    let mut logits_raw: Option<String> = None;
+    let mut engine = "cpu".to_string();
+    let mut stream = false;
     let mut i = 4;
     while i < args.len() {
         match args[i].as_str() {
@@ -163,9 +250,28 @@ fn cmd_decode(args: &[String]) -> ExitCode {
                 logits_out = Some(args[i + 1].clone());
                 i += 2;
             }
+            "--logits-raw" if i + 1 < args.len() => {
+                logits_raw = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--engine" if i + 1 < args.len() => {
+                engine = args[i + 1].clone();
+                i += 2;
+            }
+            "--stream" => {
+                stream = true;
+                i += 1;
+            }
             _ => i += 1,
         }
     }
+    if engine != "cpu" && engine != "gpu" {
+        eprintln!("--engine must be cpu or gpu (got {engine})");
+        return ExitCode::from(2);
+    }
+    // FERROSEEK_STREAM=1 selects the unified-memory streaming path without
+    // the flag (docs/streaming.md)
+    let stream = stream || ferroseek_gpu_stream_env();
     let dir = Path::new(dir);
 
     let tk = match ferroseek_tokenizer::Tokenizer::from_model_dir(dir) {
@@ -175,21 +281,22 @@ fn cmd_decode(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut ckpt = match ferroseek_core::Checkpoint::open(dir) {
+    let ckpt = match ferroseek_core::Checkpoint::open(dir) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("checkpoint: {e}");
             return ExitCode::FAILURE;
         }
     };
-    eprintln!("loading model (mmap, dequant on demand)…");
-    let mut model = match ferroseek_ref::RefModel::from_checkpoint(&mut ckpt) {
+    let t0_load = std::time::Instant::now();
+    let mut model = match build_engine(&engine, ckpt, stream) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("model: {e}");
+            eprintln!("model ({engine}): {e}");
             return ExitCode::FAILURE;
         }
     };
+    eprintln!("model loaded in {:?}", t0_load.elapsed());
     let t_map = std::time::Instant::now();
     match ferroseek_tokenizer::engram_map::build_compressed_token_map(&tk) {
         Ok(map) => {
@@ -215,21 +322,39 @@ fn cmd_decode(args: &[String]) -> ExitCode {
     let mut records: Vec<String> = Vec::new();
     let mut record = |logits: &[f32], pos: u64, consumed: u32, records: &mut Vec<String>| {
         let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let (mut top1, mut top1_idx) = (f32::NEG_INFINITY, 0u32);
+        let (mut top1, mut top2, mut top1_idx) = (f32::NEG_INFINITY, f32::NEG_INFINITY, 0u32);
         let mut sum_exp = 0.0f64;
         for (i, &l) in logits.iter().enumerate() {
             sum_exp += ((l - max) as f64).exp();
             if l > top1 {
+                top2 = top1;
                 top1 = l;
                 top1_idx = i as u32;
+            } else if l > top2 {
+                top2 = l;
             }
         }
         let logprob = logits[consumed as usize] - max - (sum_exp.ln() as f32);
         let rank = logits.iter().filter(|&&l| l > logits[consumed as usize]).count() + 1;
+        let norm = sum_exp.ln() as f32;
         records.push(format!(
-            "{{\"pos\":{pos},\"consumed\":{consumed},\"logprob\":{logprob:.6},\"rank\":{rank},\"top1\":{top1_idx},\"top1_logprob\":{:.6}}}",
-            top1 - max - (sum_exp.ln() as f32)
+            "{{\"pos\":{pos},\"consumed\":{consumed},\"logprob\":{logprob:.6},\"rank\":{rank},\"top1\":{top1_idx},\"top1_logprob\":{:.6},\"top1_top2_gap\":{:.6}}}",
+            top1 - max - norm,
+            top1 - top2
         ));
+    };
+
+    if let Some(dir) = &logits_raw {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let dump_raw = |logits: &[f32], pos: u64, dir: &Option<String>| {
+        if let Some(d) = dir {
+            let path = std::path::Path::new(d).join(format!("pos{pos}.f32"));
+            let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+            if let Err(e) = std::fs::write(&path, bytes) {
+                eprintln!("logits-raw {path:?}: {e}");
+            }
+        }
     };
 
     let t0 = std::time::Instant::now();
@@ -237,7 +362,10 @@ fn cmd_decode(args: &[String]) -> ExitCode {
     let mut pos = 0u64;
     for (i, &t) in ids.iter().enumerate() {
         match model.decode(t, pos) {
-            Ok(l) => logits = l,
+            Ok(l) => {
+                logits = l;
+                dump_raw(&logits, pos, &logits_raw);
+            }
             Err(e) => {
                 eprintln!("decode@{pos}: {e}");
                 return ExitCode::FAILURE;
@@ -268,7 +396,10 @@ fn cmd_decode(args: &[String]) -> ExitCode {
             break;
         }
         match model.decode(next, pos) {
-            Ok(l) => logits = l,
+            Ok(l) => {
+                logits = l;
+                dump_raw(&logits, pos, &logits_raw);
+            }
             Err(e) => {
                 eprintln!("decode@{pos}: {e}");
                 return ExitCode::FAILURE;
