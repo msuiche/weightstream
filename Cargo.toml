@@ -7,6 +7,7 @@ members = [
     "crates/ferroseek-gpu",
     "crates/ferroseek-ref",
     "crates/ferroseek-tokenizer",
+    "crates/ferroseek-transport",
 ]
 
 [workspace.package]
