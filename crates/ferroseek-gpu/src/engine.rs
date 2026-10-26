@@ -45,6 +45,53 @@ use ferroseek_ref::engram::{hash_ids, EngramLayout};
 use ferroseek_ref::model::{validate_dims, validate_layout};
 use ferroseek_ref::store::{bytes_to_f32, CkptStore, DType, SyntheticWeights, WeightStore};
 use std::io;
+use std::time::Instant;
+
+/// Env-gated coarse decode profiler (`FERROSEEK_PROF=1`): wall time per
+/// section of a decode step, aggregated over the run and reported through
+/// `GpuModel::prof_stats` at exit. Zero overhead when the env is unset
+/// (one bool check per section boundary).
+#[derive(Default)]
+pub struct Prof {
+    pub on: bool,
+    pub attn_us: u64,
+    pub moe_us: u64,
+    pub gate_us: u64, // moe routing readback (the per-layer D2H sync)
+    pub engram_us: u64,
+    pub head_us: u64,
+    pub other_us: u64,
+    pub steps: u64,
+}
+
+impl Prof {
+    pub fn from_env() -> Self {
+        Prof {
+            on: std::env::var_os("FERROSEEK_PROF").is_some(),
+            ..Default::default()
+        }
+    }
+    fn add(&mut self, slot: &mut u64, t: Instant) {
+        if self.on {
+            *slot += t.elapsed().as_micros() as u64;
+        }
+    }
+    pub fn summary(&self) -> String {
+        if !self.on {
+            return String::new();
+        }
+        let f = |us: u64| us as f64 / 1e3 / self.steps.max(1) as f64;
+        format!(
+            "prof: steps={} attn={:.1}ms moe={:.1}ms gate={:.1}ms engram={:.1}ms head={:.1}ms other={:.1}ms",
+            self.steps,
+            f(self.attn_us),
+            f(self.moe_us),
+            f(self.gate_us),
+            f(self.engram_us),
+            f(self.head_us),
+            f(self.other_us)
+        )
+    }
+}
 
 /// Default decode-position bound; caches are preallocated for it
 /// (docs/kernels.md: never reallocated mid-sequence).
@@ -526,6 +573,8 @@ pub struct GpuModel<'a> {
     /// TP4 transport (docs/transport.md). None = TP1: no collective is
     /// issued and every reduction point falls through to the local sum.
     pub comm: Option<Box<dyn Collectives>>,
+    /// Decode-section profiler (`FERROSEEK_PROF`, see [`Prof`]).
+    pub prof: Prof,
 }
 
 // ---------------------------------------------------------------------------
@@ -1197,6 +1246,7 @@ impl GpuModel<'static> {
             arena,
             sharding,
             comm,
+            prof,
             ..
         } = self;
         let arena_opt: Option<&crate::stream::HostArena> = arena.as_ref();
@@ -1256,6 +1306,7 @@ impl GpuModel<'static> {
             let layer = &layers[li];
 
             // engram merge before the block (model.py:1264-1266)
+            let t_eng = Instant::now();
             if let Some(ei) = layer.engram {
                 let e = layer.engram_w.as_ref().unwrap();
                 let hash = &hashes[ei];
@@ -1337,6 +1388,7 @@ impl GpuModel<'static> {
                     );
                 }
             }
+            prof.add(&mut prof.engram_us, t_eng);
 
             // attention sublayer wiring (spec §2, model.py:970-996)
             let hc_dim = hc * dim;
@@ -1372,6 +1424,7 @@ impl GpuModel<'static> {
                 eps,
             );
 
+            let t_att = Instant::now();
             attention_step(
                 c,
                 cfg,
@@ -1386,6 +1439,7 @@ impl GpuModel<'static> {
                 sharding,
                 comm_opt.as_deref_mut(),
             )?;
+            prof.add(&mut prof.attn_us, t_att);
 
             {
                 let h_next = 1 - h_cur;
@@ -1434,6 +1488,7 @@ impl GpuModel<'static> {
                 eps,
             );
 
+            let t_moe = Instant::now();
             moe_step(
                 c,
                 cfg,
@@ -1442,7 +1497,9 @@ impl GpuModel<'static> {
                 arena_opt,
                 sharding,
                 comm_opt.as_deref_mut(),
+                prof,
             )?;
+            prof.add(&mut prof.moe_us, t_moe);
 
             {
                 let h_next = 1 - h_cur;
@@ -1480,6 +1537,7 @@ impl GpuModel<'static> {
         // head: the rank's vocab shard produces the first vocab/world
         // logits; TP4 assembles the full vector with the all-gather so
         // every rank samples identically (no token broadcast needed)
+        let t_head = Instant::now();
         let vocab_l = cfg.vocab as usize / world;
         k::f32_gemv(
             c,
@@ -1500,6 +1558,8 @@ impl GpuModel<'static> {
         }
         let mut out = vec![0.0f32; cfg.vocab as usize];
         s.logits.copy_to(&mut out).map_err(cuda_err)?;
+        prof.steps += 1;
+        prof.add(&mut prof.head_us, t_head);
         Ok(out)
     }
 
@@ -1994,6 +2054,7 @@ impl<'a> GpuModel<'a> {
             max_seq,
             sharding: *sh,
             comm: None,
+            prof: Prof::from_env(),
             arena: None,
             store_keepalive: None,
         })
@@ -2504,6 +2565,7 @@ fn moe_step(
     arena: Option<&crate::stream::HostArena>,
     sh: Sharding,
     mut comm: Option<&mut (dyn Collectives + 'static)>,
+    prof: &mut Prof,
 ) -> io::Result<()> {
     let l = layer.layer;
     let dim = cfg.dim as usize;
@@ -2517,6 +2579,7 @@ fn moe_step(
     let e_start = sh.rank as usize * n_experts / world;
     let e_len = n_experts / world;
 
+    let t_gate = Instant::now();
     k::moe_route(
         c,
         k::base(&s.x),
@@ -2534,6 +2597,7 @@ fn moe_step(
     let mut i_host = vec![0i32; top_k];
     s.gate_w_out.copy_to(&mut w_host).map_err(cuda_err)?;
     s.gate_i_out.copy_to(&mut i_host).map_err(cuda_err)?;
+    prof.add(&mut prof.gate_us, t_gate);
 
     crate::dump::i32s(
         format!("d_pos{}_gorder{l}.i32", crate::dump::pos()),

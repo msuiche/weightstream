@@ -182,10 +182,21 @@ impl Decoder for ferroseek_gpu::engine::GpuModel<'static> {
         self.set_token_map(map)
     }
     fn coll_stats(&self) -> String {
-        self.comm.as_ref().map(|c| c.stats()).unwrap_or_default()
+        let coll = self.comm.as_ref().map(|c| c.stats()).unwrap_or_default();
+        let prof = self.prof.summary();
+        match (coll.is_empty(), prof.is_empty()) {
+            (false, false) => format!("{coll}\n{prof}"),
+            (false, true) => coll,
+            (_, prof_is_empty) => {
+                if prof_is_empty {
+                    String::new()
+                } else {
+                    prof
+                }
+            }
+        }
     }
 }
-
 fn ferroseek_gpu_stream_env() -> bool {
     std::env::var("FERROSEEK_STREAM")
         .map(|v| v == "1")
