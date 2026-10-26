@@ -72,10 +72,25 @@ pub struct ModelConfig {
     pub index_n_heads: Option<u32>,
     #[serde(default)]
     pub index_topk: Option<u32>,
+    /// Layers carrying the indexer query projections (8 on DS4.1F-1017;
+    /// the kv_norm/wk half of the indexer lives on kv_source_layer_ids).
+    #[serde(default)]
+    pub index_source_layer_ids: Vec<u32>,
+
+    // DSpark drafter
+    #[serde(default)]
+    pub dspark_n_routed_experts: Option<u32>,
 
     // hyper-connection
     #[serde(default)]
     pub hc_mult: Option<u32>,
+
+    // Engram n-gram tables live on these layers (2 on DS4.1F-1017)
+    #[serde(default)]
+    pub engram_layer_ids: Vec<u32>,
+    // DSpark draft modules (mtp.0..N)
+    #[serde(default)]
+    pub num_nextn_predict_layers: Option<u32>,
 
     #[serde(default)]
     pub max_position_embeddings: Option<u32>,
@@ -113,6 +128,10 @@ impl ModelConfig {
             }
         }
         serde_json::from_value(value)
+    }
+
+    pub fn num_nextn_predict_layers(&self) -> u32 {
+        self.num_nextn_predict_layers.unwrap_or(0)
     }
 
     pub fn is_dsa(&self) -> bool {

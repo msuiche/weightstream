@@ -5,5 +5,7 @@
 
 pub mod config;
 pub mod kv;
+pub mod safetensors;
+pub mod weights;
 
 pub use config::ModelConfig;

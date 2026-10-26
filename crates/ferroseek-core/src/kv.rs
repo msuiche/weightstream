@@ -48,13 +48,13 @@ pub fn pool_tokens(cfg: &ModelConfig, dtype_bytes: u64, budget_bytes: u64, reser
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The real DS4.1F-1017 shape: composite config, 40 layers, 576-wide
     /// latent via head_dim 512 + rope 64, CSA ratio-2 on layers 2–19,
     /// full rate on 20–39, none on 0–1.
-    fn fixture() -> ModelConfig {
+    pub(crate) fn fixture() -> ModelConfig {
         let mut ratios = vec![0u32; 2];
         ratios.extend([2u32; 18]);
         ratios.extend([1u32; 20]);
@@ -75,6 +75,10 @@ mod tests {
                 "qk_rope_head_dim": 64,
                 "compress_ratios": ratios,
                 "kv_source_layer_ids": [2, 8, 14, 20],
+                "index_source_layer_ids": [2, 8, 14, 20, 24, 28, 32, 36],
+                "engram_layer_ids": [1, 14],
+                "num_nextn_predict_layers": 3,
+                "dspark_n_routed_experts": 128,
                 "n_routed_experts": 384,
                 "n_shared_experts": 1,
                 "num_experts_per_tok": 6,

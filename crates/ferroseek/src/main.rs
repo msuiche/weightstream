@@ -5,9 +5,10 @@ use std::process::ExitCode;
 const USAGE: &str = "ferroseek — DGX Spark-native inference for DeepSeek V4.1 Flash
 
 USAGE:
-    ferroseek info <model-dir>   Parse config.json, print shape and KV sizing
-    ferroseek serve <model-dir>  OpenAI-compatible endpoint (phase 3)
-    ferroseek bench <model-dir>  Decode/prefill microbench (phase 4)
+    ferroseek info <model-dir>     Parse config.json, print shape and KV sizing
+    ferroseek weights <model-dir>  Validate shard coverage against the DS4.1F census
+    ferroseek serve <model-dir>    OpenAI-compatible endpoint (phase 3)
+    ferroseek bench <model-dir>    Decode/prefill microbench (phase 4)
 
 Docs: docs/architecture.md
 ";
@@ -16,6 +17,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("info") => cmd_info(args.get(1)),
+        Some("weights") => cmd_weights(args.get(1)),
         Some("serve") | Some("bench") => {
             eprintln!(
                 "{}: not yet — phases and kernel strategy in docs/architecture.md",
@@ -88,4 +90,53 @@ fn cmd_info(dir: Option<&String>) -> ExitCode {
         );
     }
     ExitCode::SUCCESS
+}
+
+fn cmd_weights(dir: Option<&String>) -> ExitCode {
+    let Some(dir) = dir else {
+        eprint!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    let dir = Path::new(dir);
+    let cfg = match ModelConfig::from_file(&dir.join("config.json")) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{}: {e}", dir.join("config.json").display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let index_path = dir.join("model.safetensors.index.json");
+    let index = match ferroseek_core::safetensors::parse_index(&index_path) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("{}: {e}", index_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let expected = ferroseek_core::weights::expected_tensors(&cfg);
+    let (missing, unexpected) = ferroseek_core::weights::diff_index(&cfg, &index);
+
+    let shards: std::collections::BTreeSet<&String> = index.values().collect();
+    println!("tensors         {} in {} shards", index.len(), shards.len());
+    println!("census          {} expected (text model, DS4.1F)", expected.len());
+    println!("coverage        {}/{}", expected.len() - missing.len(), expected.len());
+    if !missing.is_empty() {
+        println!("missing         {} (first 10):", missing.len());
+        for n in missing.iter().take(10) {
+            println!("  - {n}");
+        }
+    }
+    if !unexpected.is_empty() {
+        println!("not in census   {} (first 10):", unexpected.len());
+        for n in unexpected.iter().take(10) {
+            println!("  ? {n}");
+        }
+    }
+    if missing.is_empty() {
+        println!("ok              every serving tensor is present");
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
