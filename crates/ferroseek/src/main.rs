@@ -170,7 +170,19 @@ fn cmd_decode(dir: Option<&String>, prompt: Option<&String>, max_tokens: Option<
             return ExitCode::FAILURE;
         }
     };
-    eprintln!("note: engram token_map is identity (compressed map not built yet)");
+    let t_map = std::time::Instant::now();
+    match ferroseek_tokenizer::engram_map::build_compressed_token_map(&tk) {
+        Ok(map) => {
+            let size = 1 + map.iter().max().copied().unwrap_or(0);
+            eprintln!(
+                "engram token map: {} compressed ids in {:?}",
+                size,
+                t_map.elapsed()
+            );
+            model.set_token_map(map);
+        }
+        Err(e) => eprintln!("warning: engram token map not built ({e}); identity fallback"),
+    }
 
     let ids = tk.encode(prompt);
     if ids.is_empty() {

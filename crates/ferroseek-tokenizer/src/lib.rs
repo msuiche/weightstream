@@ -4,6 +4,8 @@
 
 use std::path::Path;
 
+pub mod engram_map;
+
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
     pub bos_token_id: Option<u32>,
@@ -71,6 +73,11 @@ impl Tokenizer {
 
     pub fn vocab_size(&self) -> usize {
         self.inner.get_vocab_size(true)
+    }
+
+    /// Raw fast tokenizer (engram.py's `backend_tokenizer` equivalent).
+    pub fn inner(&self) -> &tokenizers::Tokenizer {
+        &self.inner
     }
 }
 
