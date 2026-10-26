@@ -66,6 +66,7 @@ extern "C" __global__ void swiglu_limit10(
     if (i >= n) return;
     float g = fminf(gate[i], 10.0f);
     float u = fminf(fmaxf(up[i], -10.0f), 10.0f);
-    float silu = g / (1.0f + expf(-g));
+    // silu exactly as the CPU reference computes it: g * (1 / (1 + exp(-g)))
+    float silu = g * (1.0f / (1.0f + expf(-g)));
     out[i] = silu * u * routing_weight;
 }

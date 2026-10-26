@@ -4,6 +4,7 @@ members = [
     "crates/ferroseek",
     "crates/ferroseek-core",
     "crates/ferroseek-cuda",
+    "crates/ferroseek-gpu",
     "crates/ferroseek-ref",
     "crates/ferroseek-tokenizer",
 ]

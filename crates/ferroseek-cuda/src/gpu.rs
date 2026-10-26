@@ -324,7 +324,9 @@ mod tests {
                 mant = 0;
                 e += 1;
             }
-            if e >= 15 {
+            // E=15 mant 0..6 is the valid 256..448 range; only e>=16
+            // saturates (448 = S.1111.110)
+            if e >= 16 {
                 448.0
             } else {
                 (1.0 + mant as f32 / 8.0) * 2f32.powi(e - 7)
@@ -409,7 +411,8 @@ mod tests {
             mant = 0;
             e += 1;
         }
-        if e >= 15 {
+        // E=15 mant 0..6 is the valid 256..448 range; only e>=16 saturates
+        if e >= 16 {
             return sign | 0x7E; // saturate to 448 (S.1111.110)
         }
         sign | ((e as u8) << 3) | (mant as u8)
@@ -966,7 +969,7 @@ mod tests {
         for i in 0..n {
             let g = gate[i].min(10.0);
             let u = up[i].clamp(-10.0, 10.0);
-            let silu = g / (1.0 + (-g).exp());
+            let silu = g * (1.0 / (1.0 + (-g).exp()));
             expected[i] = silu * u * rw;
         }
         let d_g = DeviceBuffer::from_slice(&gate).unwrap();

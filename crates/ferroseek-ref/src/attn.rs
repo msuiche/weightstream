@@ -11,7 +11,10 @@ use std::io;
 
 /// Sliding-window indices for one decode query (model.py:409-426): the whole
 /// ring, oldest first, with `-1` for slots that hold nothing yet.
-fn window_topk_idxs(window: usize, pos: u64) -> Vec<i32> {
+///
+/// Public: the GPU engine's host glue selects indices for the same ring
+/// layout.
+pub fn window_topk_idxs(window: usize, pos: u64) -> Vec<i32> {
     let oldest = (pos % window as u64 + 1) as usize;
     let mut idxs: Vec<i32> = (oldest..window)
         .chain(0..oldest)
@@ -108,6 +111,9 @@ pub fn attention(
     let dim = cfg.dim as usize;
     let win = cfg.window_size as usize;
     let freqs = &li.freqs;
+    if rt.capture_x.is_some() {
+        rt.capture_x.as_mut().unwrap().push((l, x.to_vec()));
+    }
 
     // query path: q_a -> q_norm -> q_b, rope tail (spec §3, model.py:771-773)
     let qr = {
@@ -127,6 +133,8 @@ pub fn attention(
         fp8_gemv(w.bytes, s.bytes, heads * hd, cfg.q_lora as usize, &qr)
     };
     freqs.apply_heads(&mut q, hd, pos, false);
+    crate::dump::f32s(format!("d_pos{pos}_qr{l}.f32"), &qr);
+    crate::dump::f32s(format!("d_pos{pos}_q{l}.f32"), &q);
 
     // window KV: one shared latent per token, rope tail, fp8 snap, ring write
     let mut kv = {
@@ -186,15 +194,23 @@ pub fn attention(
         let src = rt.compress_slot;
         let rows = &rt.sources[src].compress[..compress_len * hd];
         kv_all.extend_from_slice(rows);
+        if let Some(lat) = &latent {
+            crate::dump::f32s(format!("d_pos{pos}_latent{l}.f32"), lat);
+        }
+        crate::dump::i32s(format!("d_pos{pos}_cmpidxs{l}.i32"), &cmp_idxs);
         idxs.extend(cmp_idxs);
     }
 
     // attention itself (kernel.py:311-403)
     let sink = ctx.dense(&format!("layers.{l}.attn.attn_sink"))?.to_vec();
+    crate::dump::f32s(format!("d_pos{pos}_kvall{l}.f32"), &kv_all);
+    crate::dump::i32s(format!("d_pos{pos}_idxs{l}.i32"), &idxs);
     let mut o = sparse_attn(&q, heads, hd, &kv_all, &idxs, &sink, num::rsqrt(hd as f32));
+    crate::dump::f32s(format!("d_pos{pos}_attnraw{l}.f32"), &o);
 
     // inverse rope on the output tail at the query position (spec §3)
     freqs.apply_heads(&mut o, hd, pos, true);
+    crate::dump::f32s(format!("d_pos{pos}_osnap{l}.f32"), &o);
 
     // grouped output projection: fp8 snap per group row, block-diagonal wo_a,
     // then wo_b (model.py:785-791)
@@ -217,6 +233,7 @@ pub fn attention(
             }
         }
     }
+    crate::dump::f32s(format!("d_pos{pos}_fl{l}.f32"), &fl);
     let out = {
         let (w, s) = ctx.get2(
             &format!("layers.{l}.attn.wo_b.weight"),
@@ -414,13 +431,19 @@ fn indexer(
     }
 
     let topk = (cfg.index_topk as usize).min(compress_len);
-    // deterministic top-k: value desc, index asc (spec §12.6)
+    Ok(select_topk(&score, topk, compress_len, cfg.window_size as i32))
+}
+
+/// Decode-path top-k over indexer scores (model.py:579-581): deterministic
+/// (value desc, index asc) selection (spec §12.6), re-sorted into position
+/// order, shifted by the window offset with `-1` for unreachable entries.
+/// Public: the GPU engine runs this selection host-side for v1.
+pub fn select_topk(score: &[f32], topk: usize, compress_len: usize, offset: i32) -> Vec<i32> {
     let mut order: Vec<usize> = (0..compress_len).collect();
     order.sort_by(|&a, &b| score[b].total_cmp(&score[a]).then(a.cmp(&b)));
     order.truncate(topk);
     order.sort_unstable(); // re-sorted into position order (model.py:580)
-    let offset = cfg.window_size as i32;
-    Ok(order
+    order
         .into_iter()
         .map(|i| {
             if i < compress_len {
@@ -429,13 +452,13 @@ fn indexer(
                 -1
             }
         })
-        .collect())
+        .collect()
 }
 
 /// Level-one top-k: keep the `topk_blocks` best candidate blocks, pinning the
 /// block holding the newest position (select_candidate_blocks,
-/// model.py:584-611).
-fn select_candidate_blocks(score: &[f32], topk_blocks: usize, block_size: usize) -> Vec<bool> {
+/// model.py:584-611). Public: the GPU engine runs level-one host-side.
+pub fn select_candidate_blocks(score: &[f32], topk_blocks: usize, block_size: usize) -> Vec<bool> {
     let width = score.len();
     if width == 0 || topk_blocks == 0 || block_size == 0 {
         return vec![false; width];

@@ -66,6 +66,8 @@ pub mod store;
 #[cfg(test)]
 mod tests;
 
+pub(crate) mod dump;
+
 pub use config::RefConfig;
 pub use model::RefModel;
 pub use sample::{argmax, GumbelSampler};

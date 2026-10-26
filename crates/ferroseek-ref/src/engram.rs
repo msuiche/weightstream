@@ -150,8 +150,8 @@ impl EngramLayout {
 /// (host-side, spec §11), identity is used — synthetic tests and any
 /// checkpoint load start there; call `RefModel::set_token_map` to install
 /// the real one.
-fn token_map(rt: &Runtime, token: i64) -> i64 {
-    match &rt.token_map {
+fn map_token(token_map: Option<&[i64]>, token: i64) -> i64 {
+    match token_map {
         Some(m) => {
             let i = token.clamp(0, m.len() as i64 - 1) as usize;
             m[i]
@@ -164,22 +164,26 @@ fn token_map(rt: &Runtime, token: i64) -> i64 {
 /// (`NgramHashState.forward`, engram.py:159-184). Text-only: no DEAD/image
 /// masking. Look-back stops at the sequence start; missing history takes the
 /// compressed pad id.
-pub fn hash_step(
+///
+/// Public (runtime-free form): the GPU engine hashes host-side on the same
+/// compressed-id cache and uploads the ids.
+pub fn hash_ids(
     cfg: &RefConfig,
     layout: &EngramLayout,
-    rt: &mut Runtime,
+    eng_cache: &mut Vec<i64>,
+    token_map: Option<&[i64]>,
     token: u32,
     pos: u64,
 ) -> Vec<Vec<u64>> {
-    let cid = token_map(rt, token as i64);
-    debug_assert_eq!(rt.engram_ids.len(), pos as usize);
-    rt.engram_ids.push(cid);
-    let pad = token_map(rt, cfg.engram_pad_id as i64);
+    let cid = map_token(token_map, token as i64);
+    debug_assert_eq!(eng_cache.len(), pos as usize);
+    eng_cache.push(cid);
+    let pad = map_token(token_map, cfg.engram_pad_id as i64);
 
     let mut tokens = vec![0i64; layout.max_ngram];
     for shift in 0..layout.max_ngram {
         tokens[shift] = if pos >= shift as u64 {
-            rt.engram_ids[(pos - shift as u64) as usize]
+            eng_cache[(pos - shift as u64) as usize]
         } else {
             pad
         };
@@ -204,6 +208,18 @@ pub fn hash_step(
         out.push(hashes);
     }
     out
+}
+
+/// `hash_ids` over the ref engine's runtime state.
+pub fn hash_step(
+    cfg: &RefConfig,
+    layout: &EngramLayout,
+    rt: &mut Runtime,
+    token: u32,
+    pos: u64,
+) -> Vec<Vec<u64>> {
+    let token_map = rt.token_map.clone();
+    hash_ids(cfg, layout, &mut rt.engram_ids, token_map.as_deref(), token, pos)
 }
 
 /// Merge the n-gram embeddings into the stream `h` (model.py:328-365):

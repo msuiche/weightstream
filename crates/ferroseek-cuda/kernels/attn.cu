@@ -47,7 +47,11 @@ extern "C" __global__ void sparse_attn(
         block_reduce_sum(partial, &s_dot);
         __syncthreads();
 
-        float logit = (idx >= 0) ? s_dot * scale : -1e30f;
+        // invalid indices are -inf, matching kernel.py's acc_s convention:
+        // they contribute exactly zero to the softmax. (-1e30 would
+        // contribute exp(0)=1 each while the running max is still at its
+        // floor, inflating the denominator at early decode positions.)
+        float logit = (idx >= 0) ? s_dot * scale : __int_as_float(0xff800000);
         float mnew = fmaxf(m, logit);
         float corr = expf(m - mnew);
         float w = expf(logit - mnew);

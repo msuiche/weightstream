@@ -28,7 +28,11 @@ __device__ __forceinline__ uint8_t f32_to_e4m3_bits(float v) {
     }
     int mant = (int)rintf((m * 2.0f - 1.0f) * 8.0f);
     if (mant == 8) { mant = 0; e += 1; }
-    if (e >= 15) return sign | 0x7E; // 448
+    // E=15 with mant 0..6 is the valid 256..448 range (448 = S.1111.110);
+    // only the carry past E=15 saturates (unreachable after the 448 clamp,
+    // kept for safety). Saturating at e>=15 instead would snap every value
+    // in (256, 448) to 448, diverging from kernel.py and the CPU reference.
+    if (e >= 16) return sign | 0x7E; // 448
     return sign | (uint8_t)((e << 3) | mant);
 }
 

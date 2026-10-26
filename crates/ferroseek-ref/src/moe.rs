@@ -49,6 +49,11 @@ pub fn moe(cfg: &RefConfig, ctx: &mut Ctx<'_>, layer: u32, x: &[f32]) -> io::Res
     order.sort_by(|&a, &b| biased[b].total_cmp(&biased[a]).then(a.cmp(&b)));
     order.truncate(topk);
     let mut weights: Vec<f32> = order.iter().map(|&i| scores[i]).collect();
+    crate::dump::f32s(format!("d_pos{}_gscores{layer}.f32", crate::dump::pos()), &scores);
+    crate::dump::i32s(
+        format!("d_pos{}_gorder{layer}.i32", crate::dump::pos()),
+        &order.iter().map(|&i| i as i32).collect::<Vec<_>>(),
+    );
     if cfg.norm_topk_prob && topk > 1 {
         let sum: f32 = weights.iter().sum();
         for w in weights.iter_mut() {
@@ -58,15 +63,16 @@ pub fn moe(cfg: &RefConfig, ctx: &mut Ctx<'_>, layer: u32, x: &[f32]) -> io::Res
     for w in weights.iter_mut() {
         *w *= cfg.route_scale;
     }
+    crate::dump::f32s(format!("d_pos{}_gweights{layer}.f32", crate::dump::pos()), &weights);
 
     // fp32 accumulator, experts added in expert-id order (model.py:895)
     let mut y = vec![0.0f32; dim];
     let mut sel: Vec<(usize, f32)> = order.iter().cloned().zip(weights.iter().copied()).collect();
     sel.sort_by_key(|&(e, _)| e); // ascending expert id, matching the reference loop
     for (e, w) in sel {
-        let h = expert_hidden(cfg, ctx, &p, e, x)?;
+        let h = expert_hidden(cfg, ctx, &p, e, x, w)?;
         for d in 0..dim {
-            y[d] += w * h[d];
+            y[d] += h[d];
         }
     }
 
@@ -79,13 +85,16 @@ pub fn moe(cfg: &RefConfig, ctx: &mut Ctx<'_>, layer: u32, x: &[f32]) -> io::Res
 }
 
 /// One routed expert's hidden state: gate/up fp4 GEMMs, asymmetric
-/// swiglu_limit clamps, silu·up (spec §6, model.py:843-853).
+/// swiglu_limit clamps, silu·up, the routing weight folded into the
+/// inter-dim hidden BEFORE the w2 GEMV (spec §6, model.py:843-853 — the
+/// weight scales the quantization amax, so the order is semantic).
 fn expert_hidden(
     cfg: &RefConfig,
     ctx: &mut Ctx<'_>,
     p: &str,
     expert: usize,
     x: &[f32],
+    routing_weight: f32,
 ) -> io::Result<Vec<f32>> {
     let inter = cfg.inter_dim as usize;
     let dim = cfg.dim as usize;
@@ -114,7 +123,7 @@ fn expert_hidden(
         } else {
             gate[i]
         };
-        h[i] = num::silu(g) * u;
+        h[i] = num::silu(g) * u * routing_weight;
     }
     let (w2, s2) = ctx.get2(
         &format!("{p}.experts.{expert}.w2.weight"),
@@ -163,4 +172,47 @@ fn shared_expert_hidden(
         &format!("{p}.shared_experts.w2.scale"),
     )?;
     Ok(fp8_gemv(w2.bytes, s2.bytes, dim, inter, &h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RefConfig;
+    use crate::model::Ctx;
+    use crate::store::{DenseLru, SyntheticWeights, WeightStore};
+    use ferroseek_core::ModelConfig;
+
+    /// The mini test config (mirrors tests::mini_config_json).
+    fn cfg() -> RefConfig {
+        let json = crate::tests::mini_config_json_public();
+        let mc = ModelConfig::from_str(&json).unwrap();
+        RefConfig::from_model_config(&mc).unwrap()
+    }
+
+    /// Spec §6 / model.py:848-853: the routing weight folds into the
+    /// inter-dim hidden BEFORE the w2 GEMV — it scales the fp8 quantization
+    /// amax, so `expert(1.5·w)` must differ from `1.5·expert(w)` in general.
+    /// (Applying the weight after w2 — the old bug — makes the two exactly
+    /// equal: scaling a quantized result by 1.5 is a single f32 multiply.)
+    #[test]
+    fn routing_weight_applies_before_w2() {
+        let cfg = cfg();
+        let mc = ModelConfig::from_str(&crate::tests::mini_config_json_public()).unwrap();
+        let weights = SyntheticWeights::generate(&mc, 31337).unwrap();
+        let mut store: Box<dyn WeightStore> = Box::new(weights);
+        let mut lru = DenseLru::new(1 << 20);
+        let dim = cfg.dim as usize;
+        let mut x = vec![0.5f32; dim];
+        // a spread so the amax/quantization actually bites
+        for (i, v) in x.iter_mut().enumerate() {
+            *v = ((i % 7) as f32 - 3.0) * 0.11;
+        }
+
+        let mut ctx = Ctx { store: store.as_mut(), lru: &mut lru };
+        let a = expert_hidden(&cfg, &mut ctx, "layers.0.ffn", 0, &x, 1.0).unwrap();
+        let b = expert_hidden(&cfg, &mut ctx, "layers.0.ffn", 0, &x, 1.5).unwrap();
+        let exact_scale: Vec<f32> = a.iter().map(|&v| 1.5 * v).collect();
+        assert_ne!(b, exact_scale, "routing weight looks post-w2 (pure scaling)");
+        assert!(b.iter().all(|v| v.is_finite()));
+    }
 }

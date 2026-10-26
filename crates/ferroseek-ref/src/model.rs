@@ -67,6 +67,8 @@ pub struct Runtime {
     pub token_map: Option<Vec<i64>>,
     /// Next expected decode position.
     pub pos: u64,
+    /// Debug: when Some, every attention sublayer records (layer, x).
+    pub capture_x: Option<Vec<(u32, Vec<f32>)>>,
 }
 
 /// Borrow bundle passed through the layer pipeline.
@@ -201,6 +203,7 @@ impl<'a> RefModel<'a> {
             engram_ids: Vec::new(),
             token_map: None,
             pos: 0,
+            capture_x: None,
         };
         Ok(Self {
             cfg,
@@ -215,104 +218,15 @@ impl<'a> RefModel<'a> {
     /// Reject configs whose tensor geometry would violate the quantization
     /// block constraints (32-divisibility) or the head/group wiring.
     fn validate_dims(cfg: &RefConfig) -> io::Result<()> {
-        let err = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
-        let hd = cfg.head_dim as usize;
-        let heads = cfg.n_heads as usize;
-        if hd % 32 != 0 {
-            return Err(err("head_dim must be 32-divisible (fp8 act blocks)".into()));
-        }
-        if heads * hd % (cfg.o_groups as usize) != 0 {
-            return Err(err(
-                "n_heads * head_dim must be divisible by o_groups".into()
-            ));
-        }
-        if heads * hd / cfg.o_groups as usize % 32 != 0 {
-            return Err(err("wo_a group row must be 32-divisible".into()));
-        }
-        if cfg.dim as usize % 32 != 0 || cfg.q_lora as usize % 32 != 0 {
-            return Err(err("dim and q_lora_rank must be 32-divisible".into()));
-        }
-        if cfg.o_groups as usize * cfg.o_lora as usize % 32 != 0 {
-            return Err(err("o_groups * o_lora_rank must be 32-divisible".into()));
-        }
-        if cfg
-            .index_sources
-            .iter()
-            .any(|&l| cfg.compress_ratios.get(l as usize).copied().unwrap_or(0) == 0)
-        {
-            return Err(err(
-                "index_source_layer on a ratio-0 layer (spec forbids)".into()
-            ));
-        }
-        for &s in &cfg.kv_sources {
-            let r = cfg.compress_ratios.get(s as usize).copied().unwrap_or(0);
-            if r == 0 {
-                return Err(err("kv_source_layer with compress_ratio 0".into()));
-            }
-            if !cfg.index_sources.contains(&s) {
-                return Err(err(
-                    "every kv source must also be an index source (spec §4)".into(),
-                ));
-            }
-        }
-        if !cfg.engram_layers.is_empty() && cfg.engram_head_dim as usize % 32 != 0 {
-            return Err(err("engram_head_dim must be 32-divisible".into()));
-        }
-        Ok(())
+        validate_dims(cfg)
     }
 
     /// Check every layout tensor exists with a compatible dtype and shape
     /// (checkpoint loads only; synthetic generation is by construction).
     fn validate_layout(&mut self) -> io::Result<()> {
-        let specs = crate::layout::layout(&self.cfg);
-        for (name, spec) in &specs {
-            let view = self.store.get(name)?;
-            // FP4 weights pack two values per byte: on disk [rows, cols/2];
-            // synthetic stores keep the logical shape. Accept both.
-            let shape_ok = view.shape == spec.shape
-                || (spec.kind == crate::layout::TKind::Fp4
-                    && view.shape.len() == 2
-                    && view.shape[0] == spec.shape[0]
-                    && view.shape[1] * 2 == spec.shape[1]);
-            if !shape_ok {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "{name}: shape {:?} != expected {:?}",
-                        view.shape, spec.shape
-                    ),
-                ));
-            }
-            let want = match spec.kind {
-                crate::layout::TKind::Bf16 => crate::store::DType::Bf16,
-                crate::layout::TKind::F32 => crate::store::DType::F32,
-                crate::layout::TKind::Fp8 => crate::store::DType::Fp8E4m3,
-                crate::layout::TKind::Fp4 => crate::store::DType::Fp4Packed,
-                crate::layout::TKind::E8m0 => crate::store::DType::E8m0,
-            };
-            // The raw HF export keeps wo_a quantized (fp8+ue8m0) — convert.py
-            // host-dequantizes it for the reference stack. Accept both; the
-            // dense path dequantizes on read (spec §11).
-            let want = if want == crate::store::DType::Bf16
-                && view.dtype == crate::store::DType::Fp8E4m3
-                && name.ends_with(".weight")
-            {
-                crate::store::DType::Fp8E4m3
-            } else {
-                want
-            };
-            // Small fp32-routine tensors (compressor wkv/wgate) are exported
-            // bf16 and upcast at load; the dense path already decodes to f32.
-            let dtype_ok = view.dtype == want
-                || (want == crate::store::DType::F32 && view.dtype == crate::store::DType::Bf16);
-            if !dtype_ok {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{name}: dtype {:?} != expected {:?}", view.dtype, want),
-                ));
-            }
-        }
-        Ok(())
+        let cfg = &self.cfg;
+        let store: &mut dyn WeightStore = &mut *self.store;
+        validate_layout(cfg, store)
     }
 
     /// Install the tokenizer-derived compressed id map (engram; spec §11).
@@ -335,6 +249,28 @@ impl<'a> RefModel<'a> {
             .map(|src| self.rt.sources[src].compress.len() / self.cfg.head_dim as usize)
     }
 
+    /// One sliding-window ring row (gate debugging; spec §3).
+    pub fn window_row(&self, layer: u32, slot: usize) -> Vec<f32> {
+        let hd = self.cfg.head_dim as usize;
+        self.rt.window[layer as usize][slot * hd..(slot + 1) * hd].to_vec()
+    }
+
+    /// One published compressed-KV row (gate debugging; spec §5).
+    pub fn compress_row(&self, layer: u32, j: usize) -> Option<Vec<f32>> {
+        let li = &self.layers[layer as usize];
+        let hd = self.cfg.head_dim as usize;
+        li.kv_src
+            .map(|src| self.rt.sources[src].compress[j * hd..(j + 1) * hd].to_vec())
+    }
+
+    /// One owned index-key row (gate debugging; spec §4).
+    pub fn index_k_row(&self, layer: u32, j: usize) -> Option<Vec<f32>> {
+        let li = &self.layers[layer as usize];
+        let ihd = self.cfg.index_head_dim as usize;
+        li.kv_src
+            .map(|src| self.rt.sources[src].index_k[j * ihd..(j + 1) * ihd].to_vec())
+    }
+
     /// Index-key rows a kv-source layer owns (`(pos+1)/ratio`; spec §4).
     pub fn index_k_len(&self, layer: u32) -> Option<usize> {
         let li = &self.layers[layer as usize];
@@ -350,6 +286,16 @@ impl<'a> RefModel<'a> {
     /// Engram layout (hash primes/multipliers), for tests and tooling.
     pub fn engram_layout(&self) -> &EngramLayout {
         &self.engram
+    }
+
+    /// Debug: capture every attention sublayer's input x (gate tooling).
+    pub fn debug_capture_x(&mut self, on: bool) {
+        self.rt.capture_x = if on { Some(Vec::new()) } else { None };
+    }
+
+    /// Debug: take the captured (layer, x) pairs.
+    pub fn debug_take_captures(&mut self) -> Vec<(u32, Vec<f32>)> {
+        self.rt.capture_x.take().unwrap_or_default()
     }
 
     /// Speculative drafter (mtp.0-2, DSpark; spec §9). TODO(spec-decode):
@@ -379,6 +325,7 @@ impl<'a> RefModel<'a> {
             ));
         }
         self.rt.pos += 1;
+        crate::dump::set_pos(position);
         if token >= self.cfg.vocab {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -400,6 +347,17 @@ impl<'a> RefModel<'a> {
 
         let hc = cfg.hc_mult as usize;
         let dim = cfg.dim as usize;
+
+        // Synthetic-bisection dump hook (src/bin/dump-synth.rs, spec §12):
+        // per-layer streams and sublayer outputs as raw f32, only when
+        // FERROSEEK_DUMP names a directory. Zero cost otherwise.
+        let dump_dir = std::env::var_os("FERROSEEK_DUMP");
+        let dump = |name: String, vals: &[f32]| {
+            if let Some(dir) = &dump_dir {
+                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let _ = std::fs::write(std::path::Path::new(dir).join(name), bytes);
+            }
+        };
 
         // engram hashes for this position, all layers at once (model.py:1255)
         let hashes: Option<Vec<Vec<u64>>> = if engram.layer_ids.is_empty() {
@@ -427,11 +385,13 @@ impl<'a> RefModel<'a> {
 
         for li in layers.iter() {
             let l = li.layer;
+            dump(format!("pos{position}_pre{l}.f32"), &h);
             // engram writes into the stream before the block (model.py:1264-1266)
             if let Some(ei) = li.engram_idx {
                 let hash = hashes.as_ref().unwrap()[ei].clone();
                 engram::merge(&mut *ctx.store, cfg, engram, ei, l, &mut h, &hash)?;
             }
+            dump(format!("pos{position}_in{l}.f32"), &h);
 
             // attention sublayer (spec §2 wiring, model.py:970-996)
             let hc::HcMixes {
@@ -454,12 +414,16 @@ impl<'a> RefModel<'a> {
                     cfg.hc_eps,
                 )
             };
+            dump(format!("d_pos{position}_hca_pre{l}.f32"), &a_pre);
+            dump(format!("d_pos{position}_hca_post{l}.f32"), &a_post);
+            dump(format!("d_pos{position}_hca_comb{l}.f32"), &a_comb);
             let x = {
                 let x = hc::hc_pre(&h, &pre_mix, hc, dim);
                 let nrm = ctx.dense(&format!("layers.{l}.attn_norm.weight"))?;
                 num::rmsnorm(&x, nrm, cfg.norm_eps)
             };
             let x = crate::attn::attention(cfg, li, &mut ctx, rt, &x, position)?;
+            dump(format!("pos{position}_attn{l}.f32"), &x);
             h = hc::hc_post(&x, &h, &a_post, &a_comb, hc, dim);
 
             // ffn sublayer; its pre feeds the NEXT block's attention
@@ -483,17 +447,22 @@ impl<'a> RefModel<'a> {
                     cfg.hc_eps,
                 )
             };
+            dump(format!("d_pos{position}_hcf_pre{l}.f32"), &f_pre);
+            dump(format!("d_pos{position}_hcf_post{l}.f32"), &f_post);
+            dump(format!("d_pos{position}_hcf_comb{l}.f32"), &f_comb);
             let x = {
                 let x = hc::hc_pre(&h, &a_pre, hc, dim);
                 let nrm = ctx.dense(&format!("layers.{l}.ffn_norm.weight"))?;
                 num::rmsnorm(&x, nrm, cfg.norm_eps)
             };
             let x = moe::moe(cfg, &mut ctx, l, &x)?;
+            dump(format!("pos{position}_ffn{l}.f32"), &x);
             h = hc::hc_post(&x, &h, &f_post, &f_comb, hc, dim);
             pre_mix = f_pre;
         }
 
         // collapse, final norm, head (model.py:1271-1272, spec §1)
+        dump(format!("pos{position}_final.f32"), &h);
         let x = hc::hc_pre(&h, &pre_mix, hc, dim);
         let x = {
             let nrm = ctx.dense("norm.weight")?;
@@ -503,6 +472,7 @@ impl<'a> RefModel<'a> {
             let head = ctx.dense("head.weight")?;
             num::gemv(head, cfg.vocab as usize, dim, &x)
         };
+        dump(format!("logits{position}.f32"), &logits);
         Ok(logits)
     }
 }
@@ -510,4 +480,107 @@ impl<'a> RefModel<'a> {
 /// Decode the tokenizer map helper used by tests (identity default).
 pub fn identity_token_map(vocab: u32) -> Vec<i64> {
     (0..vocab as i64).collect()
+}
+
+/// Reject configs whose tensor geometry would violate the quantization
+/// block constraints (32-divisibility) or the head/group wiring.
+/// Public: the GPU engine validates the same constraints before allocating
+/// device buffers.
+pub fn validate_dims(cfg: &RefConfig) -> io::Result<()> {
+    let err = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
+    let hd = cfg.head_dim as usize;
+    let heads = cfg.n_heads as usize;
+    if hd % 32 != 0 {
+        return Err(err("head_dim must be 32-divisible (fp8 act blocks)".into()));
+    }
+    if heads * hd % cfg.o_groups as usize != 0 {
+        return Err(err("n_heads * head_dim must be divisible by o_groups".into()));
+    }
+    if heads * hd / cfg.o_groups as usize % 32 != 0 {
+        return Err(err("wo_a group row must be 32-divisible".into()));
+    }
+    if cfg.dim as usize % 32 != 0 || cfg.q_lora as usize % 32 != 0 {
+        return Err(err("dim and q_lora_rank must be 32-divisible".into()));
+    }
+    if cfg.o_groups as usize * cfg.o_lora as usize % 32 != 0 {
+        return Err(err("o_groups * o_lora_rank must be 32-divisible".into()));
+    }
+    if cfg
+        .index_sources
+        .iter()
+        .any(|&l| cfg.compress_ratios.get(l as usize).copied().unwrap_or(0) == 0)
+    {
+        return Err(err(
+            "index_source_layer on a ratio-0 layer (spec forbids)".into()
+        ));
+    }
+    for &s in &cfg.kv_sources {
+        let r = cfg.compress_ratios.get(s as usize).copied().unwrap_or(0);
+        if r == 0 {
+            return Err(err("kv_source_layer with compress_ratio 0".into()));
+        }
+        if !cfg.index_sources.contains(&s) {
+            return Err(err(
+                "every kv source must also be an index source (spec §4)".into(),
+            ));
+        }
+    }
+    if !cfg.engram_layers.is_empty() && cfg.engram_head_dim as usize % 32 != 0 {
+        return Err(err("engram_head_dim must be 32-divisible".into()));
+    }
+    Ok(())
+}
+
+/// Check every layout tensor exists with a compatible dtype and shape.
+/// Public: the GPU engine runs the same validation before uploading.
+pub fn validate_layout(cfg: &RefConfig, store: &mut dyn WeightStore) -> io::Result<()> {
+    let specs = crate::layout::layout(cfg);
+    for (name, spec) in &specs {
+        let view = store.get(name)?;
+        // FP4 weights pack two values per byte: on disk [rows, cols/2];
+        // synthetic stores keep the logical shape. Accept both.
+        let shape_ok = view.shape == spec.shape
+            || (spec.kind == crate::layout::TKind::Fp4
+                && view.shape.len() == 2
+                && view.shape[0] == spec.shape[0]
+                && view.shape[1] * 2 == spec.shape[1]);
+        if !shape_ok {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{name}: shape {:?} != expected {:?}",
+                    view.shape, spec.shape
+                ),
+            ));
+        }
+        let want = match spec.kind {
+            crate::layout::TKind::Bf16 => crate::store::DType::Bf16,
+            crate::layout::TKind::F32 => crate::store::DType::F32,
+            crate::layout::TKind::Fp8 => crate::store::DType::Fp8E4m3,
+            crate::layout::TKind::Fp4 => crate::store::DType::Fp4Packed,
+            crate::layout::TKind::E8m0 => crate::store::DType::E8m0,
+        };
+        // The raw HF export keeps wo_a quantized (fp8+ue8m0) — convert.py
+        // host-dequantizes it for the reference stack. Accept both; the
+        // dense path dequantizes on read (spec §11).
+        let want = if want == crate::store::DType::Bf16
+            && view.dtype == crate::store::DType::Fp8E4m3
+            && name.ends_with(".weight")
+        {
+            crate::store::DType::Fp8E4m3
+        } else {
+            want
+        };
+        // Small fp32-routine tensors (compressor wkv/wgate) are exported
+        // bf16 and upcast at load; the dense path already decodes to f32.
+        let dtype_ok = view.dtype == want
+            || (want == crate::store::DType::F32 && view.dtype == crate::store::DType::Bf16);
+        if !dtype_ok {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{name}: dtype {:?} != expected {:?}", view.dtype, want),
+            ));
+        }
+    }
+    Ok(())
 }

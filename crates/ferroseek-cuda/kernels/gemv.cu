@@ -34,3 +34,15 @@ extern "C" __global__ void bf16_gemv(
     for (int c = threadIdx.x; c < cols; c += blockDim.x) acc += bf16_to_f32d(wr[c]) * x[c];
     block_reduce_sum(acc, &y[r]);
 }
+
+// y[i] += x[i] — the fp32 MoE accumulator gathers expert outputs
+// (model-spec §6: experts added in ascending expert-id order).
+extern "C" __global__ void acc_f32(
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    y[i] += x[i];
+}

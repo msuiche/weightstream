@@ -9,6 +9,11 @@ use crate::sample::argmax;
 use crate::store::SyntheticWeights;
 use ferroseek_core::ModelConfig;
 
+/// The mini config JSON, shared with the moe unit test.
+pub(crate) fn mini_config_json_public() -> String {
+    mini_config_json(mini_engram_rows())
+}
+
 /// Mini config: 4 layers, hidden 64, 4 heads, head_dim 32 (rope 8), 8
 /// experts top-2, window 8 (wraps inside an 8-step test), compress_ratios
 /// [0, 2, 1, 1] — ratio 0/1/2 all covered; kv sources {1, 2}; index sources

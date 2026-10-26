@@ -65,3 +65,20 @@ extern "C" __global__ void engram_merge(
         hj[d] += gate * value[d];
     }
 }
+
+// f32 row gather — the embedding lookup (spec §1): one token row out of
+// the [vocab, dim] f32 table. Same shape as gather_rows_fp8 minus scales.
+extern "C" __global__ void gather_rows_f32(
+    const float* __restrict__ table,  // [n_rows_total, cols]
+    const long*   __restrict__ idxs,   // [n_sel]
+    float* __restrict__ out,           // [n_sel, cols]
+    int n_sel, int cols)
+{
+    int r = blockIdx.x;
+    if (r >= n_sel) return;
+    long idx = idxs[r];
+    const float* src = table + (size_t)idx * cols;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        out[(size_t)r * cols + c] = src[c];
+    }
+}
