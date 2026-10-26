@@ -359,6 +359,22 @@ impl<'a> RefModel<'a> {
             }
         };
 
+        // FERROSEEK_BF16_STREAM=1: transport shadow — round the hc stream
+        // and the sublayer outputs to bf16 at every boundary, mimicking the
+        // reference/vLLM bf16 storage against this engine's f32 (spec §12
+        // known-divergences list). Real-checkpoint-scale control for the
+        // gate: quantifies how much of the observed dlogprob is transport.
+        let bf16_stream = std::env::var_os("FERROSEEK_BF16_STREAM").is_some();
+        let snap_bf16 = |v: &mut [f32]| {
+            if bf16_stream {
+                for x in v.iter_mut() {
+                    *x = ferroseek_core::quant::bf16_to_f32(ferroseek_core::quant::f32_to_bf16(
+                        *x,
+                    ));
+                }
+            }
+        };
+
         // engram hashes for this position, all layers at once (model.py:1255)
         let hashes: Option<Vec<Vec<u64>>> = if engram.layer_ids.is_empty() {
             None
@@ -390,6 +406,7 @@ impl<'a> RefModel<'a> {
             if let Some(ei) = li.engram_idx {
                 let hash = hashes.as_ref().unwrap()[ei].clone();
                 engram::merge(&mut *ctx.store, cfg, engram, ei, l, &mut h, &hash)?;
+                snap_bf16(&mut h);
             }
             dump(format!("pos{position}_in{l}.f32"), &h);
 
@@ -420,11 +437,16 @@ impl<'a> RefModel<'a> {
             let x = {
                 let x = hc::hc_pre(&h, &pre_mix, hc, dim);
                 let nrm = ctx.dense(&format!("layers.{l}.attn_norm.weight"))?;
-                num::rmsnorm(&x, nrm, cfg.norm_eps)
+                let mut x = num::rmsnorm(&x, nrm, cfg.norm_eps);
+                snap_bf16(&mut x);
+                x
             };
-            let x = crate::attn::attention(cfg, li, &mut ctx, rt, &x, position)?;
+            let mut x = crate::attn::attention(cfg, li, &mut ctx, rt, &x, position)?;
             dump(format!("pos{position}_attn{l}.f32"), &x);
-            h = hc::hc_post(&x, &h, &a_post, &a_comb, hc, dim);
+            snap_bf16(&mut x);
+            let mut h2 = hc::hc_post(&x, &h, &a_post, &a_comb, hc, dim);
+            snap_bf16(&mut h2);
+            h = h2;
 
             // ffn sublayer; its pre feeds the NEXT block's attention
             let hc::HcMixes {
@@ -453,17 +475,23 @@ impl<'a> RefModel<'a> {
             let x = {
                 let x = hc::hc_pre(&h, &a_pre, hc, dim);
                 let nrm = ctx.dense(&format!("layers.{l}.ffn_norm.weight"))?;
-                num::rmsnorm(&x, nrm, cfg.norm_eps)
+                let mut x = num::rmsnorm(&x, nrm, cfg.norm_eps);
+                snap_bf16(&mut x);
+                x
             };
-            let x = moe::moe(cfg, &mut ctx, l, &x)?;
+            let mut x = moe::moe(cfg, &mut ctx, l, &x)?;
             dump(format!("pos{position}_ffn{l}.f32"), &x);
-            h = hc::hc_post(&x, &h, &f_post, &f_comb, hc, dim);
+            snap_bf16(&mut x);
+            let mut h2 = hc::hc_post(&x, &h, &f_post, &f_comb, hc, dim);
+            snap_bf16(&mut h2);
+            h = h2;
             pre_mix = f_pre;
         }
 
         // collapse, final norm, head (model.py:1271-1272, spec §1)
         dump(format!("pos{position}_final.f32"), &h);
-        let x = hc::hc_pre(&h, &pre_mix, hc, dim);
+        let mut x = hc::hc_pre(&h, &pre_mix, hc, dim);
+        snap_bf16(&mut x);
         let x = {
             let nrm = ctx.dense("norm.weight")?;
             num::rmsnorm(&x, nrm, cfg.norm_eps)
