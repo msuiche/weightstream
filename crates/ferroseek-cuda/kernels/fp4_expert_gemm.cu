@@ -24,19 +24,26 @@ extern "C" __global__ void fp4_expert_gemm(
         const uint8_t* a = A + (size_t)m * K + b * 32;
         const uint8_t* bp = B + (size_t)n * (K / 2) + b * 16;
         float dot = 0.0f;
-        // 16-byte vectorized load: 32 packed fp4 = 32 dot terms, same
-        // order as the byte loop (identical fp32 add sequence)
+        // 16-byte vectorized loads, same element order (identical adds):
+        // one uint4 covers the 16 packed-fp4 bytes (32 K values); the 32
+        // fp8 activation bytes need two.
         const uint4 pack = *reinterpret_cast<const uint4*>(bp);
-        const uint4 act = *reinterpret_cast<const uint4*>(a);
+        const uint4 act0 = *reinterpret_cast<const uint4*>(a);
+        const uint4 act1 = *reinterpret_cast<const uint4*>(a + 16);
         const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&pack);
-        const uint8_t* acts = reinterpret_cast<const uint8_t*>(&act);
+        const uint8_t* a0 = reinterpret_cast<const uint8_t*>(&act0);
+        const uint8_t* a1 = reinterpret_cast<const uint8_t*>(&act1);
 #pragma unroll
-        for (int k = 0; k < 16; k++) {
+        for (int k = 0; k < 8; k++) {
             uint8_t byte = bytes[k];
-            float b0 = FP4_TABLE[byte & 0x0F];
-            float b1 = FP4_TABLE[byte >> 4];
-            dot += e4m3_to_f32(acts[2 * k]) * b0;
-            dot += e4m3_to_f32(acts[2 * k + 1]) * b1;
+            dot += e4m3_to_f32(a0[2 * k]) * FP4_TABLE[byte & 0x0F];
+            dot += e4m3_to_f32(a0[2 * k + 1]) * FP4_TABLE[byte >> 4];
+        }
+#pragma unroll
+        for (int k = 8; k < 16; k++) {
+            uint8_t byte = bytes[k];
+            dot += e4m3_to_f32(a1[2 * k - 16]) * FP4_TABLE[byte & 0x0F];
+            dot += e4m3_to_f32(a1[2 * k - 15]) * FP4_TABLE[byte >> 4];
         }
         float sa = e8m0_to_f32(sA[(size_t)m * kb + b]);
         float sb = e8m0_to_f32(sB[(size_t)n * kb + b]);
