@@ -5,7 +5,10 @@
 
 pub mod config;
 pub mod kv;
+pub mod loader;
+pub mod quant;
 pub mod safetensors;
 pub mod weights;
 
 pub use config::ModelConfig;
+pub use loader::Checkpoint;

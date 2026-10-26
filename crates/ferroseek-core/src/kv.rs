@@ -54,12 +54,12 @@ pub(crate) mod tests {
     /// The real DS4.1F-1017 shape: composite config, 40 layers, 576-wide
     /// latent via head_dim 512 + rope 64, CSA ratio-2 on layers 2–19,
     /// full rate on 20–39, none on 0–1.
-    pub(crate) fn fixture() -> ModelConfig {
+    pub(crate) fn fixture_json() -> String {
         let mut ratios = vec![0u32; 2];
         ratios.extend([2u32; 18]);
         ratios.extend([1u32; 20]);
         ratios.extend([0u32; 3]); // nextn draft layers
-        let json = serde_json::json!({
+        serde_json::json!({
             "model_type": "deepseek_v41",
             "architectures": ["DeepseekV41ForCausalLM"],
             "quantization_config": {"quant_method": "fp8", "expert_dtype": "fp4"},
@@ -89,8 +89,12 @@ pub(crate) mod tests {
                 "max_position_embeddings": 1048576
             },
             "vision_config": {"hidden_size": 1152}
-        });
-        ModelConfig::from_str(&json.to_string()).unwrap()
+        })
+        .to_string()
+    }
+
+    pub(crate) fn fixture() -> ModelConfig {
+        ModelConfig::from_str(&fixture_json()).unwrap()
     }
 
     #[test]
