@@ -70,6 +70,12 @@ pub struct HostArena {
     /// host->device address delta for each — streamed tensors must fall
     /// inside one of these; anything else falls back to staging/uploads.
     pub ranges: Vec<(usize, usize, i64)>,
+    /// Every mapped shard `(base, end, path)` — registered or not. The
+    /// per-use staging path resolves a host pointer back to its backing
+    /// file so cold tensors read with one sequential `read()` instead of
+    /// page-cache faults (which crawl at ~1-4 MB/s inside a process that
+    /// holds tens of GB of pinned device memory on GB10).
+    files: Vec<(usize, usize, std::path::PathBuf)>,
     total_bytes: u64,
 }
 
@@ -130,7 +136,7 @@ impl HostArena {
     ///   budget is therefore conservative; `FERROSEEK_STREAM_BUDGET_GB`
     ///   overrides (0 disables registration entirely — everything then
     ///   uploads or stages per use).
-    pub fn new(regions: &[(usize, usize)]) -> io::Result<Self> {
+    pub fn new(regions: &[(usize, usize, std::path::PathBuf)]) -> io::Result<Self> {
         let budget: u64 = std::env::var("FERROSEEK_STREAM_BUDGET_GB")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -138,9 +144,17 @@ impl HostArena {
         let budget = budget * (1 << 30);
         let mut registrations = Vec::new();
         let mut ranges = Vec::new();
+        let files = regions
+            .iter()
+            .map(|&(ptr, len, ref path)| {
+                let base = ptr & !(PAGE_ALIGN - 1);
+                let end = (ptr + len + PAGE_ALIGN - 1) & !(PAGE_ALIGN - 1);
+                (base, end, path.clone())
+            })
+            .collect();
         let mut total = 0u64;
         let mut failed = 0usize;
-        for (i, &(ptr, len)) in regions.iter().enumerate() {
+        for (i, &(ptr, len, _)) in regions.iter().enumerate() {
             if total >= budget {
                 failed += 1;
                 continue;
@@ -171,6 +185,7 @@ impl HostArena {
         Ok(HostArena {
             registrations,
             ranges,
+            files,
             total_bytes: total,
         })
     }
@@ -188,6 +203,17 @@ impl HostArena {
             .iter()
             .find(|&&(b, e, _)| p >= b && p < e)
             .map(|&(_, _, d)| (p as i64 + d) as u64)
+    }
+
+    /// Backing file and byte offset for `[ptr, ptr+len)` in any mapped shard
+    /// (the mmaps cover the whole files, so `ptr - base` is the file offset).
+    /// None for addresses outside the checkpoint (the synthetic store).
+    pub fn file_range(&self, ptr: *const u8, len: usize) -> Option<(std::path::PathBuf, u64)> {
+        let p = ptr as usize;
+        self.files
+            .iter()
+            .find(|&&(b, e, _)| p >= b && p + len <= e)
+            .map(|&(b, _, ref path)| (path.clone(), (p - b) as u64))
     }
 }
 

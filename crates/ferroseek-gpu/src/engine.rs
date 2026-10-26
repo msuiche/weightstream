@@ -87,6 +87,45 @@ pub struct W8 {
     host: Option<(*const u8, usize)>,
 }
 
+/// Fault every page of a mapped tensor into this process before a device
+/// copy: cudaMemcpy's GUP path faults file-backed pages synchronously at
+/// ~0.2-4 MB/s on GB10 under memory pressure (measured: a 42 MB wq_b copy
+/// took 10.9 s cold, 0.5 ms warm), so the load pass and per-use staging
+/// pre-touch the range at memory speed instead.
+fn prefault(bytes: &[u8]) {
+    let mut acc = 0u64;
+    for chunk in bytes.chunks(4096) {
+        acc = acc.wrapping_add(chunk[0] as u64);
+    }
+    std::hint::black_box(acc);
+}
+
+/// One-shot device copy of a checkpoint payload. Cold file-backed pages
+/// fault catastrophically slowly inside a process holding tens of GB of
+/// pinned device memory on GB10 (~1-4 MB/s through the copy's GUP path and
+/// through plain page faults alike, while a fresh process reads the same
+/// ranges at ~130 MB/s) — so when the arena can resolve the payload back
+/// to its shard file, read it with one sequential `read()` into anon
+/// memory and copy from there (measured: anon-to-device at ~10 GB/s).
+fn read_up(
+    c: &Cuda,
+    arena: Option<&crate::stream::HostArena>,
+    bytes: &[u8],
+) -> io::Result<D<u8>> {
+    if let Some((path, off)) =
+        arena.and_then(|a| a.file_range(bytes.as_ptr(), bytes.len()))
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(&path)?;
+        f.seek(SeekFrom::Start(off))?;
+        let mut buf = vec![0u8; bytes.len()];
+        f.read_exact(&mut buf)?;
+        return up_u8(c, &buf);
+    }
+    prefault(bytes);
+    up_u8(c, bytes)
+}
+
 impl W8 {
     fn device(buf: D<u8>) -> Self {
         Self {
@@ -115,7 +154,7 @@ impl W8 {
                 host: None,
             })
         } else {
-            Ok(Self::device(up_u8(c, bytes)?))
+            Ok(Self::device(read_up(c, arena, bytes)?))
         }
     }
 
@@ -163,14 +202,14 @@ impl W8 {
 
     /// One-shot device copy of a host-backed payload; empty for tensors
     /// that already live on the device or in a registered mapping.
-    fn stage(&self, c: &Cuda) -> io::Result<D<u8>> {
+    fn stage(&self, c: &Cuda, arena: Option<&crate::stream::HostArena>) -> io::Result<D<u8>> {
         match self.host {
             Some((ptr, len)) => {
                 // SAFETY: the pointer aliases the weight store's mmap,
                 // owned by the model's keepalive; the copy happens while the
                 // model lives.
                 let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-                up_u8(c, slice)
+                read_up(c, arena, slice)
             }
             None => DeviceBuffer::from_slice(&[]).map_err(cuda_err),
         }
@@ -690,7 +729,90 @@ fn upload_layer(
         experts.push([w1, w2, w3]);
     }
 
-    Ok(GpuLayer {
+    // per-field loads (the struct literal binds them in order)
+    let attn_norm_w = up_f32(c, &view_f32(store, &format!("{p}.attn_norm.weight"))?)?;
+    let ffn_norm_w = up_f32(c, &view_f32(store, &format!("{p}.ffn_norm.weight"))?)?;
+    let hc_attn_fn = up_f32(c, &view_f32(store, &format!("{p}.hc_attn_fn"))?)?;
+    let hc_ffn_fn = up_f32(c, &view_f32(store, &format!("{p}.hc_ffn_fn"))?)?;
+    let hc_attn_base = up_f32(c, &view_f32(store, &format!("{p}.hc_attn_base"))?)?;
+    let hc_ffn_base = up_f32(c, &view_f32(store, &format!("{p}.hc_ffn_base"))?)?;
+    let hc_attn_scale = up_f32(c, &view_f32(store, &format!("{p}.hc_attn_scale"))?)?;
+    let hc_ffn_scale = up_f32(c, &view_f32(store, &format!("{p}.hc_ffn_scale"))?)?;
+    let wq_a = load_q8(
+        store,
+        c,
+        arena,
+        &format!("{p}.attn.wq_a.weight"),
+        &format!("{p}.attn.wq_a.scale"),
+    )?;
+    let q_norm_w = up_f32(c, &view_f32(store, &format!("{p}.attn.q_norm.weight"))?)?;
+    let wq_b = load_q8(
+        store,
+        c,
+        arena,
+        &format!("{p}.attn.wq_b.weight"),
+        &format!("{p}.attn.wq_b.scale"),
+    )?;
+    let wkv = load_q8(
+        store,
+        c,
+        arena,
+        &format!("{p}.attn.wkv.weight"),
+        &format!("{p}.attn.wkv.scale"),
+    )?;
+    let kv_norm_w = up_f32(c, &view_f32(store, &format!("{p}.attn.kv_norm.weight"))?)?;
+    let attn_sink = up_f32(c, &view_f32(store, &format!("{p}.attn.attn_sink"))?)?;
+    let wo_a = load_wo_a(
+        store,
+        c,
+        &format!("{p}.attn.wo_a.weight"),
+        cfg.o_groups as usize * cfg.o_lora as usize,
+        cfg.n_heads as usize * hd / cfg.o_groups as usize,
+    )?;
+    let wo_b = load_q8(
+        store,
+        c,
+        arena,
+        &format!("{p}.attn.wo_b.weight"),
+        &format!("{p}.attn.wo_b.scale"),
+    )?;
+    let gate_w = up_u16(c, &{
+        let v = store.get(&format!("{p}.ffn.gate.weight"))?;
+        let n = cfg.n_routed as usize * dim;
+        if v.bytes.len() != n * 2 {
+            return ioerr("gate weight size mismatch".into());
+        }
+        v.bytes
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect::<Vec<u16>>()
+    })?;
+    let gate_bias = up_f32(c, &view_f32(store, &format!("{p}.ffn.gate.bias"))?)?;
+    let shared_experts = [
+        load_q8(
+            store,
+            c,
+            arena,
+            &format!("{p}.ffn.shared_experts.w1.weight"),
+            &format!("{p}.ffn.shared_experts.w1.scale"),
+        )?,
+        load_q8(
+            store,
+            c,
+            arena,
+            &format!("{p}.ffn.shared_experts.w2.weight"),
+            &format!("{p}.ffn.shared_experts.w2.scale"),
+        )?,
+        load_q8(
+            store,
+            c,
+            arena,
+            &format!("{p}.ffn.shared_experts.w3.weight"),
+            &format!("{p}.ffn.shared_experts.w3.scale"),
+        )?,
+    ];
+
+    let layer = GpuLayer {
         layer,
         ratio,
         kv_src,
@@ -700,93 +822,32 @@ fn upload_layer(
         uses_cand: cfg.candidate_source >= 0 && (layer as i64) > cfg.candidate_source && idx_src,
         engram: cfg.engram_layers.iter().position(|&e| e == layer),
         freq: if ratio > 0 { 1 } else { 0 },
-        attn_norm_w: up_f32(c, &view_f32(store, &format!("{p}.attn_norm.weight"))?)?,
-        ffn_norm_w: up_f32(c, &view_f32(store, &format!("{p}.ffn_norm.weight"))?)?,
-        hc_attn_fn: up_f32(c, &view_f32(store, &format!("{p}.hc_attn_fn"))?)?,
-        hc_ffn_fn: up_f32(c, &view_f32(store, &format!("{p}.hc_ffn_fn"))?)?,
-        hc_attn_base: up_f32(c, &view_f32(store, &format!("{p}.hc_attn_base"))?)?,
-        hc_ffn_base: up_f32(c, &view_f32(store, &format!("{p}.hc_ffn_base"))?)?,
-        hc_attn_scale: up_f32(c, &view_f32(store, &format!("{p}.hc_attn_scale"))?)?,
-        hc_ffn_scale: up_f32(c, &view_f32(store, &format!("{p}.hc_ffn_scale"))?)?,
-        wq_a: load_q8(
-            store,
-            c,
-            arena,
-            &format!("{p}.attn.wq_a.weight"),
-            &format!("{p}.attn.wq_a.scale"),
-        )?,
-        q_norm_w: up_f32(c, &view_f32(store, &format!("{p}.attn.q_norm.weight"))?)?,
-        wq_b: load_q8(
-            store,
-            c,
-            arena,
-            &format!("{p}.attn.wq_b.weight"),
-            &format!("{p}.attn.wq_b.scale"),
-        )?,
-        wkv: load_q8(
-            store,
-            c,
-            arena,
-            &format!("{p}.attn.wkv.weight"),
-            &format!("{p}.attn.wkv.scale"),
-        )?,
-        kv_norm_w: up_f32(c, &view_f32(store, &format!("{p}.attn.kv_norm.weight"))?)?,
-        attn_sink: up_f32(c, &view_f32(store, &format!("{p}.attn.attn_sink"))?)?,
-        wo_a: load_wo_a(
-            store,
-            c,
-            &format!("{p}.attn.wo_a.weight"),
-            cfg.o_groups as usize * cfg.o_lora as usize,
-            cfg.n_heads as usize * hd / cfg.o_groups as usize,
-        )?,
-        wo_b: load_q8(
-            store,
-            c,
-            arena,
-            &format!("{p}.attn.wo_b.weight"),
-            &format!("{p}.attn.wo_b.scale"),
-        )?,
-        gate_w: up_u16(c, &{
-            let v = store.get(&format!("{p}.ffn.gate.weight"))?;
-            let n = cfg.n_routed as usize * dim;
-            if v.bytes.len() != n * 2 {
-                return ioerr("gate weight size mismatch".into());
-            }
-            v.bytes
-                .chunks_exact(2)
-                .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                .collect::<Vec<u16>>()
-        })?,
-        gate_bias: up_f32(c, &view_f32(store, &format!("{p}.ffn.gate.bias"))?)?,
+        attn_norm_w,
+        ffn_norm_w,
+        hc_attn_fn,
+        hc_ffn_fn,
+        hc_attn_base,
+        hc_ffn_base,
+        hc_attn_scale,
+        hc_ffn_scale,
+        wq_a,
+        q_norm_w,
+        wq_b,
+        wkv,
+        kv_norm_w,
+        attn_sink,
+        wo_a,
+        wo_b,
+        gate_w,
+        gate_bias,
         experts,
-        shared_experts: [
-            load_q8(
-                store,
-                c,
-                arena,
-                &format!("{p}.ffn.shared_experts.w1.weight"),
-                &format!("{p}.ffn.shared_experts.w1.scale"),
-            )?,
-            load_q8(
-                store,
-                c,
-                arena,
-                &format!("{p}.ffn.shared_experts.w2.weight"),
-                &format!("{p}.ffn.shared_experts.w2.scale"),
-            )?,
-            load_q8(
-                store,
-                c,
-                arena,
-                &format!("{p}.ffn.shared_experts.w3.weight"),
-                &format!("{p}.ffn.shared_experts.w3.scale"),
-            )?,
-        ],
+        shared_experts,
         compressor,
         indexer,
         k_owner,
         engram_w,
-    })
+    };
+    Ok(layer)
 }
 
 // ---------------------------------------------------------------------------
@@ -954,8 +1015,10 @@ impl GpuModel<'static> {
             bands,
             run,
             engram,
+            arena,
             ..
         } = self;
+        let arena_opt: Option<&crate::stream::HostArena> = arena.as_ref();
 
         let dim = cfg.dim as usize;
         let hc = cfg.hc_mult as usize;
@@ -1176,7 +1239,7 @@ impl GpuModel<'static> {
                 eps,
             );
 
-            moe_step(c, cfg, layer, s)?;
+            moe_step(c, cfg, layer, s, arena_opt)?;
 
             {
                 let h_next = 1 - h_cur;
@@ -1296,10 +1359,11 @@ impl<'a> GpuModel<'a> {
     pub fn from_checkpoint_streaming(ckpt: &'a mut Checkpoint) -> io::Result<GpuModel<'a>> {
         let cfg = RefConfig::from_model_config(&ckpt.config)?;
         validate_dims(&cfg)?;
-        let regions: Vec<(usize, usize)> = ckpt
+        let dir = ckpt.dir.clone();
+        let regions: Vec<(usize, usize, std::path::PathBuf)> = ckpt
             .data_regions()?
             .into_iter()
-            .map(|(p, l, _)| (p, l))
+            .map(|(p, l, name)| (p, l, dir.join(name)))
             .collect();
         let n_regions = regions.len();
         // a CUDA context must exist before cuMemHostRegister; register
@@ -1316,8 +1380,12 @@ impl<'a> GpuModel<'a> {
             arena.bytes() as f64 / (1u64 << 30) as f64
         );
         let mut store: Box<dyn WeightStore + 'a> = Box::new(CkptStore::new(ckpt));
+        let t_v = std::time::Instant::now();
         validate_layout(&cfg, store.as_mut())?;
+        eprintln!("streaming: layout validated in {:?}", t_v.elapsed());
+        let t_b = std::time::Instant::now();
         let mut model = Self::build(cfg, store.as_mut(), DEFAULT_MAX_SEQ_LEN, Some(&arena))?;
+        eprintln!("streaming: weight pass in {:?}", t_b.elapsed());
         // the borrow above ended when build returned, so the arena and
         // store can move into the model; both keep the shard mmaps alive
         model.arena = Some(arena);
@@ -1381,6 +1449,7 @@ impl<'a> GpuModel<'a> {
         }
 
         // rope tables: two variants shared by all layers (spec §3), built
+        let t_phase = std::time::Instant::now();
         // with the ref's own Freqs computation so the tables are
         // bit-identical to the CPU engine's for ANY config (YaRN comes from
         // cfg.original_seq_len — the ferroseek-cuda helpers hardcode the
@@ -1412,25 +1481,33 @@ impl<'a> GpuModel<'a> {
         let (cos_comp, sin_comp) = expand(&comp_f);
         let rope_cos = [up_f32(c, &cos_plain)?, up_f32(c, &cos_comp)?];
         let rope_sin = [up_f32(c, &sin_plain)?, up_f32(c, &sin_comp)?];
+        eprintln!("build: rope tables in {:?}", t_phase.elapsed());
 
         let mut layers = Vec::with_capacity(n_layers);
+        let t_layers = std::time::Instant::now();
         for l in 0..n_layers {
+            let t_l = std::time::Instant::now();
             layers.push(upload_layer(&cfg, store, c, l, kv_src_of[l], arena)?);
+            eprintln!("build: layer {l} in {:?}", t_l.elapsed());
         }
+        eprintln!("build: {n_layers} layers in {:?}", t_layers.elapsed());
 
         // embedding + head as f32 (spec §11: head held fp32; embed is
         // row-gathered)
         // streaming mode reads embedding rows host-side (no 2.6 GB device
         // table); upload mode gathers from a device copy
+        let t_head = std::time::Instant::now();
         let emb = match arena {
             Some(_) => None,
             None => Some(up_f32(c, &view_f32(store, "embed.weight")?)?),
         };
         let head = up_f32(c, &view_f32(store, "head.weight")?)?;
         let final_norm = up_f32(c, &view_f32(store, "norm.weight")?)?;
+        eprintln!("build: embed/head/norm in {:?}", t_head.elapsed());
 
         // caches: per layer kv_all = ring + compressed view; per source
         // index_k + compressor state
+        let t_caches = std::time::Instant::now();
         let mut kv_all = Vec::with_capacity(n_layers);
         for l in 0..n_layers {
             let ratio = cfg.compress_ratios[l] as u64;
@@ -1459,8 +1536,10 @@ impl<'a> GpuModel<'a> {
                 comp_score.push(None);
             }
         }
+        eprintln!("build: caches in {:?}", t_caches.elapsed());
 
         // scratch
+        let t_scratch = std::time::Instant::now();
         let score_cap = cfg
             .kv_sources
             .iter()
@@ -1533,6 +1612,7 @@ impl<'a> GpuModel<'a> {
         };
 
         let n_sources = cfg.kv_sources.len();
+        eprintln!("build: scratch in {:?}", t_scratch.elapsed());
         Ok(GpuModel {
             cfg,
             layers,
@@ -2041,7 +2121,13 @@ fn dump_dev(c: &Cuda, buf: &D<f32>, n: usize, name: String) {
 /// The MoE sublayer (spec §6, model.py:794-906): device-side routing, then
 /// selected experts in ascending expert-id order (matching the CPU
 /// accumulation order), then the shared expert.
-fn moe_step(c: &Cuda, cfg: &RefConfig, layer: &GpuLayer, s: &mut Scratch) -> io::Result<()> {
+fn moe_step(
+    c: &Cuda,
+    cfg: &RefConfig,
+    layer: &GpuLayer,
+    s: &mut Scratch,
+    arena: Option<&crate::stream::HostArena>,
+) -> io::Result<()> {
     let l = layer.layer;
     let dim = cfg.dim as usize;
     let inter = cfg.inter_dim as usize;
@@ -2103,8 +2189,8 @@ fn moe_step(c: &Cuda, cfg: &RefConfig, layer: &GpuLayer, s: &mut Scratch) -> io:
         // unregistered experts (the driver's ~120 GB registration cap on
         // 475 GB of shards): one-shot device copy per use, 17.7 MB/expert
         let [w1, w2, w3] = &layer.experts[e];
-        let (w1d, w1sd) = (w1.w.stage(c)?, w1.s.stage(c)?);
-        let (w3d, w3sd) = (w3.w.stage(c)?, w3.s.stage(c)?);
+        let (w1d, w1sd) = (w1.w.stage(c, arena)?, w1.s.stage(c, arena)?);
+        let (w3d, w3sd) = (w3.w.stage(c, arena)?, w3.s.stage(c, arena)?);
         k::fp4_gemm(
             c,
             k::base(&s.act_x),
@@ -2143,7 +2229,7 @@ fn moe_step(c: &Cuda, cfg: &RefConfig, layer: &GpuLayer, s: &mut Scratch) -> io:
             inter,
         );
         drop((w1d, w1sd, w3d, w3sd));
-        let (w2d, w2sd) = (w2.w.stage(c)?, w2.s.stage(c)?);
+        let (w2d, w2sd) = (w2.w.stage(c, arena)?, w2.s.stage(c, arena)?);
         k::fp4_gemm(
             c,
             k::base(&s.act_h),
