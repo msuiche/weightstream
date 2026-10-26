@@ -17,6 +17,8 @@ const MOE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/moe.ptx"));
 const GEMV_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/gemv.ptx"));
 const COMPRESSOR_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/compressor.ptx"));
 const INDEXER_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/indexer.ptx"));
+const ENGRAM_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/engram.ptx"));
+const SAMPLE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/sample.ptx"));
 
 pub struct Cuda {
     pub context: Context,
@@ -35,6 +37,8 @@ pub struct Cuda {
     pub gemv: Module,
     pub compressor: Module,
     pub indexer: Module,
+    pub engram: Module,
+    pub sample: Module,
 }
 
 static CUDA: Mutex<Option<Cuda>> = Mutex::new(None);
@@ -69,6 +73,8 @@ impl Cuda {
             let gemv = Module::from_ptx(GEMV_PTX, &[]).expect("gemv module");
             let compressor = Module::from_ptx(COMPRESSOR_PTX, &[]).expect("compressor module");
             let indexer = Module::from_ptx(INDEXER_PTX, &[]).expect("indexer module");
+            let engram = Module::from_ptx(ENGRAM_PTX, &[]).expect("engram module");
+            let sample = Module::from_ptx(SAMPLE_PTX, &[]).expect("sample module");
             *guard = Some(Cuda {
                 context,
                 device,
@@ -86,6 +92,8 @@ impl Cuda {
                 gemv,
                 compressor,
                 indexer,
+                engram,
+                sample,
             });
         }
         // tests run on many threads; the lock holder always becomes current
@@ -1144,5 +1152,139 @@ mod tests {
             let e: f32 = got.iter().zip(&expected_bf).map(|(g, e)| (g - e).abs()).fold(0.0, f32::max);
             assert!(e < 1e-4, "bf16_gemv max err {e}");
         }
+    }
+
+    #[test]
+    fn engram_gather_and_merge_match_cpu() {
+        let guard = Cuda::global();
+        let cuda = guard.as_ref().unwrap();
+        let (table_rows, cols, n_sel, dim) = (512usize, 256usize, 24usize, 512usize);
+
+        // fp8 table: random f32 -> quantize per row
+        let table_f32 = rand_vec(table_rows * cols, 6001);
+        let (table_q, table_s) = quantize_fp8(&table_f32);
+        let idxs: Vec<i64> = (0..n_sel as i64).map(|i| (i * 37 + 11) % table_rows as i64).collect();
+
+        // CPU gather mirror
+        let mut exp_rows = vec![0.0f32; n_sel * cols];
+        for (r, &idx) in idxs.iter().enumerate() {
+            for c in 0..cols {
+                exp_rows[r * cols + c] = ferroseek_core::quant::e4m3_to_f32(
+                    table_q[idx as usize * cols + c],
+                ) * ferroseek_core::quant::e8m0_to_f32(
+                    table_s[idx as usize * (cols / 32) + c / 32],
+                );
+            }
+        }
+
+        let d_t = DeviceBuffer::from_slice(&table_q).unwrap();
+        let d_s = DeviceBuffer::from_slice(&table_s).unwrap();
+        let d_i = DeviceBuffer::from_slice(&idxs).unwrap();
+        let mut d_o = DeviceBuffer::from_slice(&vec![0.0; n_sel * cols]).unwrap();
+        let gather = cuda.engram.get_function("gather_rows_fp8").unwrap();
+        let stream = &cuda.stream;
+        unsafe {
+            launch!(
+                gather<<<n_sel as u32, 256, 0, stream>>>(
+                    d_t.as_device_ptr(),
+                    d_s.as_device_ptr(),
+                    d_i.as_device_ptr(),
+                    d_o.as_device_ptr(),
+                    n_sel as i32,
+                    cols as i32
+                )
+            )
+            .unwrap();
+        }
+        stream.synchronize().unwrap();
+        let mut got = vec![0.0f32; n_sel * cols];
+        d_o.copy_to(&mut got).unwrap();
+        assert_eq!(got, exp_rows, "gather not exact");
+
+        // merge: 4 hc copies
+        let mut h = rand_vec(4 * dim, 6002);
+        let key = rand_vec(4 * dim, 6003);
+        let value = rand_vec(dim, 6004);
+        let w = rand_vec(dim, 6005);
+        let mut expected = h.clone();
+        for j in 0..4 {
+            let hj = &h[j * dim..(j + 1) * dim];
+            let kj = &key[j * dim..(j + 1) * dim];
+            let mut dot = 0.0f32;
+            let mut hsq = 0.0f32;
+            let mut ksq = 0.0f32;
+            for d in 0..dim {
+                dot += hj[d] * w[d] * kj[d];
+                hsq += hj[d] * hj[d];
+                ksq += kj[d] * kj[d];
+            }
+            let rstd_h = 1.0 / (hsq / dim as f32 + 1e-20).sqrt();
+            let rstd_k = 1.0 / (ksq / dim as f32 + 1e-20).sqrt();
+            let d01 = dot * rstd_h * rstd_k * (dim as f32).powf(-0.5);
+            let gate = 1.0 / (1.0 + (-d01.abs().max(1e-6).sqrt().copysign(d01)).exp());
+            for d in 0..dim {
+                expected[j * dim + d] += gate * value[d];
+            }
+        }
+
+        let mut d_h = DeviceBuffer::from_slice(&h).unwrap();
+        let d_k = DeviceBuffer::from_slice(&key).unwrap();
+        let d_v = DeviceBuffer::from_slice(&value).unwrap();
+        let d_w = DeviceBuffer::from_slice(&w).unwrap();
+        let merge = cuda.engram.get_function("engram_merge").unwrap();
+        let inv = (dim as f32).powf(-0.5);
+        unsafe {
+            launch!(
+                merge<<<4u32, 256, 0, stream>>>(
+                    d_h.as_device_ptr(),
+                    d_k.as_device_ptr(),
+                    d_v.as_device_ptr(),
+                    d_w.as_device_ptr(),
+                    dim as i32,
+                    inv
+                )
+            )
+            .unwrap();
+        }
+        stream.synchronize().unwrap();
+        d_h.copy_to(&mut h).unwrap();
+        let max_err: f32 = h
+            .iter()
+            .zip(&expected)
+            .map(|(g, e)| (g - e).abs())
+            .fold(0.0, f32::max);
+        assert!(max_err < 1e-5, "engram merge max err {max_err}");
+    }
+
+    #[test]
+    fn argmax_matches_cpu_incl_ties() {
+        let guard = Cuda::global();
+        let cuda = guard.as_ref().unwrap();
+        let n = 129280usize;
+        let mut x = rand_vec(n, 7001);
+        x[500] = 0.99;
+        x[90000] = 0.99; // tie: lowest index wins
+        x[129279] = -100.0;
+
+        let d_x = DeviceBuffer::from_slice(&x).unwrap();
+        let mut d_i = DeviceBuffer::from_slice(&[0i32; 1]).unwrap();
+        let mut d_v = DeviceBuffer::from_slice(&[0.0f32; 1]).unwrap();
+        let func = cuda.sample.get_function("argmax_rows").unwrap();
+        let stream = &cuda.stream;
+        unsafe {
+            launch!(
+                func<<<1, 256, 0, stream>>>(
+                    d_x.as_device_ptr(),
+                    d_i.as_device_ptr(),
+                    d_v.as_device_ptr(),
+                    n as i32
+                )
+            )
+            .unwrap();
+        }
+        stream.synchronize().unwrap();
+        let mut got_i = [0i32; 1];
+        d_i.copy_to(&mut got_i).unwrap();
+        assert_eq!(got_i[0], 500, "argmax index (tie -> lowest)");
     }
 }
