@@ -2,17 +2,7 @@
 // scales per 32-element block on K → f32. Mirror of
 // ferroseek_core::quant::dequant_fp4_block; the CPU reference gates it.
 
-#include <cstdint>
-
-__device__ __constant__ float FP4_TABLE[16] = {
-    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-    0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
-};
-
-__device__ __forceinline__ float e8m0_to_f32(uint8_t e) {
-    // 2^(e-127); 0xFF is NaN upstream, never passed here
-    return exp2f((float)e - 127.0f);
-}
+#include "common.cuh"
 
 extern "C" __global__ void fp4_dequant(
     const uint8_t* __restrict__ packed,   // n_blocks * 16 bytes

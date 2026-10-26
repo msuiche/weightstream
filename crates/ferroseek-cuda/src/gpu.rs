@@ -8,6 +8,7 @@ const DEQUANT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/dequant.ptx"))
 const NORM_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/norm.ptx"));
 const ROPE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/rope.ptx"));
 const ACTQUANT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/actquant.ptx"));
+const FP8_GEMM_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fp8_gemm.ptx"));
 
 pub struct Cuda {
     pub context: Context,
@@ -17,6 +18,7 @@ pub struct Cuda {
     pub norm: Module,
     pub rope: Module,
     pub actquant: Module,
+    pub fp8_gemm: Module,
 }
 
 static CUDA: Mutex<Option<Cuda>> = Mutex::new(None);
@@ -41,6 +43,7 @@ impl Cuda {
             let norm = Module::from_ptx(NORM_PTX, &[]).expect("norm module");
             let rope = Module::from_ptx(ROPE_PTX, &[]).expect("rope module");
             let actquant = Module::from_ptx(ACTQUANT_PTX, &[]).expect("actquant module");
+            let fp8_gemm = Module::from_ptx(FP8_GEMM_PTX, &[]).expect("fp8_gemm module");
             *guard = Some(Cuda {
                 context,
                 device,
@@ -49,6 +52,7 @@ impl Cuda {
                 norm,
                 rope,
                 actquant,
+                fp8_gemm,
             });
         }
         // tests run on many threads; the lock holder always becomes current
@@ -324,5 +328,115 @@ mod tests {
         stream.synchronize().unwrap();
         d_x.copy_to(&mut x).unwrap();
         assert_eq!(x, expected, "act_quant snap not bit-exact");
+    }
+
+    /// Quantize f32 → (e4m3 bytes, e8m0 scales) per 32-block, mirroring
+    /// act_quant_ue8m0_snap's scale rule but emitting quantized storage.
+    fn quantize_fp8(x: &[f32]) -> (Vec<u8>, Vec<u8>) {
+        let kb = x.len() / 32;
+        let mut q = vec![0u8; x.len()];
+        let mut s = vec![0u8; kb];
+        for (b, g) in x.chunks_exact(32).enumerate() {
+            let amax = g.iter().fold(0.0f32, |a, v| a.max(v.abs())).max(1e-4);
+            let scale = 2f32.powf((amax / 448.0).log2().ceil());
+            s[b] = (scale.log2() + 127.0) as u8;
+            for (i, &v) in g.iter().enumerate() {
+                let y = (v / scale).clamp(-448.0, 448.0);
+                q[b * 32 + i] = f32_to_e4m3_bits(y);
+            }
+        }
+        (q, s)
+    }
+
+    /// f32 → e4m3 bits (RNE, saturate 448) — bit-level mirror used for
+    /// building kernel inputs.
+    fn f32_to_e4m3_bits(v: f32) -> u8 {
+        let sign = if v.is_sign_negative() { 0x80u8 } else { 0 };
+        let a = v.abs().min(448.0);
+        if a == 0.0 {
+            return sign;
+        }
+        let (m, exp) = frexp(a);
+        let mut e = exp - 1 + 7;
+        if e <= 0 {
+            // subnormal: quantum 2^-9
+            let mant = (a / 2f32.powi(-9)).round() as u8;
+            return sign | mant.min(7);
+        }
+        let mut mant = ((m * 2.0 - 1.0) * 8.0).round() as i32;
+        if mant == 8 {
+            mant = 0;
+            e += 1;
+        }
+        if e >= 15 {
+            return sign | 0x7E; // saturate to 448 (S.1111.110)
+        }
+        sign | ((e as u8) << 3) | (mant as u8)
+    }
+
+    #[test]
+    fn fp8_gemm_matches_cpu_mirror() {
+        let guard = Cuda::global();
+        let cuda = guard.as_ref().unwrap();
+        let (m_dim, n_dim, k_dim) = (3usize, 96usize, 8192usize);
+        let kb = k_dim / 32;
+
+        let a_f32 = rand_vec(m_dim * k_dim, 7);
+        let b_f32 = rand_vec(n_dim * k_dim, 8);
+        let (a_q, a_s) = quantize_fp8(&a_f32);
+        let (b_q, b_s) = quantize_fp8(&b_f32);
+
+        // CPU mirror: same block structure and scale rule, f32 accumulate
+        let mut expected = vec![0.0f32; m_dim * n_dim];
+        for m in 0..m_dim {
+            for n in 0..n_dim {
+                let mut acc = 0.0f32;
+                for b in 0..kb {
+                    let mut dot = 0.0f32;
+                    for k in 0..32 {
+                        let av = ferroseek_core::quant::e4m3_to_f32(a_q[m * k_dim + b * 32 + k]);
+                        let bv = ferroseek_core::quant::e4m3_to_f32(b_q[n * k_dim + b * 32 + k]);
+                        dot += av * bv;
+                    }
+                    let sa = ferroseek_core::quant::e8m0_to_f32(a_s[m * kb + b]);
+                    let sb = ferroseek_core::quant::e8m0_to_f32(b_s[(n / 32) * kb + b]);
+                    acc += dot * sa * sb;
+                }
+                expected[m * n_dim + n] = acc;
+            }
+        }
+
+        let d_a = DeviceBuffer::from_slice(&a_q).unwrap();
+        let d_as = DeviceBuffer::from_slice(&a_s).unwrap();
+        let d_b = DeviceBuffer::from_slice(&b_q).unwrap();
+        let d_bs = DeviceBuffer::from_slice(&b_s).unwrap();
+        let mut d_c = DeviceBuffer::from_slice(&vec![0.0f32; m_dim * n_dim]).unwrap();
+        let func = cuda.fp8_gemm.get_function("fp8_gemm").unwrap();
+        let stream = &cuda.stream;
+        unsafe {
+            launch!(
+                func<<<(n_dim as u32, m_dim as u32), 256, 0, stream>>>(
+                    d_a.as_device_ptr(),
+                    d_as.as_device_ptr(),
+                    d_b.as_device_ptr(),
+                    d_bs.as_device_ptr(),
+                    d_c.as_device_ptr(),
+                    m_dim as i32,
+                    n_dim as i32,
+                    k_dim as i32
+                )
+            )
+            .unwrap();
+        }
+        stream.synchronize().unwrap();
+        let mut got = vec![0.0f32; m_dim * n_dim];
+        d_c.copy_to(&mut got).unwrap();
+
+        let max_rel: f32 = got
+            .iter()
+            .zip(&expected)
+            .map(|(g, e)| (g - e).abs() / e.abs().max(1.0))
+            .fold(0.0, f32::max);
+        assert!(max_rel < 1e-4, "fp8_gemm max rel err {max_rel}");
     }
 }
