@@ -78,7 +78,7 @@ logits all-gather (added to `ring.rs`: same QPs, same two-hop schedule,
 rank-ordered concatenation). Real 4-rank decode of the 1017 checkpoint:
 'The capital of France is' → ' Paris.', all four ranks' raw logits
 bit-identical. On the drained box (ferroseek as the sole tenant):
-125 ms/token lockstep = 8.0 tok/s single-stream (2026-10-26; was
+94 ms/token lockstep = 10.6 tok/s single-stream (2026-10-26; was
 1.2 s/token under the vLLM co-tenant with per-use expert staging).
 4. next: serving from the head (continuous decode, tokenizer loop,
 KV-cache reuse across requests).
