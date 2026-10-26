@@ -300,7 +300,7 @@ pub fn hc_block(
     let stream = &c.stream;
     unsafe {
         launch!(
-            f<<<n_tokens as u32, 256, 0, stream>>>(
+            f<<<n_tokens as u32, 1024, 0, stream>>>(
                 xf, fnc, base, scale, pre, post, comb, n_tokens as i32, hc_dim as i32, mix_hc as i32, eps
             )
         )
