@@ -1428,19 +1428,29 @@ impl GpuModel<'static> {
                         let rows: Vec<usize> =
                             ids.iter().take(ncols).map(|&id| id as usize).collect();
                         let mut flat = vec![0.0f32; rows.len() * ehd];
-                        for (chunk, r) in flat.par_chunks_mut(ehd).zip(rows.par_iter()) {
-                            let r = *r;
-                            if r * ehd + ehd > wt.len() {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    format!(
-                                        "engram hash row {r} out of table ({})",
-                                        wt.len() / ehd
-                                    ),
-                                ));
-                            }
-                            let row = ferroseek_ref::store::fp8_row_scaled(wt, st, r, ehd);
-                            chunk.copy_from_slice(&row);
+                        flat.par_chunks_mut(ehd)
+                            .zip(rows.par_iter())
+                            .for_each(|(chunk, &r)| {
+                                if r * ehd + ehd > wt.len() {
+                                    // out-of-range rows are a hard error;
+                                    // record and fail after the join (rayon
+                                    // closures must be closure-safe)
+                                    chunk.fill(f32::NAN);
+                                    return;
+                                }
+                                let row = ferroseek_ref::store::fp8_row_scaled(wt, st, r, ehd);
+                                chunk.copy_from_slice(&row);
+                            });
+                        if flat.iter().any(|v| v.is_nan()) {
+                            let bad = rows
+                                .iter()
+                                .find(|&&r| r * ehd + ehd > wt.len())
+                                .copied()
+                                .unwrap_or(0);
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("engram hash row {bad} out of table ({})", wt.len() / ehd),
+                            ));
                         }
                         // pinned async staging: the two pageable copy_from
                         // calls each drained the queue (engram measured
