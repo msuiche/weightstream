@@ -522,6 +522,14 @@ struct Scratch {
     logits: D<f32>,
     argmax_i: D<i32>,
     argmax_v: D<f32>,
+    /// Pinned host staging (docs: pageable copies drain the queue at ~1 ms
+    /// a piece on GB10; ~240 per step made a 300 ms token). Sizes:
+    /// coll = max(dim, vocab/world) f32 for collective staging,
+    /// gate = top_k f32 + top_k i32 for the moe routing readback,
+    /// small = 4 KiB for engram hash/upload traffic.
+    coll_stage: crate::stream::PinnedBuf,
+    gate_stage: crate::stream::PinnedBuf,
+    small_stage: crate::stream::PinnedBuf,
 }
 
 /// Device caches, preallocated at max_seq_len (docs/kernels.md). Per layer
@@ -1557,12 +1565,14 @@ impl GpuModel<'static> {
             dim,
         );
         if let Some(comm) = comm_opt.as_deref_mut() {
-            let mut part = vec![0.0f32; vocab_l];
-            s.logits
-                .index(0..vocab_l)
-                .copy_to(&mut part)
-                .map_err(cuda_err)?;
-            let full = comm.allgather(&part)?;
+            let stream = c.stream.as_inner();
+            s.coll_stage.dtoh(
+                s.logits.as_device_ptr().as_raw() as u64,
+                vocab_l * 4,
+                stream,
+            )?;
+            s.coll_stage.sync(stream)?;
+            let full = comm.allgather(&s.coll_stage.as_f32()[..vocab_l])?;
             s.logits.copy_from(&full).map_err(cuda_err)?;
         }
         let mut out = vec![0.0f32; cfg.vocab as usize];
@@ -2029,6 +2039,11 @@ impl<'a> GpuModel<'a> {
             logits: up_zero_f32(c, cfg.vocab as usize)?,
             argmax_i: DeviceBuffer::zeroed(1).map_err(cuda_err)?,
             argmax_v: DeviceBuffer::zeroed(1).map_err(cuda_err)?,
+            coll_stage: crate::stream::PinnedBuf::new(
+                cfg.vocab as usize / sh.world_size as usize * 4 + 4,
+            )?,
+            gate_stage: crate::stream::PinnedBuf::new(1024)?,
+            small_stage: crate::stream::PinnedBuf::new(1 << 12)?,
         };
 
         let n_sources = cfg.kv_sources.len();
@@ -2390,10 +2405,16 @@ fn attention_step(
                     compress_len,
                 );
                 let mut score = vec![0.0f32; compress_len];
-                s.score
-                    .index(0..compress_len)
-                    .copy_to(&mut score)
-                    .map_err(cuda_err)?;
+                {
+                    let stream = c.stream.as_inner();
+                    s.coll_stage.dtoh(
+                        s.score.as_device_ptr().as_raw() as u64,
+                        compress_len * 4,
+                        stream,
+                    )?;
+                    s.coll_stage.sync(stream)?;
+                    score.copy_from_slice(&s.coll_stage.as_f32()[..compress_len]);
+                }
                 // index_score all-reduce (model.py:559-560): each rank
                 // scored only its 8 index heads
                 if let Some(comm) = comm.as_deref_mut() {
@@ -2529,12 +2550,11 @@ fn attention_step(
     );
     // wo_b is row-parallel: fp32 partial-sum all-reduce (spec §3)
     if let Some(comm) = comm.as_deref_mut() {
-        let mut part = vec![0.0f32; dim];
-        s.attn_out
-            .index(0..dim)
-            .copy_to(&mut part)
-            .map_err(cuda_err)?;
-        let red = comm.allreduce(&part)?;
+        let stream = c.stream.as_inner();
+        s.coll_stage
+            .dtoh(s.attn_out.as_device_ptr().as_raw() as u64, dim * 4, stream)?;
+        s.coll_stage.sync(stream)?;
+        let red = comm.allreduce(&s.coll_stage.as_f32()[..dim])?;
         s.attn_out.copy_from(&red).map_err(cuda_err)?;
     }
     dump_dev(c, &s.attn_out, dim, format!("d_pos{pos}_attnout{l}.f32"));
@@ -2601,11 +2621,30 @@ fn moe_step(
         top_k,
         cfg.route_scale,
     );
-    // TODO(gpu): batched expert GEMMs without host readback
+    // TODO(gpu): batched expert GEMMs without host readback. Until then the
+    // readback goes through pinned async staging: the pageable copy_to
+    // drained the queue (~1 ms each, 40x per step = a third of a token).
     let mut w_host = vec![0.0f32; top_k];
     let mut i_host = vec![0i32; top_k];
-    s.gate_w_out.copy_to(&mut w_host).map_err(cuda_err)?;
-    s.gate_i_out.copy_to(&mut i_host).map_err(cuda_err)?;
+    {
+        let stream = c.stream.as_inner();
+        s.gate_stage.dtoh(
+            s.gate_w_out.as_device_ptr().as_raw() as u64,
+            top_k * 4,
+            stream,
+        )?;
+        s.gate_stage.dtoh_at(
+            s.gate_i_out.as_device_ptr().as_raw() as u64,
+            top_k * 4,
+            top_k * 4, // host offset: ids after weights
+            stream,
+        )?;
+        s.gate_stage.sync(stream)?;
+        let f32s = s.gate_stage.as_f32();
+        w_host.copy_from_slice(&f32s[..top_k]);
+        let i32s = s.gate_stage.as_i32_at(top_k * 4);
+        i_host.copy_from_slice(&i32s[..top_k]);
+    }
     prof.add_us(2, t_gate);
 
     crate::dump::i32s(
@@ -2708,9 +2747,11 @@ fn moe_step(
     // ordered. The shared expert is replicated and added AFTER the reduce
     // (recomputed, not reduced), so every rank lands on identical bits.
     if let Some(comm) = comm.as_deref_mut() {
-        let mut part = vec![0.0f32; dim];
-        s.y_moe.index(0..dim).copy_to(&mut part).map_err(cuda_err)?;
-        let red = comm.allreduce(&part)?;
+        let stream = c.stream.as_inner();
+        s.coll_stage
+            .dtoh(s.y_moe.as_device_ptr().as_raw() as u64, dim * 4, stream)?;
+        s.coll_stage.sync(stream)?;
+        let red = comm.allreduce(&s.coll_stage.as_f32()[..dim])?;
         s.y_moe.copy_from(&red).map_err(cuda_err)?;
     }
 

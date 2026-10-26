@@ -18,8 +18,9 @@
 //! both ways.
 
 use cust::sys::{
-    cuGetErrorString, cuMemHostGetDevicePointer_v2, cuMemHostRegister_v2, cuMemHostUnregister,
-    cudaError_enum, CU_MEMHOSTREGISTER_DEVICEMAP,
+    cuGetErrorString, cuMemFreeHost, cuMemHostAlloc, cuMemHostGetDevicePointer_v2,
+    cuMemHostRegister_v2, cuMemHostUnregister, cuMemcpyDtoHAsync_v2, cuMemcpyHtoDAsync_v2,
+    cuStreamSynchronize, cudaError_enum, CUstream, CU_MEMHOSTREGISTER_DEVICEMAP,
 };
 use std::io;
 use std::sync::Mutex;
@@ -243,6 +244,99 @@ impl HostArena {
             .iter()
             .find(|&&(b, e, _)| p >= b && p + len <= e)
             .map(|&(b, _, ref path)| (path.clone(), (p - b) as u64))
+    }
+}
+
+/// One pinned host buffer for fast device<->host staging. The engine's
+/// pageable `DeviceBuffer::copy_to/from` round trips drain the queue and
+/// cost ~1 ms each on GB10 — with ~240 of them per decode step (gate
+/// readback, collective staging, engram uploads) that is most of a 300 ms
+/// step. Pinned memory + async copy on the engine stream + one
+/// `cuStreamSynchronize` is the same data at a fraction of the cost.
+pub struct PinnedBuf {
+    ptr: *mut u8,
+    len: usize,
+}
+
+// SAFETY: the pointer is used only from the owning thread (the decode
+// loop) while the model lives; nothing else aliases it.
+unsafe impl Send for PinnedBuf {}
+
+impl PinnedBuf {
+    pub fn new(len: usize) -> io::Result<Self> {
+        let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+        // CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP
+        let r = unsafe { cuMemHostAlloc(&mut p, len, 0x02 | 0x04) };
+        if !cu_ok(r) {
+            return Err(cuda_err(r, "cuMemHostAlloc"));
+        }
+        Ok(PinnedBuf {
+            ptr: p as *mut u8,
+            len,
+        })
+    }
+
+    pub fn as_slice_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    /// `&[T]` view of the buffer (host side).
+    pub fn as_f32(&mut self) -> &mut [f32] {
+        let n = self.len / 4;
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut f32, n) }
+    }
+
+    /// Async device->host into `[ptr+off, ptr+off+bytes)` on `stream`.
+    pub fn dtoh_at(
+        &mut self,
+        src: u64,
+        bytes: usize,
+        off: usize,
+        stream: CUstream,
+    ) -> io::Result<()> {
+        if off + bytes > self.len {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "pinned range"));
+        }
+        let r = unsafe { cuMemcpyDtoHAsync_v2(self.ptr.add(off) as *mut _, src, bytes, stream) };
+        if !cu_ok(r) {
+            return Err(cuda_err(r, "cuMemcpyDtoHAsync"));
+        }
+        Ok(())
+    }
+
+    /// Async device->host into `[ptr, ptr+bytes)`, then wait for it.
+    pub fn dtoh(&mut self, src: u64, bytes: usize, stream: CUstream) -> io::Result<()> {
+        self.dtoh_at(src, bytes, 0, stream)
+    }
+
+    /// `&[i32]` view at byte offset `off`.
+    pub fn as_i32_at(&mut self, off: usize) -> &[i32] {
+        let n = (self.len - off) / 4;
+        unsafe { std::slice::from_raw_parts(self.ptr.add(off) as *const i32, n) }
+    }
+
+    /// Wait for every async copy issued on `stream` to land.
+    pub fn sync(&self, stream: CUstream) -> io::Result<()> {
+        let r = unsafe { cuStreamSynchronize(stream) };
+        if !cu_ok(r) {
+            return Err(cuda_err(r, "cuStreamSynchronize"));
+        }
+        Ok(())
+    }
+
+    /// Async host->device from this buffer on `stream`.
+    pub fn htod(&self, dst: u64, bytes: usize, stream: CUstream) -> io::Result<()> {
+        let r = unsafe { cuMemcpyHtoDAsync_v2(dst, self.ptr as *const _, bytes, stream) };
+        if !cu_ok(r) {
+            return Err(cuda_err(r, "cuMemcpyHtoDAsync"));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PinnedBuf {
+    fn drop(&mut self) {
+        let _r = unsafe { cuMemFreeHost(self.ptr as *mut _) };
     }
 }
 
