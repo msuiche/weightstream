@@ -1704,6 +1704,7 @@ impl<'a> GpuModel<'a> {
         }
         let cfg = RefConfig::from_model_config(&ckpt.config)?;
         validate_dims(&cfg)?;
+        let n_experts_local = cfg.n_routed / sharding.world_size;
         let mut store: Box<dyn WeightStore + 'a> = Box::new(CkptStore::new(ckpt));
         validate_layout(&cfg, store.as_mut())?;
         let t_b = std::time::Instant::now();
@@ -1712,8 +1713,8 @@ impl<'a> GpuModel<'a> {
             "tp4 rank {}: upload weight pass in {:?} ({}/{} experts device-resident)",
             sharding.rank,
             t_b.elapsed(),
-            cfg.n_routed / sharding.world_size,
-            cfg.n_routed
+            n_experts_local,
+            n_experts_local * sharding.world_size
         );
         model.store_keepalive = Some(store);
         model.sharding = sharding;
