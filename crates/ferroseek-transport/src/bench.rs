@@ -663,8 +663,8 @@ fn run_worker(
                 let s = run_soak(ring, iters, ve)?;
                 serde_json::json!({ "rank": me, "soak": s })
             }
-            // engine-only phase; the bench never issues it
-            Phase::Start => serde_json::json!({ "rank": me }),
+            // engine-only phases; the bench never issues them
+            Phase::Start | Phase::Next => serde_json::json!({ "rank": me }),
         };
         worker.send_ready(result).map_err(|e| e.to_string())?;
     }
