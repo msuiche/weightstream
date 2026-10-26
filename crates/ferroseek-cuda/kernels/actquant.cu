@@ -4,33 +4,7 @@
 // The gate expects bit-exact match with the CPU reference (all ops are
 // exact in fp32 except the fp8 round, which is deterministic).
 
-#include <cstdint>
-
-__device__ __forceinline__ float f32_to_e4m3(float v) {
-    // Round-to-nearest-even to e4m3fn (bias 7, 3 mantissa bits, max 448).
-    uint32_t bits = __float_as_uint(v);
-    uint32_t sign = bits & 0x80000000u;
-    float a = fabsf(v);
-    if (a > 448.0f) a = 448.0f;
-    int exp;
-    float m = frexpf(a, &exp); // a = m * 2^exp, m in [0.5, 1)
-    // e4m3 exponent field = exp + 6 (bias 7, and m in [0.5,1) -> 1.m with exp-1)
-    int e = exp - 1 + 7;
-    float val;
-    if (e <= 0) {
-        // subnormal: value = mant/8 * 2^-6
-        val = rintf(a * 512.0f) / 512.0f;
-    } else {
-        int mant = (int)rintf((m * 2.0f - 1.0f) * 8.0f);
-        if (mant == 8) { mant = 0; e += 1; }
-        if (e >= 15) {
-            val = 448.0f; // saturate (finite-only variant has no inf)
-        } else {
-            val = ldexpf(1.0f + (float)mant / 8.0f, e - 7);
-        }
-    }
-    return sign ? -val : val;
-}
+#include "common.cuh"
 
 extern "C" __global__ void act_quant_ue8m0_snap(
     float* __restrict__ x,
@@ -55,6 +29,6 @@ extern "C" __global__ void act_quant_ue8m0_snap(
     if (threadIdx.x < 32) {
         float y = g[threadIdx.x] / s;
         y = fminf(fmaxf(y, -448.0f), 448.0f);
-        x[(size_t)group * 32 + threadIdx.x] = f32_to_e4m3(y) * s;
+        x[(size_t)group * 32 + threadIdx.x] = e4m3_to_f32(f32_to_e4m3_bits(y)) * s;
     }
 }
