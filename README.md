@@ -6,7 +6,10 @@ cache, cluster transport and serving layer are Rust; the tensor-core kernels
 are CUDA, reused from proven stacks first and rewritten only where profiling
 says so.
 
-Status: **TP4 integration.** What works today:
+Status: **TP4 sharded decode landed.** First real 4-rank decode of the
+1017 checkpoint across the ring (2026-10-26): "The capital of France is"
+→ " Paris.", raw logits bit-identical on all four ranks, ~1.2 s/token in
+lockstep (2.0× single-node under the vLLM co-tenant). What works today:
 
 - **CPU reference engine** (`ferroseek-ref`) — full DS4.1F decode on the real
   475 GB checkpoint, **gate-passed against the production vLLM TP4 stack**
@@ -20,9 +23,13 @@ Status: **TP4 integration.** What works today:
 - **TP4 transport** (`ferroseek-transport`) — one-shot two-hop fp32
   all-reduce over the 4-node switchless RoCE ring, bit-exact on all ranks,
   ~10 µs/4 KB, zero packet loss in a 100k soak
+- **TP4 sharded decode** — `ferroseek decode --engine gpu --stream --tp4
+  --rank N --ring nodes-ring4.local.json`: per-rank slices (16 heads,
+  96 experts, vocab shard) with all-reduces at the spec's three reduction
+  points plus the logits all-gather
 
-In flight: TP4 sharded decode across the ring. Remaining: serving,
-speculative decode, prefill. See [`docs/architecture.md`](docs/architecture.md),
+Remaining: serving from the head, speculative decode, prefill. See
+[`docs/architecture.md`](docs/architecture.md),
 [`docs/model-spec.md`](docs/model-spec.md), [`docs/streaming.md`](docs/streaming.md),
 [`docs/transport.md`](docs/transport.md).
 
