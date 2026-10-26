@@ -1,8 +1,17 @@
 // Hyper-connection mixing + 20-iteration Sinkhorn (model-spec §2,
 // model.py:950-968, kernel.py:406-474).
 //
-// One block per token. mixes = (xf @ hc_fn^T) * rstd over the flattened
-// 4x-dim stream; then pre/post/comb with the exact eps placement:
+// hc_block: one block per token (the whole computation in one kernel).
+// hc_mixes + hc_finalize: the same arithmetic split across two launches
+// so the 24 dot rows run on 24 SMs instead of 8 warps of one — the dot
+// per lane and the shuffle tree are UNCHANGED, so the fp32 values are
+// bit-identical to hc_block's warp-per-row form (gate-verified).
+//   hc_mixes: one warp per dot row, gridDim.x = mix_hc; writes raw dots
+//     (rstd applied in hc_finalize).
+//   hc_finalize: 256 threads — rstd via the original strided
+//     block_reduce_sum over sum-of-squares (same shape as hc_block), then
+//     thread 0 runs the identical sigmoid/softmax/Sinkhorn tail.
+// pre/post/comb placement, spec order:
 //   pre[j]  = sigmoid(mixes[j]        * scale[0] + base[j]) + eps
 //   post[j] = 2 * sigmoid(mixes[4+j]  * scale[1] + base[4+j])
 //   comb_raw[j][k] = mixes[8 + j*4 + k] * scale[2] + base[8 + j*4 + k]
@@ -11,6 +20,102 @@
 
 #include "common.cuh"
 
+// raw dots for one token: gridDim.x = mix_hc, one warp per row.
+extern "C" __global__ void hc_mixes(
+    const float* __restrict__ xf,      // [n_tokens, hc_dim]
+    const float* __restrict__ hc_fn,   // [mix_hc, hc_dim]
+    float* __restrict__ out_dots,       // [n_tokens, mix_hc]
+    int n_tokens, int hc_dim, int mix_hc)
+{
+    int row = blockIdx.x;
+    int tok = blockIdx.y;
+    if (row >= mix_hc || tok >= n_tokens) return;
+    const float* x = xf + (size_t)tok * hc_dim;
+    const float* w = hc_fn + (size_t)row * hc_dim;
+    const int lane = threadIdx.x;
+    float part = 0.0f;
+    for (int i = lane; i < hc_dim; i += 32) part += x[i] * w[i];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        part += __shfl_down_sync(0xFFFFFFFFu, part, off);
+    if (lane == 0) out_dots[(size_t)tok * mix_hc + row] = part;
+}
+
+// rstd + sigmoid/softmax/Sinkhorn tail for one token (256 threads).
+extern "C" __global__ void hc_finalize(
+    const float* __restrict__ xf,        // [n_tokens, hc_dim] (for rstd)
+    const float* __restrict__ dots,     // [n_tokens, mix_hc] (hc_mixes out)
+    const float* __restrict__ hc_base,  // [mix_hc]
+    const float* __restrict__ hc_scale,// [3]
+    float* __restrict__ out_pre,        // [n_tokens, 4]
+    float* __restrict__ out_post,       // [n_tokens, 4]
+    float* __restrict__ out_comb,       // [n_tokens, 16]
+    int n_tokens, int hc_dim, int mix_hc, float eps)
+{
+    int tok = blockIdx.x;
+    if (tok >= n_tokens) return;
+    const float* x = xf + (size_t)tok * hc_dim;
+
+    __shared__ float s_sumsq;
+    __shared__ float s_mix[24];
+    if (mix_hc > 24) return;
+
+    // rstd: the original strided block_reduce_sum shape
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < hc_dim; i += blockDim.x) {
+        float v = x[i];
+        acc += v * v;
+    }
+    block_reduce_sum(acc, &s_sumsq);
+    __syncthreads();
+    float rstd = rsqrtf(s_sumsq / (float)hc_dim + 1e-20f);
+
+    for (int row = threadIdx.x; row < mix_hc; row += blockDim.x) {
+        s_mix[row] = dots[(size_t)tok * mix_hc + row] * rstd;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        const float* hc_scale_ = hc_scale;
+        float pre[4], comb[16];
+        for (int j = 0; j < 4; j++) {
+            pre[j] = 1.0f / (1.0f + expf(-(s_mix[j] * hc_scale_[0] + hc_base[j]))) + eps;
+            out_post[(size_t)tok * 4 + j] =
+                2.0f / (1.0f + expf(-(s_mix[4 + j] * hc_scale_[1] + hc_base[4 + j])));
+            out_pre[(size_t)tok * 4 + j] = pre[j];
+            for (int k = 0; k < 4; k++) {
+                comb[j * 4 + k] = s_mix[8 + j * 4 + k] * hc_scale_[2] + hc_base[8 + j * 4 + k];
+            }
+        }
+        for (int j = 0; j < 4; j++) {
+            float mx = fmaxf(fmaxf(comb[j*4], comb[j*4+1]), fmaxf(comb[j*4+2], comb[j*4+3]));
+            float sum = 0.0f;
+            for (int k = 0; k < 4; k++) { comb[j*4+k] = expf(comb[j*4+k] - mx); sum += comb[j*4+k]; }
+            for (int k = 0; k < 4; k++) comb[j*4+k] = comb[j*4+k] / sum + eps;
+        }
+        for (int k = 0; k < 4; k++) {
+            float cs = eps;
+            for (int j = 0; j < 4; j++) cs += comb[j * 4 + k];
+            for (int j = 0; j < 4; j++) comb[j * 4 + k] /= cs;
+        }
+        for (int it = 0; it < 19; it++) {
+            for (int j = 0; j < 4; j++) {
+                float rs = eps;
+                for (int k = 0; k < 4; k++) rs += comb[j * 4 + k];
+                for (int k = 0; k < 4; k++) comb[j * 4 + k] /= rs;
+            }
+            for (int k = 0; k < 4; k++) {
+                float cs = eps;
+                for (int j = 0; j < 4; j++) cs += comb[j * 4 + k];
+                for (int j = 0; j < 4; j++) comb[j * 4 + k] /= cs;
+            }
+        }
+        for (int k = 0; k < 16; k++) out_comb[(size_t)tok * 16 + k] = comb[k];
+    }
+}
+
+// hc_block: the original single-kernel form (kept for the TP1/synthetic
+// path and as the bit-exact reference for the split kernels).
 extern "C" __global__ void hc_block(
     const float* __restrict__ xf,      // [n_tokens, hc_dim]
     const float* __restrict__ hc_fn,   // [mix_hc, hc_dim]

@@ -280,6 +280,59 @@ pub fn fp4_gemm(c: &Cuda, a: U8, sa: U8, b: U8, sb: U8, out: F32, m: usize, n: u
     }
 }
 
+/// `hc_mixes` (hc.cu): one warp per dot row, grid (mix_hc, n_tokens) —
+/// the dots spread across SMs instead of 8 warps of one block.
+pub fn hc_mixes(
+    c: &Cuda,
+    xf: F32,
+    fnc: F32,
+    dots: F32,
+    n_tokens: usize,
+    hc_dim: usize,
+    mix_hc: usize,
+) {
+    let f = c.hc.get_function("hc_mixes").unwrap();
+    let stream = &c.stream;
+    unsafe {
+        launch!(
+            f<<<(mix_hc as u32, n_tokens as u32), 32, 0, stream>>>(
+                xf, fnc, dots, n_tokens as i32, hc_dim as i32, mix_hc as i32
+            )
+        )
+        .unwrap()
+    }
+}
+
+/// `hc_finalize` (hc.cu): rstd (original block_reduce_sum shape) + the
+/// sigmoid/softmax/Sinkhorn tail over hc_mixes's dots.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_finalize(
+    c: &Cuda,
+    xf: F32,
+    dots: F32,
+    base: F32,
+    scale: F32,
+    pre: F32,
+    post: F32,
+    comb: F32,
+    n_tokens: usize,
+    hc_dim: usize,
+    mix_hc: usize,
+    eps: f32,
+) {
+    let f = c.hc.get_function("hc_finalize").unwrap();
+    let stream = &c.stream;
+    unsafe {
+        launch!(
+            f<<<n_tokens as u32, 256, 0, stream>>>(
+                xf, dots, base, scale, pre, post, comb,
+                n_tokens as i32, hc_dim as i32, mix_hc as i32, eps
+            )
+        )
+        .unwrap()
+    }
+}
+
 /// `hc_block` (hc.cu): mixes + 20-iter Sinkhorn for `n_tokens` tokens.
 #[allow(clippy::too_many_arguments)]
 pub fn hc_block(

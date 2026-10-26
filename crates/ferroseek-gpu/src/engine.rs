@@ -527,6 +527,7 @@ struct Scratch {
     gate_w_out: D<f32>,
     gate_i_out: D<i32>,
     gate_scores: D<f32>,
+    hc_dots: D<f32>,
     win_idxs: D<i32>,
     shared_idxs: D<i32>,
     pre_attn: D<f32>,
@@ -1478,20 +1479,48 @@ impl GpuModel<'static> {
             // attention sublayer wiring (spec §2, model.py:970-996)
             let hc_dim = hc * dim;
             let mix_hc = cfg.mix_hc();
-            k::hc_block(
-                c,
-                k::base(&s.h[h_cur]),
-                k::base(&layer.hc_attn_fn),
-                k::base(&layer.hc_attn_base),
-                k::base(&layer.hc_attn_scale),
-                k::base(&s.pre_attn),
-                k::base(&s.post),
-                k::base(&s.comb),
-                1,
-                hc_dim,
-                mix_hc,
-                cfg.hc_eps,
-            );
+            if world > 1 {
+                // split hc (TP4): the 24 dot rows run on 24 SMs; identical
+                // per-lane order and shuffle tree as hc_block (gate-verified)
+                k::hc_mixes(
+                    c,
+                    k::base(&s.h[h_cur]),
+                    k::base(&layer.hc_attn_fn),
+                    k::base(&s.hc_dots),
+                    1,
+                    hc_dim,
+                    mix_hc,
+                );
+                k::hc_finalize(
+                    c,
+                    k::base(&s.h[h_cur]),
+                    k::base(&s.hc_dots),
+                    k::base(&layer.hc_attn_base),
+                    k::base(&layer.hc_attn_scale),
+                    k::base(&s.pre_attn),
+                    k::base(&s.post),
+                    k::base(&s.comb),
+                    1,
+                    hc_dim,
+                    mix_hc,
+                    cfg.hc_eps,
+                );
+            } else {
+                k::hc_block(
+                    c,
+                    k::base(&s.h[h_cur]),
+                    k::base(&layer.hc_attn_fn),
+                    k::base(&layer.hc_attn_base),
+                    k::base(&layer.hc_attn_scale),
+                    k::base(&s.pre_attn),
+                    k::base(&s.post),
+                    k::base(&s.comb),
+                    1,
+                    hc_dim,
+                    mix_hc,
+                    cfg.hc_eps,
+                );
+            }
             k::hc_pre(
                 c,
                 k::base(&s.h[h_cur]),
@@ -1542,20 +1571,46 @@ impl GpuModel<'static> {
             }
 
             // ffn sublayer: its pre feeds the next block's attention
-            k::hc_block(
-                c,
-                k::base(&s.h[h_cur]),
-                k::base(&layer.hc_ffn_fn),
-                k::base(&layer.hc_ffn_base),
-                k::base(&layer.hc_ffn_scale),
-                k::base(&s.pre_ffn),
-                k::base(&s.post),
-                k::base(&s.comb),
-                1,
-                hc_dim,
-                mix_hc,
-                cfg.hc_eps,
-            );
+            if world > 1 {
+                k::hc_mixes(
+                    c,
+                    k::base(&s.h[h_cur]),
+                    k::base(&layer.hc_ffn_fn),
+                    k::base(&s.hc_dots),
+                    1,
+                    hc_dim,
+                    mix_hc,
+                );
+                k::hc_finalize(
+                    c,
+                    k::base(&s.h[h_cur]),
+                    k::base(&s.hc_dots),
+                    k::base(&layer.hc_ffn_base),
+                    k::base(&layer.hc_ffn_scale),
+                    k::base(&s.pre_ffn),
+                    k::base(&s.post),
+                    k::base(&s.comb),
+                    1,
+                    hc_dim,
+                    mix_hc,
+                    cfg.hc_eps,
+                );
+            } else {
+                k::hc_block(
+                    c,
+                    k::base(&s.h[h_cur]),
+                    k::base(&layer.hc_ffn_fn),
+                    k::base(&layer.hc_ffn_base),
+                    k::base(&layer.hc_ffn_scale),
+                    k::base(&s.pre_ffn),
+                    k::base(&s.post),
+                    k::base(&s.comb),
+                    1,
+                    hc_dim,
+                    mix_hc,
+                    cfg.hc_eps,
+                );
+            }
             k::hc_pre(
                 c,
                 k::base(&s.h[h_cur]),
@@ -2102,6 +2157,7 @@ impl<'a> GpuModel<'a> {
             act_e_s,
             gate_w_out: up_zero_f32(c, cfg.n_activated as usize)?,
             gate_scores: up_zero_f32(c, cfg.n_routed as usize)?,
+            hc_dots: up_zero_f32(c, cfg.mix_hc() as usize)?,
             gate_i_out: DeviceBuffer::zeroed(cfg.n_activated as usize).map_err(cuda_err)?,
             win_idxs: DeviceBuffer::zeroed(win).map_err(cuda_err)?,
             shared_idxs: DeviceBuffer::zeroed(win + cfg.index_topk as usize).map_err(cuda_err)?,
