@@ -258,6 +258,75 @@ fn synthetic_generation_covers_the_layout() {
 }
 
 #[test]
+fn release_config_json_parses_with_release_key_spellings() {
+    // The real 1017 export's config.json uses HF key spellings the ModelArgs
+    // names do not (`engram_pad_token_id`, `candidate_source_layer_id`,
+    // `sliding_window`, `scoring_func`, `routed_scaling_factor`, and YaRN
+    // nested under `rope_scaling`). Regression: before the alias fix these
+    // all silently fell back to defaults that happened to coincide — a
+    // revision that changes any of them would silently rewire the engine.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata")
+        .join("config-1017.json");
+    let cfg = ferroseek_core::ModelConfig::from_file(&path).expect("release config parses");
+    let r = RefConfig::from_model_config(&cfg).expect("ref config");
+
+    assert_eq!(r.dim, 5120);
+    assert_eq!(r.n_layers, 40);
+    assert_eq!(r.n_heads, 64);
+    assert_eq!(r.head_dim, 512);
+    assert_eq!(r.rope_dim, 64);
+    assert_eq!(r.q_lora, 1280);
+    assert_eq!(r.o_lora, 1024);
+    assert_eq!(r.o_groups, 8);
+    assert_eq!(r.window_size, 128, "sliding_window alias");
+    assert_eq!(r.norm_eps, 1e-20);
+    assert_eq!(r.kv_sources, vec![2, 8, 14, 20]);
+    assert_eq!(r.index_sources, vec![2, 8, 14, 20, 24, 28, 32, 36]);
+    assert_eq!(r.candidate_source, 20, "candidate_source_layer_id alias");
+    assert_eq!(r.candidate_topk_blocks, 2048);
+    assert_eq!(r.candidate_block_size, 8);
+    assert_eq!(r.index_n_heads, 32);
+    assert_eq!(r.index_head_dim, 128);
+    assert_eq!(r.index_topk, 512);
+    assert_eq!(r.hc_mult, 4);
+    assert_eq!(r.hc_sinkhorn_iters, 20);
+    assert_eq!(r.hc_eps, 1e-6);
+    // YaRN reads out of rope_scaling
+    assert_eq!(r.original_seq_len, 65536);
+    assert_eq!(r.rope_factor, 16.0);
+    assert_eq!(r.beta_fast, 32);
+    assert_eq!(r.beta_slow, 1);
+    assert_eq!(r.compress_rope_theta, 160000.0);
+    assert_eq!(r.rope_theta, 10000.0);
+    assert_eq!(r.n_routed, 384);
+    assert_eq!(r.n_activated, 6);
+    assert_eq!(r.n_shared, 1);
+    assert_eq!(r.inter_dim, 2304);
+    assert_eq!(r.score_func, "sqrtsoftplus", "scoring_func alias");
+    assert_eq!(r.route_scale, 1.5, "routed_scaling_factor alias");
+    assert_eq!(r.swiglu_limit, 10.0);
+    // engram wiring and the pad alias
+    assert_eq!(r.engram_layers, vec![1, 14]);
+    assert_eq!(r.engram_max_ngram, 4);
+    assert_eq!(r.engram_n_heads, 8);
+    assert_eq!(r.engram_head_dim, 256);
+    assert_eq!(r.engram_pad_id, 2, "engram_pad_token_id alias");
+    assert_eq!(r.engram_compressed_vocab, 99092);
+    assert_eq!(r.engram_prime_start, 16_000_000);
+    assert_eq!(r.engram_num_embeddings, vec![384006168, 384016682]);
+    assert_eq!(&r.compress_ratios[..4], &[0, 0, 2, 2]);
+    assert_eq!(r.compress_ratios[20], 1);
+    assert_eq!(r.compress_ratios[39], 1);
+    // the engram layout the release table row counts must cover
+    let layout = crate::engram::EngramLayout::build(&r).unwrap();
+    assert_eq!(layout.layer_ids, vec![1, 14]);
+    for (need, have) in layout.required_rows().iter().zip(r.engram_num_embeddings.iter()) {
+        assert!(have >= need, "engram rows {have} < required {need}");
+    }
+}
+
+#[test]
 fn checkpoint_path_matches_synthetic_path_bit_for_bit() {
     // Serialize the synthetic weights as a real on-disk safetensors checkpoint
     // (config.json + index + shard), load it through Checkpoint::open +

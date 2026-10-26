@@ -730,9 +730,10 @@ indexer `k_cache [B, seq//ratio, 128]` ×4, compressor `kv_state/score_state
 8. **`hc_mixes` normalization** uses one RMS over the flattened 4×5120
    stream rather than per-copy; confirmed by code (`model.py:953-956`) but
    worth a numerics test against the checkpoint.
-9. **`wo_a` block size**: convert accepts 32×32 or 128×128 scales
-   (`convert.py:164`); the 1017 export's actual block size should be read
-   from the real checkpoint (the census tool already validates this).
+9. **`wo_a` block size**: RESOLVED — the 1017 raw export stores
+   `wo_a.weight` fp8 `[8192, 4096]` with `wo_a.scale` e8m0 `[256, 128]`,
+   i.e. **32×32 blocks** (read from shard 9's safetensors header), matching
+   the loader's `dequant_fp8_blockwise` 32×32 path and convert.py.
 10. **Gumbel-max sampling** consumes torch RNG; "temperature 0 output
     identity" gates are fine, but sampled-temperature replay cannot be
     bit-exact without replicating torch's Philox stream.

@@ -170,12 +170,15 @@ impl RefConfig {
             q_lora,
             o_lora,
             o_groups: opt_u32(extra, &["o_groups"]).unwrap_or(8),
-            window_size: opt_u32(extra, &["window_size"]).unwrap_or(128),
+            // the release export names this `sliding_window` (HF spelling)
+            window_size: opt_u32(extra, &["window_size", "sliding_window"]).unwrap_or(128),
             norm_eps: opt_f32(extra, &["norm_eps", "rms_norm_eps"]).unwrap_or(1e-20),
             compress_ratios,
             kv_sources,
             index_sources,
-            candidate_source: opt_i64(extra, &["candidate_source_layer"]).unwrap_or(-1),
+            // the release export names this `candidate_source_layer_id`
+            candidate_source: opt_i64(extra, &["candidate_source_layer", "candidate_source_layer_id"])
+                .unwrap_or(-1),
             candidate_topk_blocks: opt_u32(extra, &["candidate_topk_blocks"]).unwrap_or(0),
             candidate_block_size: opt_u32(extra, &["candidate_block_size"]).unwrap_or(0),
             index_n_heads,
@@ -186,24 +189,37 @@ impl RefConfig {
             hc_eps: opt_f32(extra, &["hc_eps"]).unwrap_or(1e-6),
             rope_theta: opt_f64(extra, &["rope_theta"]).unwrap_or(10000.0),
             compress_rope_theta: opt_f64(extra, &["compress_rope_theta"]).unwrap_or(160000.0),
-            original_seq_len: opt_u32(extra, &["original_seq_len"]).unwrap_or(65536),
-            rope_factor: opt_f64(extra, &["rope_factor"]).unwrap_or(16.0),
-            beta_fast: opt_u32(extra, &["beta_fast"]).unwrap_or(32),
-            beta_slow: opt_u32(extra, &["beta_slow"]).unwrap_or(1),
+            // YaRN: flat ModelArgs keys first; the release export nests them
+            // under rope_scaling (factor/beta_fast/beta_slow/
+            // original_max_position_embeddings)
+            original_seq_len: opt_u32(extra, &["original_seq_len"])
+                .or_else(|| rope_scaling_u32(extra, "original_max_position_embeddings"))
+                .unwrap_or(65536),
+            rope_factor: opt_f64(extra, &["rope_factor"])
+                .or_else(|| rope_scaling_f64(extra, "factor"))
+                .unwrap_or(16.0),
+            beta_fast: opt_u32(extra, &["beta_fast"])
+                .or_else(|| rope_scaling_u32(extra, "beta_fast"))
+                .unwrap_or(32),
+            beta_slow: opt_u32(extra, &["beta_slow"])
+                .or_else(|| rope_scaling_u32(extra, "beta_slow"))
+                .unwrap_or(1),
             n_routed,
             n_shared,
             n_activated,
             inter_dim,
-            score_func: opt_string(extra, &["score_func"]).unwrap_or_else(|| "sqrtsoftplus".into()),
+            score_func: opt_string(extra, &["score_func", "scoring_func"])
+                .unwrap_or_else(|| "sqrtsoftplus".into()),
             gate_temp: opt_f32(extra, &["gate_temp"]).unwrap_or(1.0),
             norm_topk_prob: opt_bool(extra, &["norm_topk_prob"]).unwrap_or(true),
-            route_scale: opt_f32(extra, &["route_scale"]).unwrap_or(1.5),
+            route_scale: opt_f32(extra, &["route_scale", "routed_scaling_factor"]).unwrap_or(1.5),
             swiglu_limit: opt_f32(extra, &["swiglu_limit"]).unwrap_or(10.0),
             engram_layers,
             engram_max_ngram: opt_u32(extra, &["engram_max_ngram_size"]).unwrap_or(4),
             engram_n_heads: opt_u32(extra, &["engram_n_heads"]).unwrap_or(8),
             engram_head_dim: opt_u32(extra, &["engram_head_dim"]).unwrap_or(256),
-            engram_pad_id: opt_u32(extra, &["engram_pad_id"]).unwrap_or(2),
+            // the release export names this `engram_pad_token_id`
+            engram_pad_id: opt_u32(extra, &["engram_pad_id", "engram_pad_token_id"]).unwrap_or(2),
             engram_compressed_vocab,
             engram_prime_start: opt_u64(extra, &["engram_vocab_size"]).unwrap_or(16_000_000),
             engram_num_embeddings,
@@ -222,6 +238,25 @@ impl RefConfig {
 
 fn get<'a>(extra: &'a BTreeMap<String, Value>, keys: &[&str]) -> Option<&'a Value> {
     keys.iter().find_map(|k| extra.get(*k))
+}
+
+/// Read one field out of the nested HF `rope_scaling` object
+/// ({rope_type, factor, beta_fast, beta_slow, original_max_position_embeddings}).
+fn rope_scaling_value<'a>(
+    extra: &'a BTreeMap<String, Value>,
+    key: &str,
+) -> Option<&'a Value> {
+    extra.get("rope_scaling").and_then(|v| v.get(key))
+}
+
+fn rope_scaling_u32(extra: &BTreeMap<String, Value>, key: &str) -> Option<u32> {
+    rope_scaling_value(extra, key)
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+}
+
+fn rope_scaling_f64(extra: &BTreeMap<String, Value>, key: &str) -> Option<f64> {
+    rope_scaling_value(extra, key).and_then(Value::as_f64)
 }
 
 fn opt_u32(extra: &BTreeMap<String, Value>, keys: &[&str]) -> Option<u32> {
