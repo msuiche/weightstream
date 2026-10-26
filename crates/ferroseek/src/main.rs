@@ -7,6 +7,7 @@ const USAGE: &str = "ferroseek — DGX Spark-native inference for DeepSeek V4.1 
 USAGE:
     ferroseek info <model-dir>     Parse config.json, print shape and KV sizing
     ferroseek weights <model-dir>  Validate shard coverage against the DS4.1F census
+    ferroseek tokens <model-dir> <text>  Encode text, print token ids
     ferroseek serve <model-dir>    OpenAI-compatible endpoint (phase 3)
     ferroseek bench <model-dir>    Decode/prefill microbench (phase 4)
 
@@ -18,6 +19,7 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("info") => cmd_info(args.get(1)),
         Some("weights") => cmd_weights(args.get(1)),
+        Some("tokens") => cmd_tokens(args.get(1), args.get(2)),
         Some("serve") | Some("bench") => {
             eprintln!(
                 "{}: not yet — phases and kernel strategy in docs/architecture.md",
@@ -139,4 +141,22 @@ fn cmd_weights(dir: Option<&String>) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+fn cmd_tokens(dir: Option<&String>, text: Option<&String>) -> ExitCode {
+    let (Some(dir), Some(text)) = (dir, text) else {
+        eprint!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    let tk = match ferroseek_tokenizer::Tokenizer::from_model_dir(Path::new(dir)) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let ids = tk.encode(text);
+    println!("{:?}", ids);
+    println!("{}", ids.len());
+    ExitCode::SUCCESS
 }

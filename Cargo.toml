@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/ferroseek",
     "crates/ferroseek-core",
+    "crates/ferroseek-tokenizer",
 ]
 
 [workspace.package]
