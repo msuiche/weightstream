@@ -5,6 +5,8 @@
 #[cfg(feature = "cuda")]
 pub mod gpu;
 
+pub mod rope_tables;
+
 /// True when built with driver support (does not probe hardware).
 pub fn built_with_cuda() -> bool {
     cfg!(feature = "cuda")
