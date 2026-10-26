@@ -84,20 +84,25 @@ extern "C" __global__ void expert_glu(
     const uint8_t* w3e = w3 + (size_t)e_loc * N * (K / 2);
     const uint8_t* w1se = w1_s + (size_t)e_loc * N * kb;
     const uint8_t* w3se = w3_s + (size_t)e_loc * N * kb;
-
     float acc1 = 0.0f, acc3 = 0.0f;
     for (int b = threadIdx.x; b < kb; b += blockDim.x) {
         const uint8_t* a = act_x + b * 32;
         const uint8_t* b1 = w1e + (size_t)n * (K / 2) + b * 16;
         const uint8_t* b3 = w3e + (size_t)n * (K / 2) + b * 16;
         float d1 = 0.0f, d3 = 0.0f;
+        // vectorized 16B loads (see fp4_expert_gemm.cu): identical add order
+        const uint4 act = *reinterpret_cast<const uint4*>(a);
+        const uint4 p1 = *reinterpret_cast<const uint4*>(b1);
+        const uint4 p3 = *reinterpret_cast<const uint4*>(b3);
+        const uint8_t* acts = reinterpret_cast<const uint8_t*>(&act);
+        const uint8_t* by1 = reinterpret_cast<const uint8_t*>(&p1);
+        const uint8_t* by3 = reinterpret_cast<const uint8_t*>(&p3);
 #pragma unroll
         for (int k = 0; k < 16; k++) {
-            uint8_t byte1 = b1[k], byte3 = b3[k];
-            d1 += e4m3_to_f32(a[2 * k]) * FP4_TABLE[byte1 & 0x0F];
-            d1 += e4m3_to_f32(a[2 * k + 1]) * FP4_TABLE[byte1 >> 4];
-            d3 += e4m3_to_f32(a[2 * k]) * FP4_TABLE[byte3 & 0x0F];
-            d3 += e4m3_to_f32(a[2 * k + 1]) * FP4_TABLE[byte3 >> 4];
+            d1 += e4m3_to_f32(acts[2 * k]) * FP4_TABLE[by1[k] & 0x0F];
+            d1 += e4m3_to_f32(acts[2 * k + 1]) * FP4_TABLE[by1[k] >> 4];
+            d3 += e4m3_to_f32(acts[2 * k]) * FP4_TABLE[by3[k] & 0x0F];
+            d3 += e4m3_to_f32(acts[2 * k + 1]) * FP4_TABLE[by3[k] >> 4];
         }
         float sa = e8m0_to_f32(act_x_s[b]);
         acc1 += d1 * sa * e8m0_to_f32(w1se[(size_t)n * kb + b]);
@@ -203,12 +208,16 @@ extern "C" __global__ void expert_reduce(
         for (int blk = threadIdx.x; blk < kb; blk += blockDim.x) {
             const uint8_t* bp = b + (size_t)n * (inter / 2) + blk * 16;
             const uint8_t* ap = a + blk * 32;
+            const uint4 pack = *reinterpret_cast<const uint4*>(bp);
+            const uint4 act = *reinterpret_cast<const uint4*>(ap);
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&pack);
+            const uint8_t* acts = reinterpret_cast<const uint8_t*>(&act);
             float dot = 0.0f;
 #pragma unroll
             for (int k = 0; k < 16; k++) {
-                uint8_t byte = bp[k];
-                dot += e4m3_to_f32(ap[2 * k]) * FP4_TABLE[byte & 0x0F];
-                dot += e4m3_to_f32(ap[2 * k + 1]) * FP4_TABLE[byte >> 4];
+                uint8_t byte = bytes[k];
+                dot += e4m3_to_f32(acts[2 * k]) * FP4_TABLE[byte & 0x0F];
+                dot += e4m3_to_f32(acts[2 * k + 1]) * FP4_TABLE[byte >> 4];
             }
             part += dot * e8m0_to_f32(as[blk]) * e8m0_to_f32(bs[(size_t)n * kb + blk]);
         }
