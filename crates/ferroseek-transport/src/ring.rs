@@ -85,6 +85,10 @@ pub struct Ring {
     wait: Duration,
     out_off: u64,
     ping_off: u64,
+    gather_off: u64,
+    /// allreduce + allgather latency accounting (µs), for engine reports
+    pub coll_us: f64,
+    pub coll_count: u64,
 }
 
 fn wrap_verbs(e: VerbsError) -> String {
@@ -113,7 +117,8 @@ impl Ring {
         let slot_bytes = elems * 4;
         let out_off = 8 * slot_bytes as u64;
         let ping_off = 9 * slot_bytes as u64;
-        let mut buf = vec![0u8; 9 * slot_bytes + 8].into_boxed_slice();
+        let gather_off = 9 * slot_bytes as u64 + 8;
+        let mut buf = vec![0u8; 13 * slot_bytes + 8].into_boxed_slice();
         let base = buf.as_ptr() as u64;
 
         // resolve every (peer, rail) interface to its device/port/gid
@@ -197,6 +202,9 @@ impl Ring {
             wait,
             out_off,
             ping_off,
+            gather_off,
+            coll_us: 0.0,
+            coll_count: 0,
         }, endpoints))
     }
 
@@ -286,6 +294,7 @@ impl Ring {
         &self,
         key: (u8, usize),
         src_addr: u64,
+        len: usize,
         bank: usize,
         src_rank: u8,
         seq: u16,
@@ -296,7 +305,7 @@ impl Ring {
         let remote = end.slots_addr + ((bank * 4 + src_rank as usize) * self.elems * 4) as u64;
         qp.write_imm(
             src_addr,
-            (self.elems * 4) as u32,
+            (len * 4) as u32,
             lkey,
             remote,
             end.rkey,
@@ -305,14 +314,22 @@ impl Ring {
         .map_err(wrap_verbs)
     }
 
-    /// One-shot all-reduce of `input` (fp32). On success returns the
-    /// rank-ordered sum, in registered host memory, valid until the next
-    /// all-reduce on this ring.
-    pub fn allreduce(&mut self, input: &[f32]) -> Result<&[f32], String> {
-        if input.len() != self.elems {
+    /// The two-hop exchange every collective shares: stage `input` into this
+    /// step's bank slot for my rank, one-shot write it to both neighbors,
+    /// forward the predecessor's partial to the successor, and wait until
+    /// every rank's slot for this step has landed. `input.len()` may be
+    /// smaller than the ring's slot capacity (`elems`) — the slot stride
+    /// stays fixed, the wire payload shrinks. Returns (bank, len).
+    ///
+    /// The engine is SPMD-synchronous: every rank issues the same collective
+    /// sequence, so a receiver always knows how to interpret the slots of the
+    /// step it is currently in (all-reduce sums them, all-gather
+    /// concatenates them) — the immediate carries only (seq, src).
+    fn exchange(&mut self, input: &[f32]) -> Result<(usize, usize), String> {
+        let len = input.len();
+        if len == 0 || len > self.elems {
             return Err(format!(
-                "allreduce input len {} != slot elems {}",
-                input.len(),
+                "collective input len {len} not in 1..={}",
                 self.elems
             ));
         }
@@ -335,7 +352,7 @@ impl Ring {
             std::ptr::copy_nonoverlapping(
                 input.as_ptr(),
                 self.slot_addr(bank, me as u8) as *mut f32,
-                self.elems,
+                len,
             );
         }
         let my_slot = self.slot_addr(bank, me as u8);
@@ -345,28 +362,63 @@ impl Ring {
         }
 
         // hop 1: my partial to both neighbors
-        self.write_slot((succ as u8, 0), my_slot, bank, me as u8, seq)?;
-        self.write_slot((pred as u8, 1), my_slot, bank, me as u8, seq)?;
+        self.write_slot((succ as u8, 0), my_slot, len, bank, me as u8, seq)?;
+        self.write_slot((pred as u8, 1), my_slot, len, bank, me as u8, seq)?;
 
         // hop 2: forward predecessor's partial to my successor once arrived
         self.wait_mask(1 << pred)?;
         let pred_slot = self.slot_addr(bank, pred as u8);
-        self.write_slot((succ as u8, 0), pred_slot, bank, pred as u8, seq)?;
+        self.write_slot((succ as u8, 0), pred_slot, len, bank, pred as u8, seq)?;
 
         self.wait_mask(expected)?;
+        Ok((bank, len))
+    }
 
+    /// One-shot all-reduce of `input` (fp32, `input.len() <= elems`). On
+    /// success returns the rank-ordered sum, in registered host memory,
+    /// valid until the next collective on this ring.
+    pub fn allreduce(&mut self, input: &[f32]) -> Result<&[f32], String> {
+        let t0 = Instant::now();
+        let (bank, len) = self.exchange(input)?;
+        let n = self.nranks;
         // rank-ordered sum, left to right: slot[0]+slot[1]+slot[2]+slot[3]
-        unsafe {
+        let out = unsafe {
             let out = (self.base + self.out_off) as *mut f32;
-            for i in 0..self.elems {
+            for i in 0..len {
                 let mut acc = *(self.slot_addr(bank, 0) as *const f32).add(i);
                 for r in 1..n {
                     acc += *(self.slot_addr(bank, r as u8) as *const f32).add(i);
                 }
                 *out.add(i) = acc;
             }
-            Ok(std::slice::from_raw_parts(out, self.elems))
-        }
+            std::slice::from_raw_parts(out, len)
+        };
+        self.coll_us += t0.elapsed().as_secs_f64() * 1e6;
+        self.coll_count += 1;
+        Ok(out)
+    }
+
+    /// One-shot all-gather of `contribution` (fp32, `len <= elems`): every
+    /// rank receives the rank-ordered concatenation
+    /// [c_0 | c_1 | c_2 | c_3], in registered host memory, valid until the
+    /// next collective. Same QPs, slots and two-hop schedule as the
+    /// all-reduce — the receiver interprets the step's slots as
+    /// contributions instead of partials.
+    pub fn allgather(&mut self, contribution: &[f32]) -> Result<&[f32], String> {
+        let t0 = Instant::now();
+        let (bank, len) = self.exchange(contribution)?;
+        let total = len * self.nranks;
+        let out = unsafe {
+            let out = (self.base + self.gather_off) as *mut f32;
+            for r in 0..self.nranks {
+                let src = self.slot_addr(bank, r as u8) as *const f32;
+                std::ptr::copy_nonoverlapping(src, out.add(r * len), len);
+            }
+            std::slice::from_raw_parts(out, total)
+        };
+        self.coll_us += t0.elapsed().as_secs_f64() * 1e6;
+        self.coll_count += 1;
+        Ok(out)
     }
 
     fn wait_mask(&mut self, want: u32) -> Result<(), String> {

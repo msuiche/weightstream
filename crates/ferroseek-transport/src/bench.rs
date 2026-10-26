@@ -228,6 +228,29 @@ fn run_gate(ring: &mut Ring, rounds: usize) -> Result<serde_json::Value, String>
             }
             fnv1a(&mut h, out[i].to_bits());
         }
+        // all-gather: every rank must see the rank-ordered concatenation of
+        // the same contributions, bit-exact
+        let gathered = ring.allgather(&input)?;
+        if gathered.len() != nranks * elems {
+            mismatches += 1;
+            first_bad.get_or_insert_with(|| "allgather length".to_string());
+        }
+        for r in 0..nranks {
+            for i in 0..elems {
+                let want = gate_input(round, r as u8, i);
+                if gathered[r * elems + i].to_bits() != want.to_bits() {
+                    mismatches += 1;
+                    if first_bad.is_none() {
+                        first_bad = Some(format!(
+                            "round {round} gather rank {r} elem {i}: got {:#010x}, want {:#010x}",
+                            gathered[r * elems + i].to_bits(),
+                            want.to_bits()
+                        ));
+                    }
+                }
+                fnv1a(&mut h, gathered[r * elems + i].to_bits());
+            }
+        }
         hashes.push(format!("{h:016x}"));
     }
     Ok(serde_json::json!({
@@ -616,6 +639,8 @@ fn run_worker(
                 let s = run_soak(ring, iters, ve)?;
                 serde_json::json!({ "rank": me, "soak": s })
             }
+            // engine-only phase; the bench never issues it
+            Phase::Start => serde_json::json!({ "rank": me }),
         };
         worker.send_ready(result).map_err(|e| e.to_string())?;
     }

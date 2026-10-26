@@ -9,6 +9,7 @@ USAGE:
     ferroseek weights <model-dir>  Validate shard coverage against the DS4.1F census
     ferroseek tokens <model-dir> <text>  Encode text, print token ids
     ferroseek decode <model-dir> <prompt> [max-tokens] [--engine cpu|gpu] [--stream] [--max-seq N]
+                                   [--tp4 --rank N --ring nodes-ring4.local.json]
                                    Greedy decode (default: cpu reference engine;
                                    gpu + --stream reads weights straight from the
                                    registered checkpoint mmaps, docs/streaming.md)
@@ -155,6 +156,10 @@ fn cmd_weights(dir: Option<&String>) -> ExitCode {
 trait Decoder {
     fn decode(&mut self, token: u32, position: u64) -> std::io::Result<Vec<f32>>;
     fn set_token_map(&mut self, map: Vec<i64>);
+    /// Transport accounting for run reports ("" when there is none).
+    fn coll_stats(&self) -> String {
+        String::new()
+    }
 }
 
 impl Decoder for ferroseek_ref::RefModel<'_> {
@@ -175,6 +180,9 @@ impl Decoder for ferroseek_gpu::engine::GpuModel<'static> {
     }
     fn set_token_map(&mut self, map: Vec<i64>) {
         self.set_token_map(map)
+    }
+    fn coll_stats(&self) -> String {
+        self.comm.as_ref().map(|c| c.stats()).unwrap_or_default()
     }
 }
 
@@ -217,6 +225,38 @@ fn build_engine(
     }
 }
 
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn build_engine_tp4(
+    ckpt: ferroseek_core::Checkpoint,
+    ring_path: &str,
+    rank: Option<u8>,
+    port: u16,
+    max_seq: u64,
+    wait_ms: u64,
+) -> std::io::Result<(Box<dyn Decoder>, ferroseek_gpu::tp4::Session)> {
+    // largest collective payload the engine issues: attention/moe partials
+    // (dim), the head's vocab shard (vocab/4), index scores (max_seq/ratio)
+    let cfg = ferroseek_ref::config::RefConfig::from_model_config(&ckpt.config)?;
+    let mut elems = cfg.dim as usize;
+    elems = elems.max(cfg.vocab as usize / 4);
+    for &src in &cfg.kv_sources {
+        let ratio = cfg.compress_ratios[src as usize] as u64;
+        if ratio > 0 {
+            elems = elems.max((max_seq / ratio + 1) as usize);
+        }
+    }
+    let mut session = ferroseek_gpu::tp4::join(ring_path, rank, port, elems, wait_ms)?;
+    let sharding =
+        ferroseek_gpu::engine::Sharding { world_size: 4, rank: session.rank as u32 };
+    let comm = session.take_comm();
+    let ckpt: &'static mut ferroseek_core::Checkpoint = Box::leak(Box::new(ckpt));
+    let model = ferroseek_gpu::engine::GpuModel::from_checkpoint_streaming_tp4(
+        ckpt, sharding, comm,
+    )?
+    .with_max_seq_len(max_seq);
+    Ok((Box::new(model), session))
+}
+
 #[cfg(not(feature = "cuda"))]
 fn build_engine(
     engine: &str,
@@ -250,6 +290,11 @@ fn cmd_decode(args: &[String]) -> ExitCode {
     let mut engine = "cpu".to_string();
     let mut stream = false;
     let mut max_seq: u64 = 4096;
+    let mut tp4 = false;
+    let mut tp_rank: Option<u8> = None;
+    let mut tp_ring = String::new();
+    let mut tp_port: u16 = 29871;
+    let mut tp_wait_ms: u64 = 60_000;
     let mut i = 4;
     while i < args.len() {
         match args[i].as_str() {
@@ -280,6 +325,26 @@ fn cmd_decode(args: &[String]) -> ExitCode {
                 max_seq = args[i + 1].parse().unwrap_or(max_seq);
                 i += 2;
             }
+            "--tp4" => {
+                tp4 = true;
+                i += 1;
+            }
+            "--rank" if i + 1 < args.len() => {
+                tp_rank = args[i + 1].parse().ok();
+                i += 2;
+            }
+            "--ring" if i + 1 < args.len() => {
+                tp_ring = args[i + 1].clone();
+                i += 2;
+            }
+            "--tp-port" if i + 1 < args.len() => {
+                tp_port = args[i + 1].parse().unwrap_or(tp_port);
+                i += 2;
+            }
+            "--tp-wait-ms" if i + 1 < args.len() => {
+                tp_wait_ms = args[i + 1].parse().unwrap_or(tp_wait_ms);
+                i += 2;
+            }
             _ => i += 1,
         }
     }
@@ -307,11 +372,44 @@ fn cmd_decode(args: &[String]) -> ExitCode {
         }
     };
     let t0_load = std::time::Instant::now();
-    let mut model = match build_engine(&engine, ckpt, stream, max_seq) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("model ({engine}): {e}");
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    let mut tp4_session: Option<ferroseek_gpu::tp4::Session> = None;
+    let mut model = if tp4 {
+        #[cfg(all(feature = "cuda", target_os = "linux"))]
+        {
+            if tp_ring.is_empty() {
+                eprintln!("--tp4 needs --ring <nodes-ring4.local.json>");
+                return ExitCode::from(2);
+            }
+            match build_engine_tp4(ckpt, &tp_ring, tp_rank, tp_port, max_seq, tp_wait_ms) {
+                Ok((m, mut sess)) => {
+                    if let Err(e) = sess.start_barrier() {
+                        eprintln!("tp4 start barrier: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                    eprintln!("tp4 rank {}: all ranks loaded, decode starting", sess.rank);
+                    tp4_session = Some(sess);
+                    m
+                }
+                Err(e) => {
+                    eprintln!("tp4: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+        {
+            let _ = (tp_ring.clone(), tp_rank, tp_port, tp_wait_ms);
+            eprintln!("--tp4 needs the cuda feature on linux");
             return ExitCode::FAILURE;
+        }
+    } else {
+        match build_engine(&engine, ckpt, stream, max_seq) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("model ({engine}): {e}");
+                return ExitCode::FAILURE;
+            }
         }
     };
     eprintln!("model loaded in {:?}", t0_load.elapsed());
@@ -429,6 +527,15 @@ fn cmd_decode(args: &[String]) -> ExitCode {
         }
         pos += 1;
         eprintln!("  [{}] {} ( {:?} )", pos, tk.decode(&[next]), t1.elapsed());
+    }
+
+    let cs = model.coll_stats();
+    if !cs.is_empty() {
+        eprintln!("{cs}");
+    }
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    if let Some(sess) = tp4_session.as_mut() {
+        sess.finish();
     }
 
     if let Some(path) = logits_out {

@@ -15,3 +15,4 @@ ferroseek-cuda = { path = "../ferroseek-cuda" }
 cust = { version = "0.3", optional = true }
 serde_json = "1"
 libc = "0.2"
+ferroseek-transport = { path = "../ferroseek-transport" }

@@ -62,3 +62,20 @@ no channel setup per step.
 3. wire into GpuModel behind a `tp4` feature: TP1 engine + all-reduces at
    the spec's reduction points, expert/head/vocab sharding at load
 4. logits all-gather + serving from the head
+
+## Status
+
+1. done. 2. done (gate 4/4 bit-exact, 100k-iteration soak zero loss,
+~10.5 µs p50 4 KB; the gate also covers the all-gather: every rank checks
+the rank-ordered concatenation bit-exactly).
+3. done. `ferroseek decode --engine gpu --stream --tp4 --rank N --ring
+nodes-ring4.local.json` loads rank `N`'s slice (16 heads, 2 o-groups, 8
+index heads, 96 experts, one vocab shard) and runs the full engine with
+the transport's all-reduce at the three spec reduction points plus the
+logits all-gather (added to `ring.rs`: same QPs, same two-hop schedule,
+rank-ordered concatenation). First real 4-rank decode of the 1017
+checkpoint (2026-10-26): 'The capital of France is' → ' Paris.',
+~1.2 s/token in lockstep (2.0× the single-node rate under the 90 GB/node
+vLLM co-tenant), all four ranks' raw logits bit-identical.
+4. next: serving from the head (continuous decode, tokenizer loop,
+KV-cache reuse across requests).

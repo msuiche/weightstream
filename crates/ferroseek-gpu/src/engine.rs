@@ -71,6 +71,115 @@ impl Default for Sharding {
     }
 }
 
+/// Local slice of a sharded tensor (spec §3 TP4 note). `Rows` is a
+/// contiguous output-row slice of a row-major matrix; `Cols` is a
+/// strided column (K-dim) slice. Scale tiles follow at 1/32 granularity —
+/// every TP4 slice lands on 32-row/col boundaries.
+#[derive(Clone, Copy, Debug)]
+pub enum WShard {
+    All,
+    Rows { start: usize, len: usize },
+    Cols { start: usize, len: usize },
+}
+
+impl WShard {
+    fn is_all(&self) -> bool {
+        matches!(self, WShard::All)
+    }
+}
+
+/// Sharded weight bytes: a borrow for the unsharded case (zero-copy, TP1
+/// path unchanged), an owned gather for slices.
+enum Sharded<'b> {
+    All(&'b [u8]),
+    Owned(Vec<u8>),
+}
+
+impl Sharded<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Sharded::All(b) => b,
+            Sharded::Owned(v) => v,
+        }
+    }
+}
+
+/// Slice a row-major fp8 weight's payload per `shard`. `view` gives the
+/// logical [rows, cols]; the scale tile is 32 (spec §12).
+fn shard_weight<'b>(view: &'b [u8], shape: &[usize], shard: WShard) -> io::Result<Sharded<'b>> {
+    if shard.is_all() {
+        return Ok(Sharded::All(view));
+    }
+    let (rows, cols) = (shape[0], shape[1]);
+    if view.len() != rows * cols {
+        return ioerr(format!("weight bytes {} do not tile [{rows}, {cols}]", view.len()));
+    }
+    match shard {
+        WShard::Rows { start, len } => {
+            if start % 32 != 0 || len % 32 != 0 || start + len > rows {
+                return ioerr(format!("row shard [{start}, {start}+{len}) not 32-aligned in [{rows}]"));
+            }
+            Ok(Sharded::Owned(
+                view[start * cols..(start + len) * cols].to_vec(),
+            ))
+        }
+        WShard::Cols { start, len } => {
+            if start % 32 != 0 || len % 32 != 0 || start + len > cols {
+                return ioerr(format!("col shard [{start}, {start}+{len}) not 32-aligned in [{cols}]"));
+            }
+            let mut out = Vec::with_capacity(rows * len);
+            for r in 0..rows {
+                out.extend_from_slice(&view[r * cols + start..r * cols + start + len]);
+            }
+            Ok(Sharded::Owned(out))
+        }
+        WShard::All => unreachable!(),
+    }
+}
+
+/// Slice the matching ue8m0 scale payload (`[rows/32, cols/32]`) the same
+/// way, keeping the shard's weight tiles aligned with their scale tiles.
+fn shard_scale<'b>(view: &'b [u8], shape: &[usize], shard: WShard) -> io::Result<Sharded<'b>> {
+    if shard.is_all() {
+        return Ok(Sharded::All(view));
+    }
+    let (srows, scols) = (shape[0], shape[1]);
+    if view.len() != srows * scols {
+        return ioerr(format!("scale bytes {} do not tile [{srows}, {scols}]", view.len()));
+    }
+    match shard {
+        WShard::Rows { start, len } => {
+            let s0 = start / 32;
+            let s1 = s0 + len / 32;
+            Ok(Sharded::Owned(view[s0 * scols..s1 * scols].to_vec()))
+        }
+        WShard::Cols { start, len } => {
+            let c0 = start / 32;
+            let clen = len / 32;
+            let mut out = Vec::with_capacity(srows * clen);
+            for r in 0..srows {
+                out.extend_from_slice(&view[r * scols + c0..r * scols + c0 + clen]);
+            }
+            Ok(Sharded::Owned(out))
+        }
+        WShard::All => unreachable!(),
+    }
+}
+
+/// TP4 collectives (docs/transport.md): the fp32 rank-ordered all-reduce at
+/// the spec's reduction points and the rank-ordered logits all-gather.
+/// Results must be bit-identical on every rank — the engine relies on that
+/// for identical routing, caches and sampling with no extra broadcasts.
+/// `None` (TP1) skips every call site, so single-node decode is unchanged.
+pub trait Collectives {
+    fn allreduce(&mut self, input: &[f32]) -> io::Result<Vec<f32>>;
+    fn allgather(&mut self, contribution: &[f32]) -> io::Result<Vec<f32>>;
+    /// Latency accounting for run reports ("" when untracked).
+    fn stats(&self) -> String {
+        String::new()
+    }
+}
+
 type D<T> = DeviceBuffer<T>;
 
 /// Weight bytes as the GEMM kernels see them: either an owned device
@@ -403,6 +512,9 @@ pub struct GpuModel<'a> {
     /// = upload mode, where every weight is a device copy.
     arena: Option<crate::stream::HostArena>,
     store_keepalive: Option<Box<dyn WeightStore + 'a>>,
+    /// TP4 transport (docs/transport.md). None = TP1: no collective is
+    /// issued and every reduction point falls through to the local sum.
+    pub comm: Option<Box<dyn Collectives>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -447,17 +559,30 @@ fn load_q8(
     arena: Option<&crate::stream::HostArena>,
     wname: &str,
     sname: &str,
+    shard: WShard,
 ) -> io::Result<Q8> {
     if let Some(a) = arena {
         let (wv, sv) = store.get2(wname, sname)?;
+        let wb = shard_weight(wv.bytes, &wv.shape, shard)?;
+        let sb = shard_scale(sv.bytes, &sv.shape, shard)?;
         Ok(Q8 {
-            w: W8::streamed(wv.bytes, Some(a), c)?,
-            s: W8::streamed(sv.bytes, Some(a), c)?,
+            w: W8::streamed(wb.as_slice(), Some(a), c)?,
+            s: W8::streamed(sb.as_slice(), Some(a), c)?,
         })
     } else {
+        // upload mode (synthetic gate): snapshot both slices to owned bytes
+        // first — the store lends one view at a time
+        let wb: Vec<u8> = {
+            let v = store.get(wname)?;
+            shard_weight(v.bytes, &v.shape, shard)?.as_slice().to_vec()
+        };
+        let sb: Vec<u8> = {
+            let v = store.get(sname)?;
+            shard_scale(v.bytes, &v.shape, shard)?.as_slice().to_vec()
+        };
         Ok(Q8 {
-            w: W8::device(up_u8(c, &view_bytes(store, wname)?)?),
-            s: W8::device(up_u8(c, &view_bytes(store, sname)?)?),
+            w: W8::device(up_u8(c, &wb)?),
+            s: W8::device(up_u8(c, &sb)?),
         })
     }
 }
@@ -488,24 +613,36 @@ fn load_q4(
 
 /// wo_a: bf16 dense (converted export, spec §11) or fp8+scale (raw HF
 /// export) — dequantize host-side to f32 either way, like the ref's dense
-/// path.
+/// path. TP4 loads the rank's contiguous o-group block: rows
+/// `[row_start, row_start+row_len)` of `[o_groups*o_lora, gdim]`.
 fn load_wo_a(
     store: &mut dyn WeightStore,
     c: &Cuda,
     name: &str,
     rows: usize,
     cols: usize,
+    row_start: usize,
+    row_len: usize,
 ) -> io::Result<D<u16>> {
     let v = store.get(name)?;
     let dtype = v.dtype;
-    let bytes = v.bytes.to_vec();
+    let full = v.bytes.to_vec();
     drop(v);
-    if bytes.len() != rows * cols * dtype_size(dtype) {
+    let esz = dtype_size(dtype);
+    if full.len() != rows * cols * esz {
         return ioerr(format!(
             "{name}: wo_a byte length {} does not match [{rows}, {cols}]",
-            bytes.len()
+            full.len()
         ));
     }
+    if row_start % 32 != 0 || row_len % 32 != 0 || row_start + row_len > rows {
+        return ioerr(format!(
+            "{name}: wo_a row range [{row_start}, +{row_len}) not 32-aligned in [{rows}]"
+        ));
+    }
+    let full_rows = rows;
+    let bytes = full[row_start * cols * esz..(row_start + row_len) * cols * esz].to_vec();
+    let rows = row_len;
     match dtype {
         // bf16 stays bf16 on device: bf16_gemv converts per element (exact),
         // and 40 layers of f32 dequantization would cost 5.4 GB device on a
@@ -520,20 +657,32 @@ fn load_wo_a(
         DType::Fp8E4m3 => {
             let sname = format!("{}.scale", name.trim_end_matches(".weight"));
             let sview = store.get(&sname)?;
-            let sbytes = sview.bytes.to_vec();
+            let sbytes_full = sview.bytes.to_vec();
+            let sshape = sview.shape.clone();
+            drop(sview);
             // scale shape [rows/B, cols/B] with B in {32, 128} (spec §12.9);
             // infer B from the shape rather than assuming 32
-            if sview.shape.len() != 2 {
-                return ioerr(format!("{sname}: bad scale shape {:?}", sview.shape));
+            if sshape.len() != 2 {
+                return ioerr(format!("{sname}: bad scale shape {sshape:?}"));
             }
-            let b_rows = rows.checked_div(sview.shape[0]).unwrap_or(0);
-            let b_cols = cols.checked_div(sview.shape[1]).unwrap_or(0);
+            // B from the FULL weight's shape; the shard keeps 32-alignment
+            // (checked above) so it is also B-aligned for B in {32, 128}
+            let b_rows = full_rows.checked_div(sshape[0]).unwrap_or(0);
+            let b_cols = cols.checked_div(sshape[1]).unwrap_or(0);
             if b_rows == 0 || b_rows != b_cols {
                 return ioerr(format!(
-                    "{sname}: scale shape {:?} does not tile [{rows}, {cols}]",
-                    sview.shape
+                    "{sname}: scale shape {sshape:?} does not tile [{full_rows}, {cols}]",
                 ));
             }
+            let s0 = row_start / b_rows;
+            let s1 = s0 + row_len / b_rows;
+            if row_start % b_rows != 0 || row_len % b_rows != 0 {
+                return ioerr(format!(
+                    "{sname}: wo_a shard [{row_start}, +{row_len}) not {b_rows}-aligned"
+                ));
+            }
+            let scols = sshape[1];
+            let sbytes = sbytes_full[s0 * scols..s1 * scols].to_vec();
             let host_f32 = dequant_fp8_general(&bytes, &sbytes, rows, cols, b_rows);
             let host: Vec<u16> = host_f32
                 .iter()
@@ -581,6 +730,7 @@ fn upload_layer(
     l: usize,
     kv_src: Option<usize>,
     arena: Option<&crate::stream::HostArena>,
+    sh: &Sharding,
 ) -> io::Result<GpuLayer> {
     let p = format!("layers.{l}");
     let dim = cfg.dim as usize;
@@ -588,6 +738,14 @@ fn upload_layer(
     let inh = cfg.index_n_heads as usize;
     let ihd = cfg.index_head_dim as usize;
     let ratio = cfg.compress_ratios[l];
+    // TP4 locals (spec §3): 16 heads, 2 o-groups, 8 index heads, 96 experts
+    let world = sh.world_size as usize;
+    let rank = sh.rank as usize;
+    let heads_l = cfg.n_heads as usize / world;
+    let og_l = cfg.o_groups as usize / world;
+    let inh_l = inh / world;
+    let e_start = rank * cfg.n_routed as usize / world;
+    let e_len = cfg.n_routed as usize / world;
     let idx_src = cfg.index_sources.contains(&(l as u32)) && ratio > 0;
 
     let layer = l as u32;
@@ -629,6 +787,7 @@ fn upload_layer(
                 arena,
                 &format!("{p}.engram.wkv.weight"),
                 &format!("{p}.engram.wkv.scale"),
+            WShard::All,
             )?,
             w_prod: up_f32(c, &prod)?,
         })
@@ -670,11 +829,16 @@ fn upload_layer(
                 arena,
                 &format!("{p}.attn.indexer.wq_b.weight"),
                 &format!("{p}.attn.indexer.wq_b.scale"),
+                WShard::Rows { start: rank * inh_l * ihd, len: inh_l * ihd },
             )?,
             weights_proj: {
+                // head shard: rows [rank*inh_l, +inh_l) of [inh, dim],
+                // scale factor folded at load (documented divergence)
                 let w = view_f32(store, &format!("{p}.attn.indexer.weights_proj.weight"))?;
                 let f = (ihd as f32) * (inh as f32);
-                let scaled: Vec<f32> = w.iter().map(|&v| v / f.sqrt()).collect();
+                let r0 = rank * inh_l * dim;
+                let r1 = r0 + inh_l * dim;
+                let scaled: Vec<f32> = w[r0..r1].iter().map(|&v| v / f.sqrt()).collect();
                 up_f32(c, &scaled)?
             },
         })
@@ -703,8 +867,8 @@ fn upload_layer(
         None => None,
     };
 
-    let mut experts = Vec::with_capacity(cfg.n_routed as usize);
-    for e in 0..cfg.n_routed as usize {
+    let mut experts = Vec::with_capacity(e_len);
+    for e in e_start..e_start + e_len {
         let w1 = load_q4(
             store,
             c,
@@ -744,6 +908,7 @@ fn upload_layer(
         arena,
         &format!("{p}.attn.wq_a.weight"),
         &format!("{p}.attn.wq_a.scale"),
+    WShard::All,
     )?;
     let q_norm_w = up_f32(c, &view_f32(store, &format!("{p}.attn.q_norm.weight"))?)?;
     let wq_b = load_q8(
@@ -752,6 +917,7 @@ fn upload_layer(
         arena,
         &format!("{p}.attn.wq_b.weight"),
         &format!("{p}.attn.wq_b.scale"),
+        WShard::Rows { start: rank * heads_l * hd, len: heads_l * hd },
     )?;
     let wkv = load_q8(
         store,
@@ -759,15 +925,23 @@ fn upload_layer(
         arena,
         &format!("{p}.attn.wkv.weight"),
         &format!("{p}.attn.wkv.scale"),
+    WShard::All,
     )?;
     let kv_norm_w = up_f32(c, &view_f32(store, &format!("{p}.attn.kv_norm.weight"))?)?;
-    let attn_sink = up_f32(c, &view_f32(store, &format!("{p}.attn.attn_sink"))?)?;
+    let attn_sink = {
+        // per-local-head sink slice (spec §3: [16] at TP4)
+        let sink = view_f32(store, &format!("{p}.attn.attn_sink"))?;
+        let r0 = rank * heads_l;
+        up_f32(c, &sink[r0..r0 + heads_l])?
+    };
     let wo_a = load_wo_a(
         store,
         c,
         &format!("{p}.attn.wo_a.weight"),
         cfg.o_groups as usize * cfg.o_lora as usize,
         cfg.n_heads as usize * hd / cfg.o_groups as usize,
+        rank * og_l * cfg.o_lora as usize,
+        og_l * cfg.o_lora as usize,
     )?;
     let wo_b = load_q8(
         store,
@@ -775,6 +949,11 @@ fn upload_layer(
         arena,
         &format!("{p}.attn.wo_b.weight"),
         &format!("{p}.attn.wo_b.scale"),
+        // row-parallel: the rank's K-slice of o_groups*o_lora
+        WShard::Cols {
+            start: rank * og_l * cfg.o_lora as usize,
+            len: og_l * cfg.o_lora as usize,
+        },
     )?;
     let gate_w = up_u16(c, &{
         let v = store.get(&format!("{p}.ffn.gate.weight"))?;
@@ -795,6 +974,7 @@ fn upload_layer(
             arena,
             &format!("{p}.ffn.shared_experts.w1.weight"),
             &format!("{p}.ffn.shared_experts.w1.scale"),
+        WShard::All,
         )?,
         load_q8(
             store,
@@ -802,6 +982,7 @@ fn upload_layer(
             arena,
             &format!("{p}.ffn.shared_experts.w2.weight"),
             &format!("{p}.ffn.shared_experts.w2.scale"),
+        WShard::All,
         )?,
         load_q8(
             store,
@@ -809,6 +990,7 @@ fn upload_layer(
             arena,
             &format!("{p}.ffn.shared_experts.w3.weight"),
             &format!("{p}.ffn.shared_experts.w3.scale"),
+        WShard::All,
         )?,
     ];
 
@@ -1016,9 +1198,14 @@ impl GpuModel<'static> {
             run,
             engram,
             arena,
+            sharding,
+            comm,
             ..
         } = self;
         let arena_opt: Option<&crate::stream::HostArena> = arena.as_ref();
+        let sharding = *sharding;
+        let mut comm_opt: Option<&mut (dyn Collectives + 'static)> = comm.as_deref_mut();
+        let world = sharding.world_size as usize;
 
         let dim = cfg.dim as usize;
         let hc = cfg.hc_mult as usize;
@@ -1189,7 +1376,18 @@ impl GpuModel<'static> {
             );
 
             attention_step(
-                c, cfg, layer, s, caches, run, bands, &*rope_cos, &*rope_sin, position,
+                c,
+                cfg,
+                layer,
+                s,
+                caches,
+                run,
+                bands,
+                &*rope_cos,
+                &*rope_sin,
+                position,
+                sharding,
+                comm_opt.as_deref_mut(),
             )?;
 
             {
@@ -1239,7 +1437,7 @@ impl GpuModel<'static> {
                 eps,
             );
 
-            moe_step(c, cfg, layer, s, arena_opt)?;
+            moe_step(c, cfg, layer, s, arena_opt, sharding, comm_opt.as_deref_mut())?;
 
             {
                 let h_next = 1 - h_cur;
@@ -1274,14 +1472,24 @@ impl GpuModel<'static> {
             dim,
             eps,
         );
+        // head: the rank's vocab shard produces the first vocab/world
+        // logits; TP4 assembles the full vector with the all-gather so
+        // every rank samples identically (no token broadcast needed)
+        let vocab_l = cfg.vocab as usize / world;
         k::f32_gemv(
             c,
             k::base(head),
             k::base(&s.x),
             k::base(&s.logits),
-            cfg.vocab as usize,
+            vocab_l,
             dim,
         );
+        if let Some(comm) = comm_opt.as_deref_mut() {
+            let mut part = vec![0.0f32; vocab_l];
+            s.logits.index(0..vocab_l).copy_to(&mut part).map_err(cuda_err)?;
+            let full = comm.allgather(&part)?;
+            s.logits.copy_from(&full).map_err(cuda_err)?;
+        }
         let mut out = vec![0.0f32; cfg.vocab as usize];
         s.logits.copy_to(&mut out).map_err(cuda_err)?;
         Ok(out)
@@ -1327,7 +1535,7 @@ impl GpuModel<'static> {
         let mut store: Box<dyn WeightStore> = Box::new(CkptStore::new(ckpt));
         validate_dims(&cfg)?;
         validate_layout(&cfg, store.as_mut())?;
-        Self::build(cfg, store.as_mut(), DEFAULT_MAX_SEQ_LEN, None)
+        Self::build(cfg, store.as_mut(), DEFAULT_MAX_SEQ_LEN, None, &Sharding::default())
     }
 
     /// Load from deterministically generated synthetic weights — the gate:
@@ -1339,7 +1547,7 @@ impl GpuModel<'static> {
         let rcfg = RefConfig::from_model_config(&cfg)?;
         let mut store: Box<dyn WeightStore> = Box::new(weights);
         validate_dims(&rcfg)?;
-        Self::build(rcfg, store.as_mut(), 1024, None)
+        Self::build(rcfg, store.as_mut(), 1024, None, &Sharding::default())
     }
 
     /// Raise the decode-position bound (must be set before the first step).
@@ -1384,7 +1592,8 @@ impl<'a> GpuModel<'a> {
         validate_layout(&cfg, store.as_mut())?;
         eprintln!("streaming: layout validated in {:?}", t_v.elapsed());
         let t_b = std::time::Instant::now();
-        let mut model = Self::build(cfg, store.as_mut(), DEFAULT_MAX_SEQ_LEN, Some(&arena))?;
+        let mut model =
+            Self::build(cfg, store.as_mut(), DEFAULT_MAX_SEQ_LEN, Some(&arena), &Sharding::default())?;
         eprintln!("streaming: weight pass in {:?}", t_b.elapsed());
         // the borrow above ended when build returned, so the arena and
         // store can move into the model; both keep the shard mmaps alive
@@ -1393,11 +1602,65 @@ impl<'a> GpuModel<'a> {
         Ok(model)
     }
 
+    /// TP4 (spec §3 note, docs/transport.md): rank `sharding.rank` of a
+    /// 4-rank ring loads its slice — 16 attention heads, 2 o-groups, 8
+    /// index heads, 96 routed experts, one vocab shard of the head — and
+    /// the `comm` transport carries the three fp32 all-reduces per layer
+    /// plus the logits all-gather. The residual stream, caches, gate,
+    /// shared expert and engram stay replicated: every rank runs the
+    /// identical step and samples the identical token.
+    pub fn from_checkpoint_streaming_tp4(
+        ckpt: &'a mut Checkpoint,
+        sharding: Sharding,
+        comm: Box<dyn Collectives>,
+    ) -> io::Result<GpuModel<'a>> {
+        if sharding.world_size != 4 {
+            return ioerr("TP4 needs world_size 4".into());
+        }
+        let cfg = RefConfig::from_model_config(&ckpt.config)?;
+        validate_dims(&cfg)?;
+        let dir = ckpt.dir.clone();
+        let regions: Vec<(usize, usize, std::path::PathBuf)> = ckpt
+            .data_regions()?
+            .into_iter()
+            .map(|(p, l, name)| (p, l, dir.join(name)))
+            .collect();
+        let n_regions = regions.len();
+        {
+            let _guard = Cuda::global();
+        }
+        let arena = crate::stream::HostArena::new(&regions)?;
+        eprintln!(
+            "tp4 rank {}: {} shard mappings, {:.1} GB registered ({}/{} heads, {}/{} experts, vocab shard {}/{})",
+            sharding.rank,
+            n_regions,
+            arena.bytes() as f64 / (1u64 << 30) as f64,
+            cfg.n_heads / sharding.world_size,
+            cfg.n_heads,
+            cfg.n_routed / sharding.world_size,
+            cfg.n_routed,
+            cfg.vocab / sharding.world_size,
+            cfg.vocab
+        );
+        let mut store: Box<dyn WeightStore + 'a> = Box::new(CkptStore::new(ckpt));
+        validate_layout(&cfg, store.as_mut())?;
+        let t_b = std::time::Instant::now();
+        let mut model =
+            Self::build(cfg, store.as_mut(), DEFAULT_MAX_SEQ_LEN, Some(&arena), &sharding)?;
+        eprintln!("tp4 rank {}: weight pass in {:?}", sharding.rank, t_b.elapsed());
+        model.arena = Some(arena);
+        model.store_keepalive = Some(store);
+        model.sharding = sharding;
+        model.comm = Some(comm);
+        Ok(model)
+    }
+
     fn build(
         cfg: RefConfig,
         store: &mut dyn WeightStore,
         max_seq: u64,
         arena: Option<&crate::stream::HostArena>,
+        sh: &Sharding,
     ) -> io::Result<Self> {
         let guard = Cuda::global();
         let c = guard
@@ -1487,7 +1750,7 @@ impl<'a> GpuModel<'a> {
         let t_layers = std::time::Instant::now();
         for l in 0..n_layers {
             let t_l = std::time::Instant::now();
-            layers.push(upload_layer(&cfg, store, c, l, kv_src_of[l], arena)?);
+            layers.push(upload_layer(&cfg, store, c, l, kv_src_of[l], arena, sh)?);
             eprintln!("build: layer {l} in {:?}", t_l.elapsed());
         }
         eprintln!("build: {n_layers} layers in {:?}", t_layers.elapsed());
@@ -1501,7 +1764,28 @@ impl<'a> GpuModel<'a> {
             Some(_) => None,
             None => Some(up_f32(c, &view_f32(store, "embed.weight")?)?),
         };
-        let head = up_f32(c, &view_f32(store, "head.weight")?)?;
+        let head = {
+            // vocab-sharded head (spec §3): the rank's 129280/world rows,
+            // bf16 promoted to fp32 like the ref (model.py:1008). The local
+            // gemv writes the first vocab/world logits; the full vector is
+            // assembled by the all-gather at the end of decode.
+            let v = store.get("head.weight")?;
+            let row_bytes = dim * dtype_size(v.dtype);
+            let vl = cfg.vocab as usize / sh.world_size as usize;
+            let r0 = sh.rank as usize * vl;
+            if v.dtype != DType::Bf16 {
+                return ioerr(format!("head.weight: expected BF16, got {:?}", v.dtype));
+            }
+            if r0 * row_bytes + vl * row_bytes > v.bytes.len() {
+                return ioerr("head.weight: vocab shard out of range".into());
+            }
+            let host: Vec<f32> = v.bytes[r0 * row_bytes..(r0 + vl) * row_bytes]
+                .chunks_exact(2)
+                .map(|b| ferroseek_core::quant::bf16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+                .collect();
+            drop(v);
+            up_f32(c, &host)?
+        };
         let final_norm = up_f32(c, &view_f32(store, "norm.weight")?)?;
         eprintln!("build: embed/head/norm in {:?}", t_head.elapsed());
 
@@ -1641,7 +1925,8 @@ impl<'a> GpuModel<'a> {
             },
             pos: 0,
             max_seq,
-            sharding: Sharding::default(),
+            sharding: *sh,
+            comm: None,
             arena: None,
             store_keepalive: None,
         })
@@ -1666,16 +1951,25 @@ fn attention_step(
     rope_cos: &[D<f32>; 2],
     rope_sin: &[D<f32>; 2],
     pos: u64,
+    sh: Sharding,
+    mut comm: Option<&mut (dyn Collectives + 'static)>,
 ) -> io::Result<()> {
     let dim = cfg.dim as usize;
     let hd = cfg.head_dim as usize;
     let rd = cfg.rope_dim as usize;
-    let heads = cfg.n_heads as usize;
-    let og = cfg.o_groups as usize;
-    let ol = cfg.o_lora as usize;
     let win = cfg.window_size as usize;
     let eps = cfg.norm_eps;
     let l = layer.layer as usize;
+    // TP4 locals: the rank's head slice (16 of 64), o-group slice (2 of 8),
+    // index-head slice (8 of 32). Every head-dim use below is local: the
+    // sharded weights (wq_b, wo_a, wo_b, indexer) load as local blocks and
+    // the kernels take the local counts.
+    let world = sh.world_size as usize;
+    let heads = cfg.n_heads as usize / world;
+    let og = cfg.o_groups as usize / world;
+    let ol = cfg.o_lora as usize;
+    let inh = cfg.index_n_heads as usize / world;
+    let ihd = cfg.index_head_dim as usize;
 
     if run.capture_x.is_some() {
         let mut v = vec![0.0f32; dim];
@@ -1872,10 +2166,9 @@ fn attention_step(
         }
 
         // DSA indexer (index sources run their own; consumers reuse the
-        // published idxs — model.py:723-738)
+        // published idxs — model.py:723-738). inh/ihd are the rank's local
+        // index-head slice (8 of 32 at TP4); scores all-reduce.
         if layer.idx_src {
-            let inh = cfg.index_n_heads as usize;
-            let ihd = cfg.index_head_dim as usize;
             // key side: append on group completion, pre-RoPE latent
             if layer.owns_k && latent_ready {
                 let kowner = layer.k_owner.as_ref().unwrap();
@@ -1964,6 +2257,11 @@ fn attention_step(
                     .index(0..compress_len)
                     .copy_to(&mut score)
                     .map_err(cuda_err)?;
+                // index_score all-reduce (model.py:559-560): each rank
+                // scored only its 8 index heads
+                if let Some(comm) = comm.as_deref_mut() {
+                    score = comm.allreduce(&score)?;
+                }
                 if layer.cand_src {
                     run.candidates = select_candidate_blocks(
                         &score,
@@ -2092,6 +2390,13 @@ fn attention_step(
         dim,
         og * ol,
     );
+    // wo_b is row-parallel: fp32 partial-sum all-reduce (spec §3)
+    if let Some(comm) = comm.as_deref_mut() {
+        let mut part = vec![0.0f32; dim];
+        s.attn_out.index(0..dim).copy_to(&mut part).map_err(cuda_err)?;
+        let red = comm.allreduce(&part)?;
+        s.attn_out.copy_from(&red).map_err(cuda_err)?;
+    }
     dump_dev(c, &s.attn_out, dim, format!("d_pos{pos}_attnout{l}.f32"));
     Ok(())
 }
@@ -2127,12 +2432,20 @@ fn moe_step(
     layer: &GpuLayer,
     s: &mut Scratch,
     arena: Option<&crate::stream::HostArena>,
+    sh: Sharding,
+    mut comm: Option<&mut (dyn Collectives + 'static)>,
 ) -> io::Result<()> {
     let l = layer.layer;
     let dim = cfg.dim as usize;
     let inter = cfg.inter_dim as usize;
     let n_experts = cfg.n_routed as usize;
     let top_k = cfg.n_activated as usize;
+    // expert-index shard: rank r owns experts [96r, 96r+96) of every
+    // layer (spec §3). The gate is replicated, so every rank routes the
+    // identical top-6 and computes only its intersection.
+    let world = sh.world_size as usize;
+    let e_start = sh.rank as usize * n_experts / world;
+    let e_len = n_experts / world;
 
     k::moe_route(
         c,
@@ -2186,9 +2499,12 @@ fn moe_step(
     );
 
     for &(e, w) in &sel {
+        if e < e_start || e >= e_start + e_len {
+            continue; // another rank's expert
+        }
         // unregistered experts (the driver's ~120 GB registration cap on
         // 475 GB of shards): one-shot device copy per use, 17.7 MB/expert
-        let [w1, w2, w3] = &layer.experts[e];
+        let [w1, w2, w3] = &layer.experts[e - e_start];
         let (w1d, w1sd) = (w1.w.stage(c, arena)?, w1.s.stage(c, arena)?);
         let (w3d, w3sd) = (w3.w.stage(c, arena)?, w3.s.stage(c, arena)?);
         k::fp4_gemm(
@@ -2243,6 +2559,16 @@ fn moe_step(
         );
         drop((w2d, w2sd));
         k::acc_f32(c, k::base(&s.expert_y), k::base(&s.y_moe), dim);
+    }
+
+    // routed-expert partial all-reduce (spec §3 TP4 note): fp32, rank-
+    // ordered. The shared expert is replicated and added AFTER the reduce
+    // (recomputed, not reduced), so every rank lands on identical bits.
+    if let Some(comm) = comm.as_deref_mut() {
+        let mut part = vec![0.0f32; dim];
+        s.y_moe.index(0..dim).copy_to(&mut part).map_err(cuda_err)?;
+        let red = comm.allreduce(&part)?;
+        s.y_moe.copy_from(&red).map_err(cuda_err)?;
     }
 
     // shared expert on every token, added last (model.py:905)

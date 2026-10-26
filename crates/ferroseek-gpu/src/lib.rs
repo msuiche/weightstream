@@ -18,6 +18,8 @@ pub mod dump;
 pub mod engine;
 #[cfg(feature = "cuda")]
 pub mod launch;
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+pub mod tp4;
 #[cfg(feature = "cuda")]
 pub mod stream;
 
