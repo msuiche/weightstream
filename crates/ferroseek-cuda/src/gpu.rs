@@ -14,6 +14,9 @@ const FP4_EXPERT_GEMM_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fp4_ex
 const HC_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/hc.ptx"));
 const ATTN_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/attn.ptx"));
 const MOE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/moe.ptx"));
+const GEMV_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/gemv.ptx"));
+const COMPRESSOR_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/compressor.ptx"));
+const INDEXER_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/indexer.ptx"));
 
 pub struct Cuda {
     pub context: Context,
@@ -29,6 +32,9 @@ pub struct Cuda {
     pub hc: Module,
     pub attn: Module,
     pub moe: Module,
+    pub gemv: Module,
+    pub compressor: Module,
+    pub indexer: Module,
 }
 
 static CUDA: Mutex<Option<Cuda>> = Mutex::new(None);
@@ -60,6 +66,9 @@ impl Cuda {
             let hc = Module::from_ptx(HC_PTX, &[]).expect("hc module");
             let attn = Module::from_ptx(ATTN_PTX, &[]).expect("attn module");
             let moe = Module::from_ptx(MOE_PTX, &[]).expect("moe module");
+            let gemv = Module::from_ptx(GEMV_PTX, &[]).expect("gemv module");
+            let compressor = Module::from_ptx(COMPRESSOR_PTX, &[]).expect("compressor module");
+            let indexer = Module::from_ptx(INDEXER_PTX, &[]).expect("indexer module");
             *guard = Some(Cuda {
                 context,
                 device,
@@ -74,6 +83,9 @@ impl Cuda {
                 hc,
                 attn,
                 moe,
+                gemv,
+                compressor,
+                indexer,
             });
         }
         // tests run on many threads; the lock holder always becomes current
@@ -975,5 +987,162 @@ mod tests {
             .map(|(g, e)| (g - e).abs())
             .fold(0.0, f32::max);
         assert!(max_err < 1e-6, "swiglu max err {max_err}");
+    }
+
+    #[test]
+    fn compressor_finish_and_bf16_snap_match_cpu() {
+        let guard = Cuda::global();
+        let cuda = guard.as_ref().unwrap();
+        let dim = 512usize;
+
+        let kv = rand_vec(2 * dim, 3001);
+        let score = rand_vec(2 * dim, 3002);
+        let mut expected = vec![0.0f32; dim];
+        for d in 0..dim {
+            let (s0, s1) = (score[d], score[dim + d]);
+            let mx = s0.max(s1);
+            let (e0, e1) = ((s0 - mx).exp(), (s1 - mx).exp());
+            expected[d] = (kv[d] * e0 + kv[dim + d] * e1) / (e0 + e1);
+        }
+        // bf16 snap
+        for v in expected.iter_mut() {
+            let bits = v.to_bits();
+            let snapped = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1)) & 0xFFFF_0000;
+            *v = f32::from_bits(snapped);
+        }
+
+        let d_kv = DeviceBuffer::from_slice(&kv).unwrap();
+        let d_score = DeviceBuffer::from_slice(&score).unwrap();
+        let mut d_lat = DeviceBuffer::from_slice(&vec![0.0; dim]).unwrap();
+        let finish = cuda.compressor.get_function("compressor_finish").unwrap();
+        let snap = cuda.compressor.get_function("bf16_snap").unwrap();
+        let stream = &cuda.stream;
+        unsafe {
+            launch!(
+                finish<<<dim.div_ceil(256) as u32, 256, 0, stream>>>(
+                    d_kv.as_device_ptr(),
+                    d_score.as_device_ptr(),
+                    d_lat.as_device_ptr(),
+                    dim as i32
+                )
+            )
+            .unwrap();
+            launch!(snap<<<dim.div_ceil(256) as u32, 256, 0, stream>>>(
+                d_lat.as_device_ptr(),
+                dim as i32
+            ))
+            .unwrap();
+        }
+        stream.synchronize().unwrap();
+        let mut got = vec![0.0f32; dim];
+        d_lat.copy_to(&mut got).unwrap();
+        assert_eq!(got, expected, "compressor finish/snap not exact");
+    }
+
+    #[test]
+    fn indexer_score_matches_cpu_mirror() {
+        let guard = Cuda::global();
+        let cuda = guard.as_ref().unwrap();
+        let (n_heads, head_dim, n_rows) = (32usize, 128usize, 96usize);
+
+        let q = rand_vec(n_heads * head_dim, 4001);
+        let index_k = rand_vec(n_rows * head_dim, 4002);
+        let weights = rand_vec(n_heads, 4003);
+
+        let mut expected = vec![0.0f32; n_rows];
+        for t in 0..n_rows {
+            let k = &index_k[t * head_dim..(t + 1) * head_dim];
+            for h in 0..n_heads {
+                let qh = &q[h * head_dim..(h + 1) * head_dim];
+                let dot: f32 = qh.iter().zip(k).map(|(a, b)| a * b).sum();
+                expected[t] += dot.max(0.0) * weights[h];
+            }
+        }
+
+        let d_q = DeviceBuffer::from_slice(&q).unwrap();
+        let d_k = DeviceBuffer::from_slice(&index_k).unwrap();
+        let d_w = DeviceBuffer::from_slice(&weights).unwrap();
+        let mut d_o = DeviceBuffer::from_slice(&vec![0.0; n_rows]).unwrap();
+        let func = cuda.indexer.get_function("indexer_score").unwrap();
+        let stream = &cuda.stream;
+        unsafe {
+            launch!(
+                func<<<n_rows as u32, 32, 0, stream>>>(
+                    d_q.as_device_ptr(),
+                    d_k.as_device_ptr(),
+                    d_w.as_device_ptr(),
+                    d_o.as_device_ptr(),
+                    n_heads as i32,
+                    head_dim as i32,
+                    n_rows as i32
+                )
+            )
+            .unwrap();
+        }
+        stream.synchronize().unwrap();
+        let mut got = vec![0.0f32; n_rows];
+        d_o.copy_to(&mut got).unwrap();
+        let max_err: f32 = got
+            .iter()
+            .zip(&expected)
+            .map(|(g, e)| (g - e).abs())
+            .fold(0.0, f32::max);
+        assert!(max_err < 1e-4, "indexer_score max err {max_err}");
+    }
+
+    #[test]
+    fn f32_and_bf16_gemv_match_cpu() {
+        let guard = Cuda::global();
+        let cuda = guard.as_ref().unwrap();
+        let (rows, cols) = (64usize, 2048usize);
+
+        let w = rand_vec(rows * cols, 5001);
+        let wb: Vec<u16> = w.iter().map(|&v| f32_to_bf16_bits(v)).collect();
+        let x = rand_vec(cols, 5002);
+
+        let mut expected = vec![0.0f32; rows];
+        let mut expected_bf = vec![0.0f32; rows];
+        for r in 0..rows {
+            expected[r] = (0..cols).map(|c| w[r * cols + c] * x[c]).sum();
+            expected_bf[r] = (0..cols)
+                .map(|c| ferroseek_core::quant::bf16_to_f32(wb[r * cols + c]) * x[c])
+                .sum();
+        }
+
+        let d_w = DeviceBuffer::from_slice(&w).unwrap();
+        let d_wb = DeviceBuffer::from_slice(&wb).unwrap();
+        let d_x = DeviceBuffer::from_slice(&x).unwrap();
+        let mut d_y = DeviceBuffer::from_slice(&vec![0.0; rows]).unwrap();
+        let f32g = cuda.gemv.get_function("f32_gemv").unwrap();
+        let bfg = cuda.gemv.get_function("bf16_gemv").unwrap();
+        let stream = &cuda.stream;
+        unsafe {
+            launch!(f32g<<<rows as u32, 256, 0, stream>>>(
+                d_w.as_device_ptr(),
+                d_x.as_device_ptr(),
+                d_y.as_device_ptr(),
+                rows as i32,
+                cols as i32
+            ))
+            .unwrap();
+            stream.synchronize().unwrap();
+            let mut got = vec![0.0f32; rows];
+            d_y.copy_to(&mut got).unwrap();
+            let e: f32 = got.iter().zip(&expected).map(|(g, e)| (g - e).abs()).fold(0.0, f32::max);
+            assert!(e < 1e-4, "f32_gemv max err {e}");
+
+            launch!(bfg<<<rows as u32, 256, 0, stream>>>(
+                d_wb.as_device_ptr(),
+                d_x.as_device_ptr(),
+                d_y.as_device_ptr(),
+                rows as i32,
+                cols as i32
+            ))
+            .unwrap();
+            stream.synchronize().unwrap();
+            d_y.copy_to(&mut got).unwrap();
+            let e: f32 = got.iter().zip(&expected_bf).map(|(g, e)| (g - e).abs()).fold(0.0, f32::max);
+            assert!(e < 1e-4, "bf16_gemv max err {e}");
+        }
     }
 }
