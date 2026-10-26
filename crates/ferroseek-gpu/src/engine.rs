@@ -466,6 +466,15 @@ struct GpuLayer {
     gate_w: D<u16>,
     gate_bias: D<f32>,
     experts: Vec<[Q4; 3]>,
+    /// Grouped-expert slabs (upload mode): contiguous [e_len] tables per
+    /// weight kind for device-side dispatch (moe_grouped.cu). None in
+    /// streaming mode (per-use staging keeps per-expert buffers).
+    w1_all: Option<D<u8>>,
+    w1s_all: Option<D<u8>>,
+    w2_all: Option<D<u8>>,
+    w2s_all: Option<D<u8>>,
+    w3_all: Option<D<u8>>,
+    w3s_all: Option<D<u8>>,
     shared_experts: [Q8; 3],
     compressor: Option<GpuCompressor>,
     indexer: Option<GpuIndexer>,
@@ -486,10 +495,12 @@ struct Scratch {
     y_moe: D<f32>,
     gate_buf: D<f32>,
     up_buf: D<f32>,
-    h_e: D<f32>,
-    expert_y: D<f32>,
-    latent: D<f32>,
-    krow: D<f32>,
+    // grouped-expert path (moe_grouped.cu): slot-strided buffers
+    local_slots: D<i32>,
+    local_count: D<i32>,
+    h_slots: D<f32>,
+    q_slots: D<u8>,
+    qs_slots: D<u8>,
     qidx: D<f32>,
     widx: D<f32>,
     score: D<f32>,
@@ -928,29 +939,73 @@ fn upload_layer(
     };
 
     let mut experts = Vec::with_capacity(e_len);
-    for e in e_start..e_start + e_len {
-        let w1 = load_q4(
-            store,
-            c,
-            arena,
-            &format!("{p}.ffn.experts.{e}.w1.weight"),
-            &format!("{p}.ffn.experts.{e}.w1.scale"),
-        )?;
-        let w2 = load_q4(
-            store,
-            c,
-            arena,
-            &format!("{p}.ffn.experts.{e}.w2.weight"),
-            &format!("{p}.ffn.experts.{e}.w2.scale"),
-        )?;
-        let w3 = load_q4(
-            store,
-            c,
-            arena,
-            &format!("{p}.ffn.experts.{e}.w3.weight"),
-            &format!("{p}.ffn.experts.{e}.w3.scale"),
-        )?;
-        experts.push([w1, w2, w3]);
+    // Fused grouped-expert path (upload mode only): one contiguous
+    // [e_len] slab per weight kind so the device-side dispatch kernel can
+    // address expert rows by local id (moe_grouped.cu). Streaming mode
+    // keeps the per-expert buffers (per-use staging).
+    let mut w1_all: Option<D<u8>> = None;
+    let mut w1s_all: Option<D<u8>> = None;
+    let mut w2_all: Option<D<u8>> = None;
+    let mut w2s_all: Option<D<u8>> = None;
+    let mut w3_all: Option<D<u8>> = None;
+    let mut w3s_all: Option<D<u8>> = None;
+    if arena.is_none() && e_len > 0 {
+        let inter = cfg.inter_dim as usize;
+        let dim = cfg.dim as usize;
+        let one_w = |store: &mut dyn WeightStore, name: &str| -> io::Result<Vec<u8>> {
+            Ok(store.get(name)?.bytes.to_vec())
+        };
+        let mut b1 = Vec::with_capacity(e_len * inter * dim / 2);
+        let mut b1s = Vec::with_capacity(e_len * inter * dim / 32);
+        let mut b2 = Vec::with_capacity(e_len * dim * inter / 2);
+        let mut b2s = Vec::with_capacity(e_len * dim * inter / 32);
+        let mut b3 = Vec::with_capacity(e_len * inter * dim / 2);
+        let mut b3s = Vec::with_capacity(e_len * inter * dim / 32);
+        for e in e_start..e_start + e_len {
+            b1.extend(one_w(store, &format!("{p}.ffn.experts.{e}.w1.weight"))?);
+            b1s.extend(one_w(store, &format!("{p}.ffn.experts.{e}.w1.scale"))?);
+            b2.extend(one_w(store, &format!("{p}.ffn.experts.{e}.w2.weight"))?);
+            b2s.extend(one_w(store, &format!("{p}.ffn.experts.{e}.w2.scale"))?);
+            b3.extend(one_w(store, &format!("{p}.ffn.experts.{e}.w3.weight"))?);
+            b3s.extend(one_w(store, &format!("{p}.ffn.experts.{e}.w3.scale"))?);
+        }
+        w1_all = Some(up_u8(c, &b1)?);
+        w1s_all = Some(up_u8(c, &b1s)?);
+        w2_all = Some(up_u8(c, &b2)?);
+        w2s_all = Some(up_u8(c, &b2s)?);
+        w3_all = Some(up_u8(c, &b3)?);
+        w3s_all = Some(up_u8(c, &b3s)?);
+        eprintln!(
+            "build: layer {l} experts fused into grouped slabs ({} x 3, {:.1} GB)",
+            e_len,
+            (b1.len() + b2.len() + b3.len()) as f64 / (1u64 << 30) as f64
+        );
+    }
+    if w1_all.is_none() {
+        for e in e_start..e_start + e_len {
+            let w1 = load_q4(
+                store,
+                c,
+                arena,
+                &format!("{p}.ffn.experts.{e}.w1.weight"),
+                &format!("{p}.ffn.experts.{e}.w1.scale"),
+            )?;
+            let w2 = load_q4(
+                store,
+                c,
+                arena,
+                &format!("{p}.ffn.experts.{e}.w2.weight"),
+                &format!("{p}.ffn.experts.{e}.w2.scale"),
+            )?;
+            let w3 = load_q4(
+                store,
+                c,
+                arena,
+                &format!("{p}.ffn.experts.{e}.w3.weight"),
+                &format!("{p}.ffn.experts.{e}.w3.scale"),
+            )?;
+            experts.push([w1, w2, w3]);
+        }
     }
 
     // per-field loads (the struct literal binds them in order)
@@ -1086,6 +1141,12 @@ fn upload_layer(
         gate_w,
         gate_bias,
         experts,
+        w1_all,
+        w1s_all,
+        w2_all,
+        w2s_all,
+        w3_all,
+        w3s_all,
         shared_experts,
         compressor,
         indexer,
@@ -2004,6 +2065,13 @@ impl<'a> GpuModel<'a> {
             y_moe: up_zero_f32(c, dim)?,
             gate_buf: up_zero_f32(c, cfg.inter_dim as usize)?,
             up_buf: up_zero_f32(c, cfg.inter_dim as usize)?,
+            local_slots: DeviceBuffer::zeroed(cfg.n_activated as usize).map_err(cuda_err)?,
+            local_count: DeviceBuffer::zeroed(1).map_err(cuda_err)?,
+            h_slots: up_zero_f32(c, cfg.n_activated as usize * cfg.inter_dim as usize)?,
+            q_slots: DeviceBuffer::zeroed(cfg.n_activated as usize * cfg.inter_dim as usize)
+                .map_err(cuda_err)?,
+            qs_slots: DeviceBuffer::zeroed(cfg.n_activated as usize * cfg.inter_dim as usize / 32)
+                .map_err(cuda_err)?,
             h_e: up_zero_f32(c, cfg.inter_dim as usize)?,
             expert_y: up_zero_f32(c, dim)?,
             latent: up_zero_f32(c, hd)?,
@@ -2621,54 +2689,6 @@ fn moe_step(
         top_k,
         cfg.route_scale,
     );
-    // TODO(gpu): batched expert GEMMs without host readback. Until then the
-    // readback goes through pinned async staging: the pageable copy_to
-    // drained the queue (~1 ms each, 40x per step = a third of a token).
-    let mut w_host = vec![0.0f32; top_k];
-    let mut i_host = vec![0i32; top_k];
-    {
-        let stream = c.stream.as_inner();
-        s.gate_stage.dtoh(
-            s.gate_w_out.as_device_ptr().as_raw() as u64,
-            top_k * 4,
-            stream,
-        )?;
-        s.gate_stage.dtoh_at(
-            s.gate_i_out.as_device_ptr().as_raw() as u64,
-            top_k * 4,
-            top_k * 4, // host offset: ids after weights
-            stream,
-        )?;
-        s.gate_stage.sync(stream)?;
-        let f32s = s.gate_stage.as_f32();
-        w_host.copy_from_slice(&f32s[..top_k]);
-        let i32s = s.gate_stage.as_i32_at(top_k * 4);
-        i_host.copy_from_slice(&i32s[..top_k]);
-    }
-    prof.add_us(2, t_gate);
-
-    crate::dump::i32s(
-        format!("d_pos{}_gorder{l}.i32", crate::dump::pos()),
-        &i_host,
-    );
-    crate::dump::f32s(
-        format!("d_pos{}_gweights{l}.f32", crate::dump::pos()),
-        &w_host,
-    );
-    // TODO(gpu-prefetch): this is the streaming-mode prefetch signal — the
-    // gate has just decided this layer's top-6 experts, so their pages
-    // (17.7 MB fp4 each) are the ones a background thread should fault in
-    // next while the current expert GEMMs run. One layer deeper: layer
-    // l+1's selection is known right after layer l's gate readback, a full
-    // sublayer before the l+1 GEMMs — enough lead time to hide the NVMe
-    // cold path (~10 GB/s) behind the streamed reads. See docs/streaming.md.
-    let mut sel: Vec<(usize, f32)> = i_host
-        .iter()
-        .map(|&i| i as usize)
-        .zip(w_host.iter().copied())
-        .collect();
-    sel.sort_by_key(|&(e, _)| e); // ascending expert id (model.py:895 loop order)
-
     let _ = s.y_moe.set_zero();
     // the activation is quantized once and reused by every expert and the
     // shared expert (identical to the ref's per-gemv quantization of x)
@@ -2679,68 +2699,171 @@ fn moe_step(
         k::base(&s.act_x_s),
         dim,
     );
+    prof.add_us(2, t_gate);
 
-    for &(e, w) in &sel {
-        if e < e_start || e >= e_start + e_len {
-            continue; // another rank's expert
+    if layer.w1_all.is_some() {
+        // Fused grouped-expert path (moe_grouped.cu): the gate's top-6 is
+        // consumed on the device — no D2H readback, no host expert loop
+        // (those cost ~107 ms + ~43 ms of a 300 ms token at 40 layers).
+        // Bit-exact by construction: moe_local_slots sorts the rank's local
+        // picks ascending by global expert id (model.py:895 order),
+        // expert_glu/expert_quant reuse the fp4_gemm/emit8/swiglu math
+        // per slot, and expert_reduce adds per-expert block-reduced partials
+        // in the same ascending order the host loop used.
+        let w1 = layer.w1_all.as_ref().unwrap();
+        let w1s = layer.w1s_all.as_ref().unwrap();
+        let w2 = layer.w2_all.as_ref().unwrap();
+        let w2s = layer.w2s_all.as_ref().unwrap();
+        let w3 = layer.w3_all.as_ref().unwrap();
+        let w3s = layer.w3s_all.as_ref().unwrap();
+        k::moe_local_slots(
+            c,
+            k::base(&s.gate_i_out),
+            k::base(&s.local_slots),
+            k::base(&s.local_count),
+            top_k,
+            e_start,
+            e_len,
+        );
+        k::expert_glu(
+            c,
+            k::base(&s.act_x),
+            k::base(&s.act_x_s),
+            k::base(w1),
+            k::base(w1s),
+            k::base(w3),
+            k::base(w3s),
+            k::base(&s.gate_w_out),
+            k::base(&s.local_slots),
+            k::base(&s.local_count),
+            k::base(&s.h_slots),
+            inter,
+            dim,
+            top_k,
+        );
+        k::expert_quant(
+            c,
+            k::base(&s.h_slots),
+            k::base(&s.local_slots),
+            k::base(&s.local_count),
+            k::base(&s.q_slots),
+            k::base(&s.qs_slots),
+            inter,
+            top_k,
+        );
+        k::expert_reduce(
+            c,
+            k::base(&s.q_slots),
+            k::base(&s.qs_slots),
+            k::base(w2),
+            k::base(w2s),
+            k::base(&s.gate_i_out),
+            k::base(&s.local_slots),
+            k::base(&s.local_count),
+            k::base(&s.y_moe),
+            dim,
+            inter,
+            top_k,
+            e_start,
+        );
+    } else {
+        // Streaming mode (per-use staging): host dispatch, identical math.
+        // Pinned async readback — the pageable copy_to drained the queue.
+        let mut w_host = vec![0.0f32; top_k];
+        let mut i_host = vec![0i32; top_k];
+        {
+            let stream = c.stream.as_inner();
+            s.gate_stage.dtoh(
+                s.gate_w_out.as_device_ptr().as_raw() as u64,
+                top_k * 4,
+                stream,
+            )?;
+            s.gate_stage.dtoh_at(
+                s.gate_i_out.as_device_ptr().as_raw() as u64,
+                top_k * 4,
+                top_k * 4, // host offset: ids after weights
+                stream,
+            )?;
+            s.gate_stage.sync(stream)?;
+            let f32s = s.gate_stage.as_f32();
+            w_host.copy_from_slice(&f32s[..top_k]);
+            let i32s = s.gate_stage.as_i32_at(top_k * 4);
+            i_host.copy_from_slice(&i32s[..top_k]);
         }
-        // unregistered experts (the driver's ~120 GB registration cap on
-        // 475 GB of shards): one-shot device copy per use, 17.7 MB/expert
-        let [w1, w2, w3] = &layer.experts[e - e_start];
-        let (w1d, w1sd) = (w1.w.stage(c, arena)?, w1.s.stage(c, arena)?);
-        let (w3d, w3sd) = (w3.w.stage(c, arena)?, w3.s.stage(c, arena)?);
-        k::fp4_gemm(
-            c,
-            k::base(&s.act_x),
-            k::base(&s.act_x_s),
-            w1.w.ptr_or(&w1d),
-            w1.s.ptr_or(&w1sd),
-            k::base(&s.gate_buf),
-            1,
-            inter,
-            dim,
+        crate::dump::i32s(
+            format!("d_pos{}_gorder{l}.i32", crate::dump::pos()),
+            &i_host,
         );
-        k::fp4_gemm(
-            c,
-            k::base(&s.act_x),
-            k::base(&s.act_x_s),
-            w3.w.ptr_or(&w3d),
-            w3.s.ptr_or(&w3sd),
-            k::base(&s.up_buf),
-            1,
-            inter,
-            dim,
+        crate::dump::f32s(
+            format!("d_pos{}_gweights{l}.f32", crate::dump::pos()),
+            &w_host,
         );
-        k::swiglu(
-            c,
-            k::base(&s.gate_buf),
-            k::base(&s.up_buf),
-            k::base(&s.h_e),
-            inter,
-            w,
-        );
-        k::emit8(
-            c,
-            k::base(&s.h_e),
-            k::base(&s.act_h),
-            k::base(&s.act_h_s),
-            inter,
-        );
-        drop((w1d, w1sd, w3d, w3sd));
-        let (w2d, w2sd) = (w2.w.stage(c, arena)?, w2.s.stage(c, arena)?);
-        k::fp4_gemm(
-            c,
-            k::base(&s.act_h),
-            k::base(&s.act_h_s),
-            w2.w.ptr_or(&w2d),
-            w2.s.ptr_or(&w2sd),
-            k::base(&s.expert_y),
-            1,
-            dim,
-            inter,
-        );
-        drop((w2d, w2sd));
-        k::acc_f32(c, k::base(&s.expert_y), k::base(&s.y_moe), dim);
+        let mut sel: Vec<(usize, f32)> = i_host
+            .iter()
+            .map(|&i| i as usize)
+            .zip(w_host.iter().copied())
+            .collect();
+        sel.sort_by_key(|&(e, _)| e); // ascending expert id (model.py:895)
+        for &(e, w) in &sel {
+            if e < e_start || e >= e_start + e_len {
+                continue; // another rank's expert
+            }
+            let [w1, w2, w3] = &layer.experts[e - e_start];
+            let (w1d, w1sd) = (w1.w.stage(c, arena)?, w1.s.stage(c, arena)?);
+            let (w3d, w3sd) = (w3.w.stage(c, arena)?, w3.s.stage(c, arena)?);
+            k::fp4_gemm(
+                c,
+                k::base(&s.act_x),
+                k::base(&s.act_x_s),
+                w1.w.ptr_or(&w1d),
+                w1.s.ptr_or(&w1sd),
+                k::base(&s.gate_buf),
+                1,
+                inter,
+                dim,
+            );
+            k::fp4_gemm(
+                c,
+                k::base(&s.act_x),
+                k::base(&s.act_x_s),
+                w3.w.ptr_or(&w3d),
+                w3.s.ptr_or(&w3sd),
+                k::base(&s.up_buf),
+                1,
+                inter,
+                dim,
+            );
+            k::swiglu(
+                c,
+                k::base(&s.gate_buf),
+                k::base(&s.up_buf),
+                k::base(&s.h_e),
+                inter,
+                w,
+            );
+            k::emit8(
+                c,
+                k::base(&s.h_e),
+                k::base(&s.act_h),
+                k::base(&s.act_h_s),
+                inter,
+            );
+            drop((w1d, w1sd, w3d, w3sd));
+            let (w2d, w2sd) = (w2.w.stage(c, arena)?, w2.s.stage(c, arena)?);
+            k::fp4_gemm(
+                c,
+                k::base(&s.act_h),
+                k::base(&s.act_h_s),
+                w2.w.ptr_or(&w2d),
+                w2.s.ptr_or(&w2sd),
+                k::base(&s.expert_y),
+                1,
+                dim,
+                inter,
+            );
+            drop((w2d, w2sd));
+            k::acc_f32(c, k::base(&s.expert_y), k::base(&s.y_moe), dim);
+        }
     }
 
     // routed-expert partial all-reduce (spec §3 TP4 note): fp32, rank-

@@ -59,6 +59,117 @@ fn gx(n: usize, threads: u32) -> u32 {
     n.div_ceil(threads as usize) as u32
 }
 
+/// `moe_local_slots` (moe_grouped.cu): device-side local slot selection
+/// from the gate output — the host never reads the routing.
+pub fn moe_local_slots(
+    c: &Cuda,
+    gate_idx: I32,
+    local_slots: I32,
+    local_count: I32,
+    top_k: usize,
+    e_start: usize,
+    e_len: usize,
+) {
+    let f = c.moe_grouped.get_function("moe_local_slots").unwrap();
+    unsafe {
+        launch!(
+            f<<<1, 1, 0, &c.stream>>>(
+                gate_idx,
+                local_slots,
+                local_count,
+                top_k as i32,
+                e_start as i32,
+                e_len as i32
+            )
+        )
+        .unwrap()
+    }
+}
+
+/// `expert_glu` (moe_grouped.cu): fused w1·x / w3·x dots + swiglu × route
+/// weight for every local slot, one block per (slot, n).
+#[allow(clippy::too_many_arguments)]
+pub fn expert_glu(
+    c: &Cuda,
+    act_x: U8,
+    act_x_s: U8,
+    w1: U8,
+    w1_s: U8,
+    w3: U8,
+    w3_s: U8,
+    route_w: F32,
+    local_slots: I32,
+    local_count: I32,
+    h_slots: F32,
+    n: usize,
+    k: usize,
+    top_k: usize,
+) {
+    let f = c.moe_grouped.get_function("expert_glu").unwrap();
+    unsafe {
+        launch!(
+            f<<<(n as u32, top_k as u32), 256, 0, &c.stream>>>(
+                act_x, act_x_s, w1, w1_s, w3, w3_s, route_w, local_slots,
+                local_count, h_slots, n as i32, k as i32, top_k as i32
+            )
+        )
+        .unwrap()
+    }
+}
+
+/// `expert_quant` (moe_grouped.cu): act-quant emit per slot.
+pub fn expert_quant(
+    c: &Cuda,
+    h_slots: F32,
+    local_slots: I32,
+    local_count: I32,
+    q_slots: U8,
+    s_slots: U8,
+    n: usize,
+    top_k: usize,
+) {
+    let f = c.moe_grouped.get_function("expert_quant").unwrap();
+    unsafe {
+        launch!(
+            f<<<((n / 32) as u32, top_k as u32), 32, 0, &c.stream>>>(
+                h_slots, local_slots, local_count, q_slots, s_slots,
+                n as i32, top_k as i32
+            )
+        )
+        .unwrap()
+    }
+}
+
+/// `expert_reduce` (moe_grouped.cu): y = Σ_slots-ascending w2·act_h —
+/// same order and per-expert reduction shape as the host loop.
+#[allow(clippy::too_many_arguments)]
+pub fn expert_reduce(
+    c: &Cuda,
+    act_slots: U8,
+    act_s_slots: U8,
+    w2: U8,
+    w2_s: U8,
+    gate_idx: I32,
+    local_slots: I32,
+    local_count: I32,
+    y: F32,
+    dim: usize,
+    inter: usize,
+    top_k: usize,
+    e_start: usize,
+) {
+    let f = c.moe_grouped.get_function("expert_reduce").unwrap();
+    unsafe {
+        launch!(
+            f<<<dim as u32, 256, 0, &c.stream>>>(
+                act_slots, act_s_slots, w2, w2_s, gate_idx, local_slots,
+                local_count, y, dim as i32, inter as i32, top_k as i32,
+                e_start as i32
+            )
+        )
+        .unwrap()
+    }
+}
 /// `rmsnorm` (norm.cu): one block per row. Safe to call with `x == out`
 /// (the reduction finishes before any element is written).
 pub fn rmsnorm(c: &Cuda, x: F32, w: F32, out: F32, dim: usize, eps: f32) {

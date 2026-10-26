@@ -19,6 +19,7 @@ const COMPRESSOR_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/compressor.
 const INDEXER_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/indexer.ptx"));
 const ENGRAM_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/engram.ptx"));
 const SAMPLE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/sample.ptx"));
+const MOE_GROUPED_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_grouped.ptx"));
 
 pub struct Cuda {
     pub context: Context,
@@ -39,6 +40,7 @@ pub struct Cuda {
     pub indexer: Module,
     pub engram: Module,
     pub sample: Module,
+    pub moe_grouped: Module,
 }
 
 static CUDA: Mutex<Option<Cuda>> = Mutex::new(None);
@@ -76,6 +78,7 @@ impl Cuda {
             let indexer = Module::from_ptx(INDEXER_PTX, &[]).expect("indexer module");
             let engram = Module::from_ptx(ENGRAM_PTX, &[]).expect("engram module");
             let sample = Module::from_ptx(SAMPLE_PTX, &[]).expect("sample module");
+            let moe_grouped = Module::from_ptx(MOE_GROUPED_PTX, &[]).expect("moe_grouped module");
             *guard = Some(Cuda {
                 context,
                 device,
@@ -95,6 +98,7 @@ impl Cuda {
                 indexer,
                 engram,
                 sample,
+                moe_grouped,
             });
         }
         // tests run on many threads; the lock holder always becomes current
