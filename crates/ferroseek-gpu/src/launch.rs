@@ -361,6 +361,52 @@ pub fn sparse_attn(
     }
 }
 
+/// `moe_gate` (moe.cu): per-expert parallel gate scoring, one block/expert.
+pub fn moe_gate(
+    c: &Cuda,
+    x: F32,
+    gate_w: U16,
+    bias: F32,
+    scores: F32,
+    dim: usize,
+    n_experts: usize,
+) {
+    let f = c.moe.get_function("moe_gate").unwrap();
+    let stream = &c.stream;
+    unsafe {
+        launch!(
+            f<<<n_experts as u32, 256, 0, stream>>>(
+                x, gate_w, bias, scores, dim as i32, n_experts as i32
+            )
+        )
+        .unwrap()
+    }
+}
+
+/// `moe_select` (moe.cu): bias-steered top-k over the gate scores.
+pub fn moe_select(
+    c: &Cuda,
+    scores: F32,
+    bias: F32,
+    out_w: F32,
+    out_i: I32,
+    n_experts: usize,
+    top_k: usize,
+    route_scale: f32,
+) {
+    let f = c.moe.get_function("moe_select").unwrap();
+    let stream = &c.stream;
+    unsafe {
+        launch!(
+            f<<<1, 32, 0, stream>>>(
+                scores, bias, out_w, out_i, n_experts as i32, top_k as i32,
+                route_scale
+            )
+        )
+        .unwrap()
+    }
+}
+
 /// `moe_route` (moe.cu): sqrtsoftplus gate + bias-steered top-k.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_route(

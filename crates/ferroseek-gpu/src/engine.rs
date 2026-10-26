@@ -526,6 +526,7 @@ struct Scratch {
     act_e_s: D<u8>,
     gate_w_out: D<f32>,
     gate_i_out: D<i32>,
+    gate_scores: D<f32>,
     win_idxs: D<i32>,
     shared_idxs: D<i32>,
     pre_attn: D<f32>,
@@ -2100,6 +2101,7 @@ impl<'a> GpuModel<'a> {
             act_e,
             act_e_s,
             gate_w_out: up_zero_f32(c, cfg.n_activated as usize)?,
+            gate_scores: up_zero_f32(c, cfg.n_routed as usize)?,
             gate_i_out: DeviceBuffer::zeroed(cfg.n_activated as usize).map_err(cuda_err)?,
             win_idxs: DeviceBuffer::zeroed(win).map_err(cuda_err)?,
             shared_idxs: DeviceBuffer::zeroed(win + cfg.index_topk as usize).map_err(cuda_err)?,
@@ -2684,18 +2686,42 @@ fn moe_step(
     let e_len = n_experts / world;
 
     let t_gate = Instant::now();
-    k::moe_route(
-        c,
-        k::base(&s.x),
-        k::base(&layer.gate_w),
-        k::base(&layer.gate_bias),
-        k::base(&s.gate_w_out),
-        k::base(&s.gate_i_out),
-        dim,
-        n_experts,
-        top_k,
-        cfg.route_scale,
-    );
+    if layer.w1_all.is_some() {
+        // parallel gate (moe.cu): one block per expert; the one-block form
+        // did 384 serial 5120-dots (1.1 ms/call, 20% of GPU time in nsys)
+        k::moe_gate(
+            c,
+            k::base(&s.x),
+            k::base(&layer.gate_w),
+            k::base(&layer.gate_bias),
+            k::base(&s.gate_scores),
+            dim,
+            n_experts,
+        );
+        k::moe_select(
+            c,
+            k::base(&s.gate_scores),
+            k::base(&layer.gate_bias),
+            k::base(&s.gate_w_out),
+            k::base(&s.gate_i_out),
+            n_experts,
+            top_k,
+            cfg.route_scale,
+        );
+    } else {
+        k::moe_route(
+            c,
+            k::base(&s.x),
+            k::base(&layer.gate_w),
+            k::base(&layer.gate_bias),
+            k::base(&s.gate_w_out),
+            k::base(&s.gate_i_out),
+            dim,
+            n_experts,
+            top_k,
+            cfg.route_scale,
+        );
+    }
     let _ = s.y_moe.set_zero();
     // the activation is quantized once and reused by every expert and the
     // shared expert (identical to the ref's per-gemv quantization of x)

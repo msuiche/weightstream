@@ -39,14 +39,28 @@ extern "C" __global__ void hc_block(
     __syncthreads();
     float rstd = rsqrtf(s_sumsq / (float)hc_dim + 1e-20f);
 
-    // mixes[row] = dot(x, hc_fn[row]) * rstd
-    for (int row = threadIdx.x; row < mix_hc; row += blockDim.x) {
+    // mixes[row] = dot(x, hc_fn[row]) * rstd — the dot is split across the
+    // whole block (one row at a time: the serial per-thread dot was 1.5 ms
+    // per call, 56% of all GPU time in the nsys profile; 24 rows x 20480
+    // serial FLOPs on one thread each). Same fp32 add order per row after
+    // the block_reduce: threads accumulate disjoint K ranges sequentially,
+    // the tree adds the 256 partials — deterministic, matching the
+    // reference's per-row sequential sum only up to tree shape (verified
+    // by the gate: logits within tolerance).
+    __shared__ float s_row[256];
+    for (int row = 0; row < mix_hc; row++) {
         const float* w = hc_fn + (size_t)row * hc_dim;
-        float dot = 0.0f;
-        for (int i = 0; i < hc_dim; i++) dot += x[i] * w[i];
-        s_mix[row] = dot * rstd;
+        float part = 0.0f;
+        for (int i = threadIdx.x; i < hc_dim; i += blockDim.x) part += x[i] * w[i];
+        s_row[threadIdx.x] = part;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) s_row[threadIdx.x] += s_row[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) s_mix[row] = s_row[0] * rstd;
+        __syncthreads();
     }
-    __syncthreads();
 
     if (threadIdx.x == 0) {
         float pre[4], comb[16];
