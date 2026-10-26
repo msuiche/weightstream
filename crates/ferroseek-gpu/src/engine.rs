@@ -1428,7 +1428,7 @@ impl GpuModel<'static> {
                         let rows: Vec<usize> =
                             ids.iter().take(ncols).map(|&id| id as usize).collect();
                         let mut flat = vec![0.0f32; rows.len() * ehd];
-                        for (chunk, r) in flat.par_chunks_mut(ehd).zip(rows.iter()) {
+                        for (chunk, r) in flat.par_chunks_mut(ehd).zip(rows.par_iter()) {
                             let r = *r;
                             if r * ehd + ehd > wt.len() {
                                 return Err(io::Error::new(
