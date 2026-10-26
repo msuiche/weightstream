@@ -108,6 +108,25 @@ fn register_range(ptr: usize, len: usize, what: &str) -> io::Result<Vec<Registra
     Ok(out)
 }
 
+/// Walk every page of `[base, end)` so the process's PTEs exist before the
+/// device ever reads the range. The checkpoint's mmaps are lazy and the
+/// page cache is warm, so this is a PTE walk, not I/O — but skipping it is
+/// fatal at decode time: a registered range whose pages are unmapped in
+/// this process makes the GPU demand-fault them through HMM mid-step, and
+/// GB10's RM wedges under that storm (NVRM "unhandled interrupt" floods,
+/// observed on all four ranks at decode@0 with 64-110 GB registered).
+fn prefault_range(base: usize, end: usize) {
+    let mut acc = 0u64;
+    let mut p = base;
+    while p < end {
+        // SAFETY: the range is the checkpoint's own mmap; reading one
+        // byte per page only populates PTEs.
+        acc = acc.wrapping_add(unsafe { *(p as *const u8) } as u64);
+        p += PAGE_ALIGN;
+    }
+    std::hint::black_box(acc);
+}
+
 /// Device pointer for a host address inside a registered range. Under UVA
 /// (GB10, CUDA 13) this is the identity mapping; queried per tensor so
 /// nothing depends on that.
@@ -130,18 +149,16 @@ impl HostArena {
     ///
     /// - the driver stops accepting ranges after ~120 GB of registrations;
     /// - every registered byte is PAGE-LOCKED host memory, and GB10's
-    ///   device allocations share the same physical RAM — with vLLM TP
-    ///   workers already holding ~90 GB, pinning more than a few tens of
-    ///   GB starves the kernel and the load pass crawls. The default
-    ///   budget is therefore conservative; `FERROSEEK_STREAM_BUDGET_GB`
-    ///   overrides (0 disables registration entirely — everything then
-    ///   uploads or stages per use).
+    ///   device allocations share the same physical RAM. As the sole
+    ///   tenant ~100 GB works (measured), but leave real headroom for
+    ///   device allocations and the kernel: 96 GB is the default.
+    ///   `FERROSEEK_STREAM_BUDGET_GB` overrides (0 disables registration
+    ///   entirely — everything then uploads or stages per use).
     pub fn new(regions: &[(usize, usize, std::path::PathBuf)]) -> io::Result<Self> {
         let budget: u64 = std::env::var("FERROSEEK_STREAM_BUDGET_GB")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(16);
-        let budget = budget * (1 << 30);
+            .unwrap_or(96);
         let mut registrations = Vec::new();
         let mut ranges = Vec::new();
         let files = regions
@@ -164,6 +181,17 @@ impl HostArena {
             match register_range(ptr, len, &format!("cuMemHostRegister shard {i}")) {
                 Ok(regs) => {
                     total += len as u64;
+                    // Fault the range's pages CPU-side before any kernel can
+                    // read them (see prefault_range): GB10's RM wedges if the
+                    // GPU demand-faults a registered range mid-step. With a
+                    // warm page cache this is a PTE walk at memory speed.
+                    let t = std::time::Instant::now();
+                    prefault_range(base, end);
+                    eprintln!(
+                        "streaming: shard {i} prefaulted {:.1} GB in {:?}",
+                        len as f64 / (1u64 << 30) as f64,
+                        t.elapsed()
+                    );
                     // one driver call per range: UVA maps host->device with
                     // a constant delta inside a registered mapping, so every
                     // tensor pointer derives arithmetically (46k+ tensors per
