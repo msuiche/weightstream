@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ferroseek",
+    "crates/ferroseek-core",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/msuiche/ferroseek"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
