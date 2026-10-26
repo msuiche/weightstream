@@ -11,11 +11,11 @@
 
 use crate::engine::GpuModel;
 use cust::prelude::*;
+use ferroseek_core::ModelConfig;
 use ferroseek_cuda::gpu::Cuda;
 use ferroseek_ref::config::RefConfig;
 use ferroseek_ref::model::RefModel;
 use ferroseek_ref::store::SyntheticWeights;
-use ferroseek_core::ModelConfig;
 
 /// Logit tolerance ladder:
 ///
@@ -121,7 +121,8 @@ fn mini_config_variant(engram_rows: u64, knobs: &[&str]) -> String {
 }
 
 fn mini_engram_rows() -> u64 {
-    let cfg = RefConfig::from_model_config(&ModelConfig::from_str(&mini_config_json(1)).unwrap()).unwrap();
+    let cfg = RefConfig::from_model_config(&ModelConfig::from_str(&mini_config_json(1)).unwrap())
+        .unwrap();
     let layout = ferroseek_ref::engram::EngramLayout::build(&cfg).unwrap();
     layout.required_rows()[0]
 }
@@ -138,14 +139,17 @@ fn ref_model(seed: u64) -> RefModel<'static> {
     RefModel::from_synthetic(cfg, weights).unwrap()
 }
 
-fn gpu_model(seed: u64) -> GpuModel {
+fn gpu_model(seed: u64) -> GpuModel<'static> {
     let cfg = mini_config();
     let weights = SyntheticWeights::generate(&cfg, seed).unwrap();
     GpuModel::from_synthetic(cfg, weights).unwrap()
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 // ---------------------------------------------------------------------------
@@ -155,7 +159,9 @@ fn rand_vec(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 33) as f32 / (1u64 << 31) as f32) - 0.5
         })
         .collect()
@@ -252,7 +258,11 @@ fn rope_uniform_pos_matches_ref() {
     d_x.copy_to(&mut x).unwrap();
     // not bit-exact: nvcc contracts x0*c - x1*s into an FMA — a 1-ULP
     // divergence the engine gate's tolerance absorbs
-    let max_err: f32 = x.iter().zip(&expected).map(|(g, e)| (g - e).abs()).fold(0.0, f32::max);
+    let max_err: f32 = x
+        .iter()
+        .zip(&expected)
+        .map(|(g, e)| (g - e).abs())
+        .fold(0.0, f32::max);
     assert!(max_err < 1e-6, "rope_uniform_pos max err {max_err}");
 }
 
@@ -268,7 +278,9 @@ fn acc_f32_and_gather_rows_f32_exact() {
     let mut d_y = DeviceBuffer::from_slice(&y).unwrap();
     let f = c.gemv.get_function("acc_f32").unwrap();
     let stream = &c.stream;
-    unsafe { launch!(f<<<(n as u32).div_ceil(256), 256, 0, stream>>>(d_a.as_device_ptr(), d_y.as_device_ptr(), n as i32)).unwrap() }
+    unsafe {
+        launch!(f<<<(n as u32).div_ceil(256), 256, 0, stream>>>(d_a.as_device_ptr(), d_y.as_device_ptr(), n as i32)).unwrap()
+    }
     stream.synchronize().unwrap();
     let mut got = vec![0.0f32; n];
     d_y.copy_to(&mut got).unwrap();
@@ -283,12 +295,17 @@ fn acc_f32_and_gather_rows_f32_exact() {
     let mut d_o = DeviceBuffer::from_slice(&vec![0.0f32; 3 * 32]).unwrap();
     let g = c.engram.get_function("gather_rows_f32").unwrap();
     let stream = &c.stream;
-    unsafe { launch!(g<<<3u32, 256, 0, stream>>>(d_t.as_device_ptr(), d_i.as_device_ptr(), d_o.as_device_ptr(), 3, 32)).unwrap() }
+    unsafe {
+        launch!(g<<<3u32, 256, 0, stream>>>(d_t.as_device_ptr(), d_i.as_device_ptr(), d_o.as_device_ptr(), 3, 32)).unwrap()
+    }
     stream.synchronize().unwrap();
     let mut rows = vec![0.0f32; 3 * 32];
     d_o.copy_to(&mut rows).unwrap();
     for (r, &i) in idxs.iter().enumerate() {
-        assert_eq!(&rows[r * 32..(r + 1) * 32], &table[i as usize * 32..(i as usize + 1) * 32]);
+        assert_eq!(
+            &rows[r * 32..(r + 1) * 32],
+            &table[i as usize * 32..(i as usize + 1) * 32]
+        );
     }
 }
 
@@ -381,7 +398,11 @@ fn gpu_greedy_decode_runs_with_device_argmax() {
     for p in 0..20u64 {
         let logits = m.decode(token, p).unwrap();
         let device_pick = m.argmax_current().unwrap();
-        assert_eq!(device_pick, ferroseek_ref::argmax(&logits), "device argmax disagrees at {p}");
+        assert_eq!(
+            device_pick,
+            ferroseek_ref::argmax(&logits),
+            "device argmax disagrees at {p}"
+        );
         token = device_pick;
         assert!(token < 32);
     }
@@ -421,10 +442,68 @@ fn rope_tables_match_the_ref() {
                         cuda_t.cos[pos * (rd / 2) + i],
                         cuda_t.sin[pos * (rd / 2) + i],
                     );
-                    assert!((c - gc).abs() < 1e-7, "{name} rd={rd} pos={pos} i={i}: cos {c} vs {gc}");
-                    assert!((sn - gs).abs() < 1e-7, "{name} rd={rd} pos={pos} i={i}: sin {sn} vs {gs}");
+                    assert!(
+                        (c - gc).abs() < 1e-7,
+                        "{name} rd={rd} pos={pos} i={i}: cos {c} vs {gc}"
+                    );
+                    assert!(
+                        (sn - gs).abs() < 1e-7,
+                        "{name} rd={rd} pos={pos} i={i}: sin {sn} vs {gs}"
+                    );
                 }
             }
         }
     }
+}
+
+#[test]
+fn gpu_streaming_checkpoint_matches_upload() {
+    // Streaming mode through the production path: the synthetic weights
+    // serialized as a real on-disk checkpoint, opened with Checkpoint::open,
+    // every shard mmap registered with cuMemHostRegister(DEVICEMAP), and
+    // the fp8/fp4 weight kernels reading device pointers straight out of
+    // the page cache (docs/streaming.md). Logits must match upload mode
+    // under the same tolerance ladder as the CPU gate.
+    use ferroseek_core::loader::Checkpoint;
+
+    let cfg = mini_config();
+    let json = mini_config_json(mini_engram_rows());
+    let weights = SyntheticWeights::generate(&cfg, 42).unwrap();
+    let dir = std::env::temp_dir().join(format!("ferroseek-gpu-stream-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    weights.write_checkpoint(&json, &dir).unwrap();
+
+    let mut ckpt = Checkpoint::open(&dir).unwrap();
+    let ckpt: &'static mut Checkpoint = Box::leak(Box::new(ckpt));
+    let mut streamed = GpuModel::from_checkpoint_streaming(ckpt).unwrap();
+    let mut uploaded = gpu_model(42);
+
+    let mut clean = 0usize;
+    for (p, &t) in TOKENS.iter().enumerate() {
+        let a = uploaded.decode(t, p as u64).unwrap();
+        let b = streamed.decode(t, p as u64).unwrap();
+        let d = max_abs_diff(&a, &b);
+        assert!(
+            b.iter().all(|v| v.is_finite()),
+            "step {p}: streamed logits not finite"
+        );
+        assert!(
+            ferroseek_ref::argmax(&a) == ferroseek_ref::argmax(&b),
+            "step {p}: streamed argmax disagrees"
+        );
+        if d < GATE_ABS_TOL {
+            clean += 1;
+        }
+        assert!(
+            d < FLIP_ABS_TOL,
+            "step {p}: streamed vs upload diverged {d:.3e} (above the flip bound)"
+        );
+        eprintln!("stream step {p}: max abs diff vs upload {d:.3e}");
+    }
+    eprintln!("STREAM GATE: {clean}/8 steps at the noise floor");
+    assert!(
+        clean >= GATE_MIN_CLEAN_STEPS,
+        "streaming diverges from upload mode systematically"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

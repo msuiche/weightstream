@@ -197,6 +197,49 @@ impl SyntheticWeights {
     pub fn names(&self) -> impl Iterator<Item = &String> {
         self.tensors.keys()
     }
+
+    /// Serialize as a real on-disk safetensors checkpoint (config.json +
+    /// index + one shard), so gate tests can exercise the mmap/loader path
+    /// real checkpoints take — including unified-memory streaming.
+    pub fn write_checkpoint(&self, config_json: &str, dir: &std::path::Path) -> io::Result<()> {
+        use std::collections::BTreeMap;
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join("config.json"), config_json)?;
+        let dt = |d: DType| match d {
+            DType::Bf16 => "BF16",
+            DType::F32 => "F32",
+            DType::Fp8E4m3 => "F8_E4M3",
+            DType::E8m0 => "F8_E8M0",
+            DType::Fp4Packed => "I8", // packed int8, like convert.py
+            DType::U8 => "U8",
+        };
+        let mut header = serde_json::Map::new();
+        let mut payload = Vec::new();
+        for (name, t) in &self.tensors {
+            let start = payload.len() as u64;
+            payload.extend_from_slice(&t.data);
+            header.insert(
+                name.clone(),
+                serde_json::json!({"dtype": dt(t.dtype), "shape": t.shape, "data_offsets": [start, payload.len() as u64]}),
+            );
+        }
+        let hdr = serde_json::to_vec(&serde_json::Value::Object(header))?;
+        let mut shard = (hdr.len() as u64).to_le_bytes().to_vec();
+        shard.extend_from_slice(&hdr);
+        shard.extend_from_slice(&payload);
+        let shard_name = "model-00001-of-00001.safetensors";
+        std::fs::write(dir.join(shard_name), &shard)?;
+        let idx = serde_json::json!({
+            "metadata": {"total_size": payload.len()},
+            "weight_map": self
+                .tensors
+                .keys()
+                .map(|n| (n.clone(), shard_name.to_string()))
+                .collect::<BTreeMap<_, _>>()
+        });
+        std::fs::write(dir.join("model.safetensors.index.json"), serde_json::to_vec(&idx).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?)?;
+        Ok(())
+    }
 }
 
 impl WeightStore for SyntheticWeights {

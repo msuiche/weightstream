@@ -9,7 +9,11 @@ description = "DGX Spark-native inference engine for DeepSeek V4.1 Flash"
 name = "ferroseek"
 path = "src/main.rs"
 
+[features]
+cuda = ["dep:ferroseek-gpu", "ferroseek-gpu/cuda"]
+
 [dependencies]
 ferroseek-core = { path = "../ferroseek-core" }
 ferroseek-ref = { path = "../ferroseek-ref" }
 ferroseek-tokenizer = { path = "../ferroseek-tokenizer" }
+ferroseek-gpu = { path = "../ferroseek-gpu", optional = true }

@@ -8,7 +8,7 @@ USAGE:
     ferroseek info <model-dir>     Parse config.json, print shape and KV sizing
     ferroseek weights <model-dir>  Validate shard coverage against the DS4.1F census
     ferroseek tokens <model-dir> <text>  Encode text, print token ids
-    ferroseek decode <model-dir> <prompt> [max-tokens] [--engine cpu|gpu] [--stream]
+    ferroseek decode <model-dir> <prompt> [max-tokens] [--engine cpu|gpu] [--stream] [--max-seq N]
                                    Greedy decode (default: cpu reference engine;
                                    gpu + --stream reads weights straight from the
                                    registered checkpoint mmaps, docs/streaming.md)
@@ -121,8 +121,15 @@ fn cmd_weights(dir: Option<&String>) -> ExitCode {
 
     let shards: std::collections::BTreeSet<&String> = index.values().collect();
     println!("tensors         {} in {} shards", index.len(), shards.len());
-    println!("census          {} expected (text model, DS4.1F)", expected.len());
-    println!("coverage        {}/{}", expected.len() - missing.len(), expected.len());
+    println!(
+        "census          {} expected (text model, DS4.1F)",
+        expected.len()
+    );
+    println!(
+        "coverage        {}/{}",
+        expected.len() - missing.len(),
+        expected.len()
+    );
     if !missing.is_empty() {
         println!("missing         {} (first 10):", missing.len());
         for n in missing.iter().take(10) {
@@ -172,7 +179,9 @@ impl Decoder for ferroseek_gpu::engine::GpuModel<'static> {
 }
 
 fn ferroseek_gpu_stream_env() -> bool {
-    std::env::var("FERROSEEK_STREAM").map(|v| v == "1").unwrap_or(false)
+    std::env::var("FERROSEEK_STREAM")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 #[cfg(feature = "cuda")]
@@ -180,6 +189,7 @@ fn build_engine(
     engine: &str,
     ckpt: ferroseek_core::Checkpoint,
     stream: bool,
+    max_seq: u64,
 ) -> std::io::Result<Box<dyn Decoder>> {
     match engine {
         "gpu" => {
@@ -189,11 +199,13 @@ fn build_engine(
                 // lifetime of this CLI run (mappings stay registered until
                 // exit).
                 let ckpt: &'static mut ferroseek_core::Checkpoint = Box::leak(Box::new(ckpt));
-                let model = ferroseek_gpu::engine::GpuModel::from_checkpoint_streaming(ckpt)?;
+                let model = ferroseek_gpu::engine::GpuModel::from_checkpoint_streaming(ckpt)?
+                    .with_max_seq_len(max_seq);
                 Ok(Box::new(model))
             } else {
                 let ckpt: &'static mut ferroseek_core::Checkpoint = Box::leak(Box::new(ckpt));
-                let model = ferroseek_gpu::engine::GpuModel::from_checkpoint(ckpt)?;
+                let model = ferroseek_gpu::engine::GpuModel::from_checkpoint(ckpt)?
+                    .with_max_seq_len(max_seq);
                 Ok(Box::new(model))
             }
         }
@@ -208,8 +220,9 @@ fn build_engine(
 #[cfg(not(feature = "cuda"))]
 fn build_engine(
     engine: &str,
-    mut ckpt: ferroseek_core::Checkpoint,
+    ckpt: ferroseek_core::Checkpoint,
     _stream: bool,
+    _max_seq: u64,
 ) -> std::io::Result<Box<dyn Decoder>> {
     if engine == "gpu" {
         return Err(std::io::Error::new(
@@ -236,6 +249,7 @@ fn cmd_decode(args: &[String]) -> ExitCode {
     let mut logits_raw: Option<String> = None;
     let mut engine = "cpu".to_string();
     let mut stream = false;
+    let mut max_seq: u64 = 4096;
     let mut i = 4;
     while i < args.len() {
         match args[i].as_str() {
@@ -261,6 +275,10 @@ fn cmd_decode(args: &[String]) -> ExitCode {
             "--stream" => {
                 stream = true;
                 i += 1;
+            }
+            "--max-seq" if i + 1 < args.len() => {
+                max_seq = args[i + 1].parse().unwrap_or(max_seq);
+                i += 2;
             }
             _ => i += 1,
         }
@@ -289,7 +307,7 @@ fn cmd_decode(args: &[String]) -> ExitCode {
         }
     };
     let t0_load = std::time::Instant::now();
-    let mut model = match build_engine(&engine, ckpt, stream) {
+    let mut model = match build_engine(&engine, ckpt, stream, max_seq) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("model ({engine}): {e}");
@@ -320,7 +338,7 @@ fn cmd_decode(args: &[String]) -> ExitCode {
     // Per-position gate stats: logprob of the token actually consumed,
     // its rank, and the top-1 id at that position (fp32 log-softmax).
     let mut records: Vec<String> = Vec::new();
-    let mut record = |logits: &[f32], pos: u64, consumed: u32, records: &mut Vec<String>| {
+    let record = |logits: &[f32], pos: u64, consumed: u32, records: &mut Vec<String>| {
         let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let (mut top1, mut top2, mut top1_idx) = (f32::NEG_INFINITY, f32::NEG_INFINITY, 0u32);
         let mut sum_exp = 0.0f64;
@@ -335,7 +353,11 @@ fn cmd_decode(args: &[String]) -> ExitCode {
             }
         }
         let logprob = logits[consumed as usize] - max - (sum_exp.ln() as f32);
-        let rank = logits.iter().filter(|&&l| l > logits[consumed as usize]).count() + 1;
+        let rank = logits
+            .iter()
+            .filter(|&&l| l > logits[consumed as usize])
+            .count()
+            + 1;
         let norm = sum_exp.ln() as f32;
         records.push(format!(
             "{{\"pos\":{pos},\"consumed\":{consumed},\"logprob\":{logprob:.6},\"rank\":{rank},\"top1\":{top1_idx},\"top1_logprob\":{:.6},\"top1_top2_gap\":{:.6}}}",

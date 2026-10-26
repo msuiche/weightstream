@@ -20,7 +20,8 @@ pub(crate) fn pos() -> u64 {
 }
 
 fn write(name: String, bytes: Vec<u8>) {
-    let dir = DIR.get_or_init(|| std::env::var_os("FERROSEEK_DUMP_GPU").map(std::path::PathBuf::from));
+    let dir =
+        DIR.get_or_init(|| std::env::var_os("FERROSEEK_DUMP_GPU").map(std::path::PathBuf::from));
     if let Some(d) = dir {
         let _ = std::fs::write(d.join(name), bytes);
     }

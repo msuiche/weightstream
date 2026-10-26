@@ -135,6 +135,24 @@ impl Checkpoint {
         };
         Ok((a_slice, b_slice))
     }
+
+    /// Every mapped shard's full payload region as `(mmap_base, mmap_len,
+    /// shard_file)`, mapping all index shards first. For unified-memory
+    /// weight streaming (docs/streaming.md): the caller registers these
+    /// regions with `cudaHostRegister(…Mapped)` and hands kernels device
+    /// pointers into them. The mappings stay valid while the `Checkpoint`
+    /// is alive.
+    pub fn data_regions(&mut self) -> std::io::Result<Vec<(usize, usize, String)>> {
+        let names: std::collections::BTreeSet<String> = self.index.values().cloned().collect();
+        for n in &names {
+            self.shard(n)?;
+        }
+        Ok(self
+            .shards
+            .iter()
+            .map(|(name, shard)| (shard.mmap.as_ptr() as usize, shard.mmap.len(), name.clone()))
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -175,6 +193,30 @@ mod tests {
         let bytes = ckpt.bytes("embed.weight").unwrap();
         assert_eq!(bytes, &[7u8; 16]);
         assert!(ckpt.meta("nope").is_err());
+
+        let regions = ckpt.data_regions().unwrap();
+        assert_eq!(regions.len(), 1);
+        let (base, len, name) = &regions[0];
+        assert_eq!(name, "model-00001-of-00001.safetensors");
+        assert_eq!(
+            *len,
+            std::fs::metadata(dir.join(name)).unwrap().len() as usize
+        );
+        // region base matches the shard payload: header json + 8-byte prefix
+        let meta = ckpt.meta("embed.weight").unwrap();
+        // the fixture writes the header inline; payload = 8-byte prefix +
+        // header json + data_offsets[0]
+        let offs = 8
+            + serde_json::to_vec(&serde_json::json!({
+                "embed.weight": {"dtype": "BF16", "shape": [4, 2], "data_offsets": [0, 16]}
+            }))
+            .unwrap()
+            .len()
+            + meta.data_offsets[0] as usize;
+        unsafe {
+            let byte = *((base + offs) as *const u8);
+            assert_eq!(byte, 7);
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

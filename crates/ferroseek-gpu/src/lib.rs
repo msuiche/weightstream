@@ -18,6 +18,8 @@ pub mod dump;
 pub mod engine;
 #[cfg(feature = "cuda")]
 pub mod launch;
+#[cfg(feature = "cuda")]
+pub mod stream;
 
 #[cfg(all(test, feature = "cuda"))]
 mod tests;
