@@ -159,6 +159,7 @@ impl HostArena {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(96);
+        let budget = budget * (1 << 30);
         let mut registrations = Vec::new();
         let mut ranges = Vec::new();
         let files = regions
