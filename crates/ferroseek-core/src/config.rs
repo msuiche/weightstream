@@ -138,14 +138,15 @@ impl ModelConfig {
         self.index_topk.is_some() && self.index_head_dim.is_some()
     }
 
-    /// Compressed KV latent width per token (elements), before per-layer
-    /// compression ratios. `None` when the config names neither layout.
+    /// Compressed KV latent width per token (elements).
+    /// V3-style: kv_lora_rank + qk_rope_head_dim. DS4.1F: the wkv output is
+    /// head_dim wide and the RoPE tail lives *inside* it (spec §3), so the
+    /// latent is head_dim alone. `None` when the config names neither layout.
     pub fn kv_width(&self) -> Option<u32> {
-        let base = match (self.kv_lora_rank, self.head_dim, self.num_key_value_heads) {
-            (Some(rank), _, _) => rank,
-            (None, Some(head_dim), Some(1)) => head_dim,
-            _ => return None,
-        };
-        Some(base + self.qk_rope_head_dim)
+        match (self.kv_lora_rank, self.head_dim, self.num_key_value_heads) {
+            (Some(rank), _, _) => Some(rank + self.qk_rope_head_dim),
+            (None, Some(head_dim), Some(1)) => Some(head_dim),
+            _ => None,
+        }
     }
 }

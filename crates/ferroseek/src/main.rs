@@ -62,22 +62,17 @@ fn cmd_info(dir: Option<&String>) -> ExitCode {
     }
     match cfg.kv_width() {
         Some(w) => {
-            let ratio_str = if cfg.compress_ratios.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    ", CSA ratios {} layers @1/2",
-                    cfg.compress_ratios.iter().filter(|&&r| r == 2).count()
-                )
-            };
-            println!("mla             {w}-wide latent{ratio_str}");
-            if let (Some(fp8), Some(bf16)) = (
-                kv::kv_bytes_per_token(&cfg, kv::FP8_BYTES),
-                kv::kv_bytes_per_token(&cfg, kv::BF16_BYTES),
-            ) {
-                println!("kv/token        {fp8} B (fp8+scales) / {bf16} B (bf16)");
+            let l = kv::layout(&cfg, 128, 43).unwrap();
+            println!(
+                "mla             {w}-wide latent, {} publisher caches ({} compressed + {} index el/token)",
+                cfg.kv_source_layer_ids.len(),
+                l.compressed_per_token,
+                l.index_per_token
+            );
+            if let Some(bf16) = kv::kv_bytes_per_token(&cfg, kv::BF16_BYTES) {
+                println!("kv/token        {bf16} B (bf16, fp4-snapped)");
                 for ctx in [262_144u64, 524_288, 1_048_576] {
-                    let gib = ctx as f64 * fp8 as f64 / (1u64 << 30) as f64;
+                    let gib = ctx as f64 * bf16 as f64 / (1u64 << 30) as f64;
                     println!("kv @ {ctx:>9} ctx   {gib:.1} GiB per sequence");
                 }
             }
