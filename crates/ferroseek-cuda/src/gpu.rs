@@ -12,6 +12,8 @@ const FP8_GEMM_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fp8_gemm.ptx"
 const FP4_ACTQUANT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fp4_actquant.ptx"));
 const FP4_EXPERT_GEMM_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fp4_expert_gemm.ptx"));
 const HC_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/hc.ptx"));
+const ATTN_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/attn.ptx"));
+const MOE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/moe.ptx"));
 
 pub struct Cuda {
     pub context: Context,
@@ -25,6 +27,8 @@ pub struct Cuda {
     pub fp4_actquant: Module,
     pub fp4_expert_gemm: Module,
     pub hc: Module,
+    pub attn: Module,
+    pub moe: Module,
 }
 
 static CUDA: Mutex<Option<Cuda>> = Mutex::new(None);
@@ -54,6 +58,8 @@ impl Cuda {
             let fp4_expert_gemm =
                 Module::from_ptx(FP4_EXPERT_GEMM_PTX, &[]).expect("fp4_expert_gemm module");
             let hc = Module::from_ptx(HC_PTX, &[]).expect("hc module");
+            let attn = Module::from_ptx(ATTN_PTX, &[]).expect("attn module");
+            let moe = Module::from_ptx(MOE_PTX, &[]).expect("moe module");
             *guard = Some(Cuda {
                 context,
                 device,
@@ -66,6 +72,8 @@ impl Cuda {
                 fp4_actquant,
                 fp4_expert_gemm,
                 hc,
+                attn,
+                moe,
             });
         }
         // tests run on many threads; the lock holder always becomes current
@@ -753,5 +761,219 @@ mod tests {
                 .fold(0.0, f32::max);
             assert!(max_err < 1e-5, "hc {name} max err {max_err}");
         }
+    }
+
+    #[test]
+    fn sparse_attn_matches_cpu_mirror() {
+        let guard = Cuda::global();
+        let cuda = guard.as_ref().unwrap();
+        let (n_heads, dim, n_rows) = (4usize, 512usize, 300usize);
+        let scale = 512f32.powf(-0.5);
+
+        let q = rand_vec(n_heads * dim, 900);
+        let kv = rand_vec(n_rows * dim, 901);
+        let sink = rand_vec(n_heads, 902);
+        // selection: valid, invalid (-1), repeated, unsorted
+        let mut idxs: Vec<i32> = (0..250i32).collect();
+        idxs[5] = -1;
+        idxs[100] = 7;
+        idxs.push(299);
+        idxs.push(-1);
+        let n_sel = idxs.len();
+
+        // CPU mirror: exact online softmax, same order
+        let mut expected = vec![0.0f32; n_heads * dim];
+        for h in 0..n_heads {
+            let qh = &q[h * dim..(h + 1) * dim];
+            let (mut m, mut s) = (-1e30f32, 0.0f32);
+            let mut acc = vec![0.0f32; dim];
+            for &idx in &idxs {
+                let logit = if idx >= 0 {
+                    let row = &kv[idx as usize * dim..(idx as usize + 1) * dim];
+                    qh.iter().zip(row).map(|(a, b)| a * b).sum::<f32>() * scale
+                } else {
+                    -1e30
+                };
+                let mnew = m.max(logit);
+                let corr = (m - mnew).exp();
+                let w = (logit - mnew).exp();
+                s = s * corr + w;
+                for d in 0..dim {
+                    acc[d] = acc[d] * corr
+                        + w * if idx >= 0 { kv[idx as usize * dim + d] } else { 0.0 };
+                }
+                m = mnew;
+            }
+            s += (sink[h] - m).exp();
+            for d in 0..dim {
+                expected[h * dim + d] = acc[d] / s;
+            }
+        }
+
+        let d_q = DeviceBuffer::from_slice(&q).unwrap();
+        let d_kv = DeviceBuffer::from_slice(&kv).unwrap();
+        let d_idx = DeviceBuffer::from_slice(&idxs).unwrap();
+        let d_sink = DeviceBuffer::from_slice(&sink).unwrap();
+        let mut d_out = DeviceBuffer::from_slice(&vec![0.0; n_heads * dim]).unwrap();
+        let func = cuda.attn.get_function("sparse_attn").unwrap();
+        let stream = &cuda.stream;
+        unsafe {
+            launch!(
+                func<<<n_heads as u32, 128, 0, stream>>>(
+                    d_q.as_device_ptr(),
+                    d_kv.as_device_ptr(),
+                    d_idx.as_device_ptr(),
+                    d_sink.as_device_ptr(),
+                    d_out.as_device_ptr(),
+                    n_heads as i32,
+                    dim as i32,
+                    n_sel as i32,
+                    scale
+                )
+            )
+            .unwrap();
+        }
+        stream.synchronize().unwrap();
+        let mut got = vec![0.0f32; n_heads * dim];
+        d_out.copy_to(&mut got).unwrap();
+        let max_err: f32 = got
+            .iter()
+            .zip(&expected)
+            .map(|(g, e)| (g - e).abs())
+            .fold(0.0, f32::max);
+        assert!(max_err < 1e-4, "sparse_attn max err {max_err}");
+    }
+
+    fn f32_to_bf16_bits(v: f32) -> u16 {
+        ferroseek_core::quant::f32_to_bf16(v)
+    }
+
+    #[test]
+    fn moe_route_matches_cpu_mirror() {
+        let guard = Cuda::global();
+        let cuda = guard.as_ref().unwrap();
+        let (dim, n_experts, top_k) = (256usize, 384usize, 6usize);
+        let route_scale = 1.5f32;
+
+        let x = rand_vec(dim, 1001);
+        let gate_f32 = rand_vec(n_experts * dim, 1002);
+        let gate_bf16: Vec<u16> = gate_f32.iter().map(|&v| f32_to_bf16_bits(v)).collect();
+        let bias = rand_vec(n_experts, 1003);
+
+        // CPU mirror
+        let mut scores: Vec<f32> = (0..n_experts)
+            .map(|e| {
+                let dot: f32 = (0..dim)
+                    .map(|d| x[d] * ferroseek_core::quant::bf16_to_f32(gate_bf16[e * dim + d]))
+                    .sum();
+                let sp = if dot > 20.0 { dot } else { (dot.exp() + 1.0).ln() };
+                sp.sqrt()
+            })
+            .collect();
+        let mut taken = vec![false; n_experts];
+        let mut exp_idx = Vec::new();
+        let mut exp_w = Vec::new();
+        for _ in 0..top_k {
+            let mut best = !0usize;
+            let mut best_v = f32::NEG_INFINITY;
+            for e in 0..n_experts {
+                if taken[e] {
+                    continue;
+                }
+                let v = scores[e] + bias[e];
+                if v > best_v {
+                    best_v = v;
+                    best = e;
+                }
+            }
+            taken[best] = true;
+            exp_idx.push(best as i32);
+            exp_w.push(scores[best]);
+        }
+        let wsum: f32 = exp_w.iter().sum();
+        for w in exp_w.iter_mut() {
+            *w = *w / (wsum + 1e-20) * route_scale;
+        }
+
+        let d_x = DeviceBuffer::from_slice(&x).unwrap();
+        let d_g = DeviceBuffer::from_slice(&gate_bf16).unwrap();
+        let d_b = DeviceBuffer::from_slice(&bias).unwrap();
+        let mut d_w = DeviceBuffer::from_slice(&vec![0.0; top_k]).unwrap();
+        let mut d_i = DeviceBuffer::from_slice(&vec![0i32; top_k]).unwrap();
+        let func = cuda.moe.get_function("moe_route").unwrap();
+        let stream = &cuda.stream;
+        let shared = (n_experts * 4) as u32;
+        unsafe {
+            launch!(
+                func<<<1, 384, shared, stream>>>(
+                    d_x.as_device_ptr(),
+                    d_g.as_device_ptr(),
+                    d_b.as_device_ptr(),
+                    d_w.as_device_ptr(),
+                    d_i.as_device_ptr(),
+                    dim as i32,
+                    n_experts as i32,
+                    top_k as i32,
+                    route_scale
+                )
+            )
+            .unwrap();
+        }
+        stream.synchronize().unwrap();
+        let mut got_w = vec![0.0f32; top_k];
+        let mut got_i = vec![0i32; top_k];
+        d_w.copy_to(&mut got_w).unwrap();
+        d_i.copy_to(&mut got_i).unwrap();
+
+        assert_eq!(got_i, exp_idx, "route indices differ");
+        let max_err: f32 = got_w
+            .iter()
+            .zip(&exp_w)
+            .map(|(g, e)| (g - e).abs())
+            .fold(0.0, f32::max);
+        assert!(max_err < 1e-5, "route weights max err {max_err}");
+    }
+
+    #[test]
+    fn swiglu_limit10_matches_cpu() {
+        let guard = Cuda::global();
+        let cuda = guard.as_ref().unwrap();
+        let n = 4096usize;
+        let gate = rand_vec(n, 2001);
+        let up = rand_vec(n, 2002);
+        let rw = 0.37f32;
+        let mut expected = vec![0.0f32; n];
+        for i in 0..n {
+            let g = gate[i].min(10.0);
+            let u = up[i].clamp(-10.0, 10.0);
+            let silu = g / (1.0 + (-g).exp());
+            expected[i] = silu * u * rw;
+        }
+        let d_g = DeviceBuffer::from_slice(&gate).unwrap();
+        let d_u = DeviceBuffer::from_slice(&up).unwrap();
+        let mut d_o = DeviceBuffer::from_slice(&vec![0.0; n]).unwrap();
+        let func = cuda.moe.get_function("swiglu_limit10").unwrap();
+        let stream = &cuda.stream;
+        unsafe {
+            launch!(
+                func<<<(n as u32).div_ceil(256), 256, 0, stream>>>(
+                    d_g.as_device_ptr(),
+                    d_u.as_device_ptr(),
+                    d_o.as_device_ptr(),
+                    n as i32,
+                    rw
+                )
+            )
+            .unwrap();
+        }
+        stream.synchronize().unwrap();
+        let mut got = vec![0.0f32; n];
+        d_o.copy_to(&mut got).unwrap();
+        let max_err: f32 = got
+            .iter()
+            .zip(&expected)
+            .map(|(g, e)| (g - e).abs())
+            .fold(0.0, f32::max);
+        assert!(max_err < 1e-6, "swiglu max err {max_err}");
     }
 }
