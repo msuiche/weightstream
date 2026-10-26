@@ -582,27 +582,100 @@ fn cmd_decode(args: &[String]) -> ExitCode {
     };
 
     let mut overall = ExitCode::SUCCESS;
-    let n_requests = 1 + prompts.len();
-    for req_i in 0..n_requests {
-        let prompt_i: String = if req_i == 0 {
-            prompt.clone()
-        } else {
-            prompts[req_i - 1].clone()
-        };
-        match run_request(&mut model, &prompt_i) {
+
+    // Request stream, protocol-driven: the head owns the list (CLI prompt
+    // + its prompts-file) and broadcasts each next request over the tp4
+    // control channel; workers never count requests locally — they decode,
+    // reset, and wait for the head's next Next (or Bye, which ends the
+    // run). Single-node (no tp4) just walks the head's local list.
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    let is_worker = tp4_session.as_ref().map(|s| s.rank != 0).unwrap_or(false);
+    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+    let is_worker = false;
+
+    if is_worker {
+        // worker: request 1 is the CLI prompt (already broadcast at Start
+        // by convention — every rank got it in argv), then wait for each
+        // next request from the head
+        match run_request(&mut model, prompt) {
             Some(generated) => println!("---\n{}", tk.decode(&generated)),
-            None => {
-                overall = ExitCode::FAILURE;
-                break;
+            None => overall = ExitCode::FAILURE,
+        }
+        while overall == ExitCode::SUCCESS {
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
+            if let Some(sess) = tp4_session.as_mut() {
+                match sess.next_request(None) {
+                    Ok(Some(cmd)) => {
+                        let next_prompt = cmd
+                            .get("prompt")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if next_prompt.is_empty() {
+                            overall = ExitCode::FAILURE;
+                            break;
+                        }
+                        if let Err(e) = model.reset() {
+                            eprintln!("reset: {e}");
+                            overall = ExitCode::FAILURE;
+                            break;
+                        }
+                        match run_request(&mut model, &next_prompt) {
+                            Some(generated) => {
+                                println!("---\n{}", tk.decode(&generated))
+                            }
+                            None => {
+                                overall = ExitCode::FAILURE;
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) => break, // head said Bye: done
+                    Err(e) => {
+                        eprintln!("tp4 next_request: {e}");
+                        overall = ExitCode::FAILURE;
+                        break;
+                    }
+                }
             }
         }
-        if req_i + 1 < n_requests {
-            // reset per-request caches; every rank runs this between
-            // requests so the next prefill starts from position 0
+    } else {
+        // head (or single-node): decode the CLI prompt, then each
+        // prompts-file line, resetting between requests
+        match run_request(&mut model, prompt) {
+            Some(generated) => println!("---\n{}", tk.decode(&generated)),
+            None => overall = ExitCode::FAILURE,
+        }
+        for p in prompts.iter() {
+            if overall != ExitCode::SUCCESS {
+                break;
+            }
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
+            if let Some(sess) = tp4_session.as_mut() {
+                match sess.next_request(Some(serde_json::json!({
+                    "prompt": p,
+                    "max_tokens": max_tokens,
+                }))) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("tp4 next_request: {e}");
+                        overall = ExitCode::FAILURE;
+                        break;
+                    }
+                }
+            }
             if let Err(e) = model.reset() {
                 eprintln!("reset: {e}");
                 overall = ExitCode::FAILURE;
                 break;
+            }
+            match run_request(&mut model, p) {
+                Some(generated) => println!("---\n{}", tk.decode(&generated)),
+                None => {
+                    overall = ExitCode::FAILURE;
+                    break;
+                }
             }
         }
     }
