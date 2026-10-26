@@ -1396,8 +1396,6 @@ impl GpuModel<'static> {
             if let Some(ei) = layer.engram {
                 let e = layer.engram_w.as_ref().unwrap();
                 let hash = &hashes[ei];
-                let ids: Vec<i64> = hash.iter().map(|&h| h as i64).collect();
-                s.hash_ids.copy_from(&ids).map_err(cuda_err)?;
                 let ncols = engram.n_hash_cols;
                 let ehd = engram.head_dim;
                 // the real checkpoint's engram embed table is a 98 GB fp8
@@ -1405,6 +1403,7 @@ impl GpuModel<'static> {
                 // n_hash_cols rows host-side with the ref engine's own
                 // fp8_row_scaled (bit-identical dequant, model.py:328-365).
                 // Registered tables (synthetic gate) keep the device gather.
+                let ids: Vec<i64> = hash.iter().map(|&h| h as i64).collect();
                 match (e.embed_w.host(), e.embed_s.host()) {
                     (Some((wp, wlen)), Some((sp, slen))) => {
                         // SAFETY: both alias the weight store's mmap, owned
@@ -1429,7 +1428,39 @@ impl GpuModel<'static> {
                             }
                             flat.extend(ferroseek_ref::store::fp8_row_scaled(wt, st, r, ehd));
                         }
-                        s.eflat.copy_from(&flat).map_err(cuda_err)?;
+                        // pinned async staging: the two pageable copy_from
+                        // calls each drained the queue (engram measured
+                        // 32 ms of a 126 ms step). Layout in the 64 KiB
+                        // buffer: [ids i64 x nids | flat f32 x ncols*ehd].
+                        let nids = ncols.min(ids.len());
+                        let ids_bytes = nids * 8;
+                        let flat_bytes = flat.len() * 4;
+                        let flat_off = 256usize; // past the id slots, 16B-aligned
+                        {
+                            let stream = c.stream.as_inner();
+                            s.small_stage.write_bytes(
+                                0,
+                                ids[..nids].as_ptr() as *const u8,
+                                ids_bytes,
+                            );
+                            s.small_stage.write_bytes(
+                                flat_off,
+                                flat.as_ptr() as *const u8,
+                                flat_bytes,
+                            );
+                            s.small_stage.htod(
+                                s.hash_ids.as_device_ptr().as_raw() as u64,
+                                ids_bytes,
+                                stream,
+                            )?;
+                            s.small_stage.htod_at(
+                                s.eflat.as_device_ptr().as_raw() as u64,
+                                flat_bytes,
+                                flat_off,
+                                stream,
+                            )?;
+                            s.small_stage.sync(stream)?;
+                        }
                     }
                     _ => {
                         k::gather_fp8(
@@ -2176,7 +2207,7 @@ impl<'a> GpuModel<'a> {
                 cfg.vocab as usize / sh.world_size as usize * 4 + 4,
             )?,
             gate_stage: crate::stream::PinnedBuf::new(1024)?,
-            small_stage: crate::stream::PinnedBuf::new(1 << 12)?,
+            small_stage: crate::stream::PinnedBuf::new(64 << 10)?,
         };
 
         let n_sources = cfg.kv_sources.len();

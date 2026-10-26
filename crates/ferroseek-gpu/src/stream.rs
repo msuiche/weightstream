@@ -324,6 +324,24 @@ impl PinnedBuf {
         Ok(())
     }
 
+    /// Async host->device from `[ptr+off, ptr+off+bytes)` on `stream`.
+    pub fn htod_at(&self, dst: u64, bytes: usize, off: usize, stream: CUstream) -> io::Result<()> {
+        if off + bytes > self.len {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "pinned range"));
+        }
+        let r = unsafe { cuMemcpyHtoDAsync_v2(dst, self.ptr.add(off) as *const _, bytes, stream) };
+        if !cu_ok(r) {
+            return Err(cuda_err(r, "cuMemcpyHtoDAsync"));
+        }
+        Ok(())
+    }
+
+    /// Copy `bytes` from a host slice into this buffer at byte `off`.
+    pub fn write_bytes(&mut self, off: usize, src: *const u8, bytes: usize) {
+        assert!(off + bytes <= self.len);
+        unsafe { std::ptr::copy_nonoverlapping(src, self.ptr.add(off), bytes) };
+    }
+
     /// Async host->device from this buffer on `stream`.
     pub fn htod(&self, dst: u64, bytes: usize, stream: CUstream) -> io::Result<()> {
         let r = unsafe { cuMemcpyHtoDAsync_v2(dst, self.ptr as *const _, bytes, stream) };
