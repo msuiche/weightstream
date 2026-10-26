@@ -6,10 +6,25 @@ cache, cluster transport and serving layer are Rust; the tensor-core kernels
 are CUDA, reused from proven stacks first and rewritten only where profiling
 says so.
 
-Status: **phase 0 — scaffolding.** `ferroseek info <model-dir>` parses a
-checkpoint's `config.json` and prints shape and KV sizing. Nothing touches a
-GPU yet. See [`docs/architecture.md`](docs/architecture.md) for the kernel
-strategy and the phase plan.
+Status: **TP4 integration.** What works today:
+
+- **CPU reference engine** (`ferroseek-ref`) — full DS4.1F decode on the real
+  475 GB checkpoint, **gate-passed against the production vLLM TP4 stack**
+  (teacher-forced top-1 identity, transport-bounded logprob deltas)
+- **16 GPU kernels** (`ferroseek-cuda`) — every DS4.1F primitive, each gated
+  on GB10 (sparse attention, DSA indexer, CSA compressor, hc Sinkhorn, MoE
+  routing, FP8/FP4 block-scaled GEMMs, engram, quant snaps)
+- **GPU decode engine** (`ferroseek-gpu`) — real-checkpoint decode via
+  unified-memory weight streaming from page-cache mmaps; tokens identical to
+  the CPU engine (` Paris.`)
+- **TP4 transport** (`ferroseek-transport`) — one-shot two-hop fp32
+  all-reduce over the 4-node switchless RoCE ring, bit-exact on all ranks,
+  ~10 µs/4 KB, zero packet loss in a 100k soak
+
+In flight: TP4 sharded decode across the ring. Remaining: serving,
+speculative decode, prefill. See [`docs/architecture.md`](docs/architecture.md),
+[`docs/model-spec.md`](docs/model-spec.md), [`docs/streaming.md`](docs/streaming.md),
+[`docs/transport.md`](docs/transport.md).
 
 ## Why
 
@@ -25,16 +40,28 @@ rewriting mature matmul kernels.
 
 | path | what it is |
 |---|---|
-| `crates/ferroseek` | CLI front door (`info`, `serve`, `bench`) |
-| `crates/ferroseek-core` | config parsing, KV/memory sizing — GPU-free, testable anywhere |
-| `docs/architecture.md` | engine design, kernel inventory, phases, verification discipline |
+| `crates/ferroseek` | CLI front door (`info`, `weights`, `tokens`, `decode`) |
+| `crates/ferroseek-core` | config, safetensors/mmap loader, quant primitives, KV sizing |
+| `crates/ferroseek-ref` | CPU reference decode engine (the numerics gate) |
+| `crates/ferroseek-cuda` | CUDA runtime + the 16 gated kernels (sm_121) |
+| `crates/ferroseek-gpu` | GPU decode engine + unified-memory streaming |
+| `crates/ferroseek-transport` | TP4 ring collectives (one-shot RoCE all-reduce) |
+| `crates/ferroseek-tokenizer` | HF tokenizer + engram compressed token map |
+| `docs/` | model-spec, architecture, kernels, streaming, transport |
+| `scripts/gate.py` | teacher-forced logit gate vs the serving stack |
 
 ## Build
 
 ```sh
 cargo build
-cargo test
-cargo run -- info /path/to/DeepSeek-V4.1-Flash-1017
+cargo test                                  # host-only suite
+# on a DGX Spark:
+cargo test -p ferroseek-cuda --features cuda
+cargo test -p ferroseek-gpu --features cuda
+./target/release/ferroseek decode /path/to/DeepSeek-V4.1-Flash-1017 \
+    "The capital of France is" 6                 # CPU reference engine
+./target/release/ferroseek decode /path/to/DeepSeek-V4.1-Flash-1017 \
+    "The capital of France is" 6 --engine gpu --stream
 ```
 
 ## Credits
