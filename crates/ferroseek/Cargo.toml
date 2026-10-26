@@ -17,3 +17,4 @@ ferroseek-core = { path = "../ferroseek-core" }
 ferroseek-ref = { path = "../ferroseek-ref" }
 ferroseek-tokenizer = { path = "../ferroseek-tokenizer" }
 ferroseek-gpu = { path = "../ferroseek-gpu", optional = true }
+serde_json = "1.0.154"
