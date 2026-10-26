@@ -11,6 +11,7 @@ const ACTQUANT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/actquant.ptx"
 const FP8_GEMM_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fp8_gemm.ptx"));
 const FP4_ACTQUANT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fp4_actquant.ptx"));
 const FP4_EXPERT_GEMM_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fp4_expert_gemm.ptx"));
+const HC_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/hc.ptx"));
 
 pub struct Cuda {
     pub context: Context,
@@ -23,6 +24,7 @@ pub struct Cuda {
     pub fp8_gemm: Module,
     pub fp4_actquant: Module,
     pub fp4_expert_gemm: Module,
+    pub hc: Module,
 }
 
 static CUDA: Mutex<Option<Cuda>> = Mutex::new(None);
@@ -51,6 +53,7 @@ impl Cuda {
             let fp4_actquant = Module::from_ptx(FP4_ACTQUANT_PTX, &[]).expect("fp4_actquant module");
             let fp4_expert_gemm =
                 Module::from_ptx(FP4_EXPERT_GEMM_PTX, &[]).expect("fp4_expert_gemm module");
+            let hc = Module::from_ptx(HC_PTX, &[]).expect("hc module");
             *guard = Some(Cuda {
                 context,
                 device,
@@ -62,6 +65,7 @@ impl Cuda {
                 fp8_gemm,
                 fp4_actquant,
                 fp4_expert_gemm,
+                hc,
             });
         }
         // tests run on many threads; the lock holder always becomes current
@@ -633,5 +637,121 @@ mod tests {
             .map(|(g, e)| (g - e).abs() / e.abs().max(1.0))
             .fold(0.0, f32::max);
         assert!(max_rel < 1e-4, "fp4_expert_gemm max rel err {max_rel}");
+    }
+
+    #[test]
+    fn hc_block_matches_cpu_mirror() {
+        let guard = Cuda::global();
+        let cuda = guard.as_ref().unwrap();
+        let (n_tokens, hc_dim, mix_hc) = (3usize, 20480usize, 24usize);
+        let eps = 1e-6f32;
+
+        let xf = rand_vec(n_tokens * hc_dim, 555);
+        let hc_fn = rand_vec(mix_hc * hc_dim, 556);
+        let hc_base = rand_vec(mix_hc, 557);
+        let hc_scale = rand_vec(3, 558);
+
+        // CPU mirror (spec §2)
+        let mut exp_pre = vec![0.0f32; n_tokens * 4];
+        let mut exp_post = vec![0.0f32; n_tokens * 4];
+        let mut exp_comb = vec![0.0f32; n_tokens * 16];
+        for t in 0..n_tokens {
+            let x = &xf[t * hc_dim..(t + 1) * hc_dim];
+            let ms: f32 = x.iter().map(|v| v * v).sum::<f32>() / hc_dim as f32;
+            let rstd = 1.0 / (ms + 1e-20).sqrt();
+            let mut mixes = [0.0f32; 24];
+            for (row, m) in mixes.iter_mut().enumerate() {
+                let w = &hc_fn[row * hc_dim..(row + 1) * hc_dim];
+                let dot: f32 = x.iter().zip(w).map(|(a, b)| a * b).sum();
+                *m = dot * rstd;
+            }
+            let sig = |v: f32| 1.0 / (1.0 + (-v).exp());
+            for j in 0..4 {
+                exp_pre[t * 4 + j] = sig(mixes[j] * hc_scale[0] + hc_base[j]) + eps;
+                exp_post[t * 4 + j] = 2.0 * sig(mixes[4 + j] * hc_scale[1] + hc_base[4 + j]);
+            }
+            let mut comb = [0.0f32; 16];
+            for j in 0..4 {
+                for k in 0..4 {
+                    comb[j * 4 + k] = mixes[8 + j * 4 + k] * hc_scale[2] + hc_base[8 + j * 4 + k];
+                }
+            }
+            for j in 0..4 {
+                let mx = (0..4).map(|k| comb[j * 4 + k]).fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = (0..4).map(|k| (comb[j * 4 + k] - mx).exp()).sum();
+                for k in 0..4 {
+                    comb[j * 4 + k] = (comb[j * 4 + k] - mx).exp() / sum + eps;
+                }
+            }
+            for k in 0..4 {
+                let cs: f32 = (0..4).map(|j| comb[j * 4 + k]).sum::<f32>() + eps;
+                for j in 0..4 {
+                    comb[j * 4 + k] /= cs;
+                }
+            }
+            for _ in 0..19 {
+                for j in 0..4 {
+                    let rs: f32 = (0..4).map(|k| comb[j * 4 + k]).sum::<f32>() + eps;
+                    for k in 0..4 {
+                        comb[j * 4 + k] /= rs;
+                    }
+                }
+                for k in 0..4 {
+                    let cs: f32 = (0..4).map(|j| comb[j * 4 + k]).sum::<f32>() + eps;
+                    for j in 0..4 {
+                        comb[j * 4 + k] /= cs;
+                    }
+                }
+            }
+            exp_comb[t * 16..(t + 1) * 16].copy_from_slice(&comb);
+        }
+
+        let d_xf = DeviceBuffer::from_slice(&xf).unwrap();
+        let d_fn = DeviceBuffer::from_slice(&hc_fn).unwrap();
+        let d_base = DeviceBuffer::from_slice(&hc_base).unwrap();
+        let d_scale = DeviceBuffer::from_slice(&hc_scale).unwrap();
+        let mut d_pre = DeviceBuffer::from_slice(&vec![0.0; n_tokens * 4]).unwrap();
+        let mut d_post = DeviceBuffer::from_slice(&vec![0.0; n_tokens * 4]).unwrap();
+        let mut d_comb = DeviceBuffer::from_slice(&vec![0.0; n_tokens * 16]).unwrap();
+        let func = cuda.hc.get_function("hc_block").unwrap();
+        let stream = &cuda.stream;
+        unsafe {
+            launch!(
+                func<<<n_tokens as u32, 256, 0, stream>>>(
+                    d_xf.as_device_ptr(),
+                    d_fn.as_device_ptr(),
+                    d_base.as_device_ptr(),
+                    d_scale.as_device_ptr(),
+                    d_pre.as_device_ptr(),
+                    d_post.as_device_ptr(),
+                    d_comb.as_device_ptr(),
+                    n_tokens as i32,
+                    hc_dim as i32,
+                    mix_hc as i32,
+                    eps
+                )
+            )
+            .unwrap();
+        }
+        stream.synchronize().unwrap();
+        let mut got_pre = vec![0.0f32; n_tokens * 4];
+        let mut got_post = vec![0.0f32; n_tokens * 4];
+        let mut got_comb = vec![0.0f32; n_tokens * 16];
+        d_pre.copy_to(&mut got_pre).unwrap();
+        d_post.copy_to(&mut got_post).unwrap();
+        d_comb.copy_to(&mut got_comb).unwrap();
+
+        for (name, got, exp) in [
+            ("pre", &got_pre, &exp_pre),
+            ("post", &got_post, &exp_post),
+            ("comb", &got_comb, &exp_comb),
+        ] {
+            let max_err: f32 = got
+                .iter()
+                .zip(exp.iter())
+                .map(|(g, e)| (g - e).abs())
+                .fold(0.0, f32::max);
+            assert!(max_err < 1e-5, "hc {name} max err {max_err}");
+        }
     }
 }
