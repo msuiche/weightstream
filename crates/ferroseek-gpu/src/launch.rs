@@ -71,9 +71,10 @@ pub fn moe_local_slots(
     e_len: usize,
 ) {
     let f = c.moe_grouped.get_function("moe_local_slots").unwrap();
+    let stream = &c.stream;
     unsafe {
         launch!(
-            f<<<1, 1, 0, &c.stream>>>(
+            f<<<1, 1, 0, stream>>>(
                 gate_idx,
                 local_slots,
                 local_count,
@@ -106,9 +107,10 @@ pub fn expert_glu(
     top_k: usize,
 ) {
     let f = c.moe_grouped.get_function("expert_glu").unwrap();
+    let stream = &c.stream;
     unsafe {
         launch!(
-            f<<<(n as u32, top_k as u32), 256, 0, &c.stream>>>(
+            f<<<(n as u32, top_k as u32), 256, 0, stream>>>(
                 act_x, act_x_s, w1, w1_s, w3, w3_s, route_w, local_slots,
                 local_count, h_slots, n as i32, k as i32, top_k as i32
             )
@@ -129,9 +131,10 @@ pub fn expert_quant(
     top_k: usize,
 ) {
     let f = c.moe_grouped.get_function("expert_quant").unwrap();
+    let stream = &c.stream;
     unsafe {
         launch!(
-            f<<<((n / 32) as u32, top_k as u32), 32, 0, &c.stream>>>(
+            f<<<((n / 32) as u32, top_k as u32), 32, 0, stream>>>(
                 h_slots, local_slots, local_count, q_slots, s_slots,
                 n as i32, top_k as i32
             )
@@ -159,9 +162,10 @@ pub fn expert_reduce(
     e_start: usize,
 ) {
     let f = c.moe_grouped.get_function("expert_reduce").unwrap();
+    let stream = &c.stream;
     unsafe {
         launch!(
-            f<<<dim as u32, 256, 0, &c.stream>>>(
+            f<<<dim as u32, 256, 0, stream>>>(
                 act_slots, act_s_slots, w2, w2_s, gate_idx, local_slots,
                 local_count, y, dim as i32, inter as i32, top_k as i32,
                 e_start as i32
