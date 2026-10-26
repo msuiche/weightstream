@@ -24,6 +24,8 @@ pub enum Phase {
     Soak,
     #[serde(rename = "start")]
     Start,
+    #[serde(rename = "next")]
+    Next,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

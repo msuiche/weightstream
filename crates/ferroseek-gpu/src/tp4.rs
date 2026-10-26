@@ -132,6 +132,44 @@ impl Session {
         Ok(())
     }
 
+    /// Serving barrier: the head broadcasts the next request (prompt text
+    /// and token budget); workers block for it. `Ok(None)` on the worker
+    /// side means the head closed (Bye) — the caller exits.
+    pub fn next_request(
+        &mut self,
+        request: Option<serde_json::Value>,
+    ) -> io::Result<Option<serde_json::Value>> {
+        match &mut self.ctrl {
+            Ctrl::Head(h) => match request {
+                Some(req) => {
+                    h.send_go(Phase::Next, req)
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    h.collect_ready(Duration::from_secs(600))
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    Ok(Some(req))
+                }
+                None => {
+                    h.send_bye();
+                    Ok(None)
+                }
+            },
+            Ctrl::Worker(w) => match w
+                .wait_go()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+            {
+                Some((Phase::Next, cmd)) => {
+                    w.send_ready(serde_json::json!({ "rank": self.rank }))
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    Ok(Some(cmd))
+                }
+                Some((p, _)) => Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("expected Next, got {p:?}"),
+                )),
+                None => Ok(None), // head said Bye: done
+            },
+        }
+    }
     /// Clean shutdown: the head says bye; workers are done when the
     /// process exits (decode has finished by then).
     pub fn finish(&mut self) {

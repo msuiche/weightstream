@@ -156,6 +156,11 @@ fn cmd_weights(dir: Option<&String>) -> ExitCode {
 trait Decoder {
     fn decode(&mut self, token: u32, position: u64) -> std::io::Result<Vec<f32>>;
     fn set_token_map(&mut self, map: Vec<i64>);
+    /// Re-zero per-request state for the next request (serving). The CPU
+    /// reference rebuilds cheaply; the GPU engine zeroes its caches.
+    fn reset(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
     /// Transport accounting for run reports ("" when there is none).
     fn coll_stats(&self) -> String {
         String::new()
@@ -180,6 +185,9 @@ impl Decoder for ferroseek_gpu::engine::GpuModel<'static> {
     }
     fn set_token_map(&mut self, map: Vec<i64>) {
         self.set_token_map(map)
+    }
+    fn reset(&mut self) -> std::io::Result<()> {
+        ferroseek_gpu::engine::GpuModel::reset(self)
     }
     fn coll_stats(&self) -> String {
         let coll = self.comm.as_ref().map(|c| c.stats()).unwrap_or_default();
@@ -311,6 +319,7 @@ fn cmd_decode(args: &[String]) -> ExitCode {
     let mut tp_rank: Option<u8> = None;
     let mut tp_ring = String::new();
     let mut tp_port: u16 = 29871;
+    let mut prompts_file: Option<String> = None;
     let mut tp_wait_ms: u64 = 60_000;
     let mut i = 4;
     while i < args.len() {
@@ -320,6 +329,10 @@ fn cmd_decode(args: &[String]) -> ExitCode {
                     .split(',')
                     .filter_map(|s| s.trim().parse().ok())
                     .collect();
+                i += 2;
+            }
+            "--prompts-file" if i + 1 < args.len() => {
+                prompts_file = Some(args[i + 1].clone());
                 i += 2;
             }
             "--logits-out" if i + 1 < args.len() => {
@@ -446,12 +459,6 @@ fn cmd_decode(args: &[String]) -> ExitCode {
         Err(e) => eprintln!("warning: engram token map not built ({e}); identity fallback"),
     }
 
-    let ids = tk.encode(prompt);
-    if ids.is_empty() {
-        eprintln!("empty prompt");
-        return ExitCode::from(2);
-    }
-
     // Per-position gate stats: logprob of the token actually consumed,
     // its rank, and the top-1 id at that position (fp32 log-softmax).
     let mut records: Vec<String> = Vec::new();
@@ -496,56 +503,108 @@ fn cmd_decode(args: &[String]) -> ExitCode {
         }
     };
 
-    let t0 = std::time::Instant::now();
-    let mut logits = Vec::new();
-    let mut pos = 0u64;
-    for (i, &t) in ids.iter().enumerate() {
-        match model.decode(t, pos) {
-            Ok(l) => {
-                logits = l;
-                dump_raw(&logits, pos, &logits_raw);
+    // One request: prefill + greedy/forced generation. Every rank runs the
+    // same request in lockstep (the collectives require it); results print
+    // on each rank.
+    let mut run_request = |model: &mut Box<dyn Decoder>, prompt: &str| -> Option<Vec<u32>> {
+        let ids = tk.encode(prompt);
+        if ids.is_empty() {
+            eprintln!("empty prompt");
+            return None;
+        }
+        let t0 = std::time::Instant::now();
+        let mut logits = Vec::new();
+        let mut pos = 0u64;
+        for (i, &t) in ids.iter().enumerate() {
+            match model.decode(t, pos) {
+                Ok(l) => {
+                    logits = l;
+                    dump_raw(&logits, pos, &logits_raw);
+                }
+                Err(e) => {
+                    eprintln!("decode@{pos}: {e}");
+                    return None;
+                }
             }
-            Err(e) => {
-                eprintln!("decode@{pos}: {e}");
-                return ExitCode::FAILURE;
+            pos += 1;
+            if logits_out.is_some() {
+                if let Some(&consumed) = ids.get(i + 1) {
+                    record(&logits, pos, consumed, &mut records);
+                }
             }
         }
-        pos += 1;
-        // logits now predict the next token; record it when teacher-forced
-        if logits_out.is_some() {
-            if let Some(&consumed) = ids.get(i + 1) {
-                record(&logits, pos, consumed, &mut records);
-            }
-        }
-    }
-    eprintln!("prefill: {} tokens in {:?}", ids.len(), t0.elapsed());
+        eprintln!("prefill: {} tokens in {:?}", ids.len(), t0.elapsed());
 
-    let mut generated = Vec::new();
-    let mut forced = force_ids.iter();
-    for _ in 0..max_tokens {
-        let next = match forced.next() {
-            Some(&id) => id, // teacher-forced (gate mode)
-            None => ferroseek_ref::sample::argmax(&logits),
+        let mut generated = Vec::new();
+        let mut forced = force_ids.iter();
+        for _ in 0..max_tokens {
+            let next = match forced.next() {
+                Some(&id) => id, // teacher-forced (gate mode)
+                None => ferroseek_ref::sample::argmax(&logits),
+            };
+            generated.push(next);
+            record(&logits, pos, next, &mut records);
+            let t1 = std::time::Instant::now();
+            let hit_eos = force_ids.is_empty() && Some(next) == tk.eos_token_id;
+            if hit_eos {
+                break;
+            }
+            match model.decode(next, pos) {
+                Ok(l) => {
+                    logits = l;
+                    dump_raw(&logits, pos, &logits_raw);
+                }
+                Err(e) => {
+                    eprintln!("decode@{pos}: {e}");
+                    return None;
+                }
+            }
+            pos += 1;
+            eprintln!("  [{}] {} ( {:?} )", pos, tk.decode(&[next]), t1.elapsed());
+        }
+        Some(generated)
+    };
+
+    // Requests: the CLI prompt first, then --prompts-file lines. With tp4
+    // the head distributes each next request over the control channel and
+    // every rank re-zeros its per-request state (GpuModel::reset); the
+    // 5-minute load happens once for all of them.
+    let prompts: Vec<String> = match &prompts_file {
+        Some(path) => std::fs::read_to_string(path)
+            .map(|text| {
+                text.lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    let mut overall = ExitCode::SUCCESS;
+    let n_requests = 1 + prompts.len();
+    for req_i in 0..n_requests {
+        let prompt_i: String = if req_i == 0 {
+            prompt.clone()
+        } else {
+            prompts[req_i - 1].clone()
         };
-        generated.push(next);
-        record(&logits, pos, next, &mut records);
-        let t1 = std::time::Instant::now();
-        let hit_eos = force_ids.is_empty() && Some(next) == tk.eos_token_id;
-        if hit_eos {
-            break;
-        }
-        match model.decode(next, pos) {
-            Ok(l) => {
-                logits = l;
-                dump_raw(&logits, pos, &logits_raw);
-            }
-            Err(e) => {
-                eprintln!("decode@{pos}: {e}");
-                return ExitCode::FAILURE;
+        match run_request(&mut model, &prompt_i) {
+            Some(generated) => println!("---\n{}", tk.decode(&generated)),
+            None => {
+                overall = ExitCode::FAILURE;
+                break;
             }
         }
-        pos += 1;
-        eprintln!("  [{}] {} ( {:?} )", pos, tk.decode(&[next]), t1.elapsed());
+        if req_i + 1 < n_requests {
+            // reset per-request caches; every rank runs this between
+            // requests so the next prefill starts from position 0
+            if let Err(e) = model.reset() {
+                eprintln!("reset: {e}");
+                overall = ExitCode::FAILURE;
+                break;
+            }
+        }
     }
 
     let cs = model.coll_stats();
@@ -566,8 +625,7 @@ fn cmd_decode(args: &[String]) -> ExitCode {
         eprintln!("logits written to {path}");
     }
 
-    println!("---\n{}", tk.decode(&generated));
-    ExitCode::SUCCESS
+    overall
 }
 
 fn cmd_tokens(dir: Option<&String>, text: Option<&String>) -> ExitCode {

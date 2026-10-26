@@ -1228,6 +1228,57 @@ impl GpuModel<'static> {
         &self.engram
     }
 
+    /// Reset for a fresh request (serving): back to position 0 with the
+    /// same weights. Zeroes every per-request cache the decode path
+    /// writes — the kv rings, the published compressed rows, the index-key
+    /// caches, the compressor open-pair state and its NEG_INF score
+    /// sentinels, the engram hash cache, the run state — everything the
+    /// build allocates per-model but the step treats as per-request.
+    /// KV memory is preallocated at build (docs/kernels.md) and simply
+    /// re-zeroed here; positions always decode from 0.
+    pub fn reset(&mut self) -> io::Result<()> {
+        let guard = Cuda::global();
+        let c = guard
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "cuda init"))?;
+        let zero = |buf: &mut D<f32>| -> io::Result<()> {
+            let _ = buf.set_zero();
+            Ok(())
+        };
+        for buf in self.caches.kv_all.iter_mut() {
+            zero(buf)?;
+        }
+        for buf in self.caches.index_k.iter_mut() {
+            zero(buf)?;
+        }
+        for opt in self.caches.comp_kv.iter_mut() {
+            if let Some(buf) = opt {
+                zero(buf)?;
+            }
+        }
+        // comp_score's sentinel: every entry NEG_INF (the open-pair search
+        // skips scores until the first write, build's exact init)
+        for opt in self.caches.comp_score.iter_mut() {
+            if let Some(buf) = opt {
+                let _ = c.stream.synchronize();
+                let n = buf.len();
+                let host = vec![f32::NEG_INFINITY; n];
+                buf.copy_from(&host).map_err(cuda_err)?;
+            }
+        }
+        self.eng_cache.clear();
+        let n_sources = self.run.compress_len.len();
+        self.run = RunState {
+            compress_len: vec![0; n_sources],
+            index_k_src: 0,
+            candidates: Vec::new(),
+            shared_n_sel: 0,
+            capture_x: None,
+        };
+        self.pos = 0;
+        Ok(())
+    }
+
     /// Debug: capture every attention sublayer's input x (gate tooling).
     pub fn debug_capture_x(&mut self, on: bool) {
         self.run.capture_x = if on { Some(Vec::new()) } else { None };
