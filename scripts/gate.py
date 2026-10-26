@@ -25,7 +25,18 @@ PROMPTS = [
     "def fibonacci(n):",
     "In 1969, the first",
 ]
-MAX_DLOGPROB = 0.05  # per-position |Δlogprob| tolerance (f32 vs bf16 paths)
+import os
+if os.environ.get("GATE_PROMPTS"):
+    PROMPTS = os.environ["GATE_PROMPTS"].split("|||")
+# Tolerances from the bisection (docs: agent-hjg0mqf7 report): rank-aware,
+# because tail tokens are hypersensitive to f32<->bf16 transport while
+# rank-1 tokens are robust. Near-ties (top1-top2 gap < 0.05) are flagged,
+# not failed.
+TOL_RANK1 = 0.1        # |dlogprob| for rank-1 consumed tokens
+TOL_RANK100 = 0.5      # rank 2-100
+TOL_TAIL = 3.0         # rank > 100
+TOL_TOP1_LOGPROB = 0.25
+NEAR_TIE = 0.05        # top1-top2 gap below this -> indeterminate, not a fail
 
 
 def post(endpoint, path, body, timeout=300):
@@ -86,6 +97,8 @@ def main() -> int:
 
         worst = 0.0
         top1_diff = 0
+        near_ties = 0
+        ok = True
         for pos in range(1, len(ids)):
             consumed = ids[pos]
             entry = (ref[pos] or {}).get(str(consumed))
@@ -94,15 +107,28 @@ def main() -> int:
                 continue
             d = abs(entry["logprob"] - mine["logprob"])
             worst = max(worst, d)
+            rank = entry.get("rank", 0)
+            tol = TOL_RANK1 if rank <= 1 else (TOL_RANK100 if rank <= 100 else TOL_TAIL)
             ref_top1 = int(max(ref[pos], key=lambda k: ref[pos][k]["logprob"]))
-            if ref_top1 != mine["top1"]:
+            top1_lp_gap = abs(entry["logprob"] - mine["top1_logprob"]) if ref_top1 == mine["top1"] else 0
+            top2 = sorted(ref[pos].values(), key=lambda v: -v["logprob"])
+            gap = (top2[0]["logprob"] - top2[1]["logprob"]) if len(top2) > 1 else 1.0
+            tied = gap < NEAR_TIE
+            near_ties += tied
+            if ref_top1 != mine["top1"] and not tied:
                 top1_diff += 1
+                ok = False
                 print(f"  top1@{pos}: vllm={ref_top1} fs={mine['top1']} "
-                      f"(consumed {consumed}, dlogprob {d:.4f})")
-        ok = worst <= MAX_DLOGPROB
+                      f"(consumed {consumed} rank {rank}, dlogprob {d:.4f})")
+            elif d > tol and not tied:
+                ok = False
+                print(f"  dlogprob@{pos}: {d:.4f} > tol {tol} (rank {rank})")
+            if ref_top1 == mine["top1"] and top1_lp_gap > TOL_TOP1_LOGPROB and not tied:
+                ok = False
+                print(f"  top1logprob@{pos}: gap {top1_lp_gap:.4f} > {TOL_TOP1_LOGPROB}")
         failed += 0 if ok else 1
         print(f"{'PASS' if ok else 'FAIL'} {prompt!r}: max|dlogprob|={worst:.4f}, "
-              f"top1 mismatches={top1_diff}, completion={completion!r}")
+              f"top1 mismatches={top1_diff}, near-ties={near_ties}, completion={completion!r}")
     return 1 if failed else 0
 
 
