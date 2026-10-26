@@ -65,6 +65,7 @@ pub fn moe_local_slots(
     c: &Cuda,
     gate_idx: I32,
     local_slots: I32,
+    local_experts: I32,
     local_count: I32,
     top_k: usize,
     e_start: usize,
@@ -77,6 +78,7 @@ pub fn moe_local_slots(
             f<<<1, 1, 0, stream>>>(
                 gate_idx,
                 local_slots,
+                local_experts,
                 local_count,
                 top_k as i32,
                 e_start as i32,
@@ -100,6 +102,7 @@ pub fn expert_glu(
     w3_s: U8,
     route_w: F32,
     local_slots: I32,
+    local_experts: I32,
     local_count: I32,
     h_slots: F32,
     n: usize,
@@ -112,7 +115,8 @@ pub fn expert_glu(
         launch!(
             f<<<(n as u32, top_k as u32), 256, 0, stream>>>(
                 act_x, act_x_s, w1, w1_s, w3, w3_s, route_w, local_slots,
-                local_count, h_slots, n as i32, k as i32, top_k as i32
+                local_experts, local_count, h_slots, n as i32, k as i32,
+                top_k as i32
             )
         )
         .unwrap()

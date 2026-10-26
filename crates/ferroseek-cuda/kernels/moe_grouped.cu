@@ -23,29 +23,37 @@
 extern "C" __global__ void moe_local_slots(
     const int* __restrict__ gate_idx,     // [top_k] global expert ids
     int* __restrict__ local_slots,        // [top_k] slot ids, ascending expert id
+    int* __restrict__ local_experts,      // [top_k] local rows (global - e_start)
     int* __restrict__ local_count,        // [1]
     int top_k, int e_start, int e_len)
 {
     if (threadIdx.x != 0) return;
     __shared__ int ids[16];
+    __shared__ int loc[16];
     __shared__ float key[16];
     int n = 0;
     for (int s = 0; s < top_k && s < 16; s++) {
         int e = gate_idx[s];
         if (e >= e_start && e < e_start + e_len) {
-            ids[n] = s;      // slot index into the gate outputs
-            key[n] = (float)e; // sort key: global expert id
+            ids[n] = s;           // slot index into the gate outputs
+            loc[n] = e - e_start; // local expert row in the slabs
+            key[n] = (float)e;    // sort key: global expert id
             n++;
         }
     }
     // insertion sort ascending (top_k <= 6)
     for (int i = 1; i < n; i++) {
-        int vi = ids[i]; float ki = key[i];
+        int vi = ids[i]; int vl = loc[i]; float ki = key[i];
         int j = i - 1;
-        while (j >= 0 && key[j] > ki) { ids[j + 1] = ids[j]; key[j + 1] = key[j]; j--; }
-        ids[j + 1] = vi; key[j + 1] = ki;
+        while (j >= 0 && key[j] > ki) {
+            ids[j + 1] = ids[j]; loc[j + 1] = loc[j]; key[j + 1] = key[j]; j--;
+        }
+        ids[j + 1] = vi; loc[j + 1] = vl; key[j + 1] = ki;
     }
-    for (int i = 0; i < n; i++) local_slots[i] = ids[i];
+    for (int i = 0; i < n; i++) {
+        local_slots[i] = ids[i];
+        local_experts[i] = loc[i];
+    }
     *local_count = n;
 }
 
@@ -59,22 +67,29 @@ extern "C" __global__ void expert_glu(
     const uint8_t* __restrict__ w3_s,
     const float* __restrict__ route_w,   // [top_k] routing weights (scaled)
     const int* __restrict__ local_slots, // [top_k]
+    const int* __restrict__ local_experts, // [top_k] local expert rows
     const int* __restrict__ local_count, // [1]
     float* __restrict__ h_slots,         // [top_k][N]
     int N, int K, int top_k)
 {
     int slot = blockIdx.y;
     if (slot >= *local_count) return;
+    int e_loc = local_experts[slot];
     slot = local_slots[slot];
     int n = blockIdx.x;
     if (n >= N) return;
     int kb = K / 32;
+    // one expert's matrix inside the contiguous slab
+    const uint8_t* w1e = w1 + (size_t)e_loc * N * (K / 2);
+    const uint8_t* w3e = w3 + (size_t)e_loc * N * (K / 2);
+    const uint8_t* w1se = w1_s + (size_t)e_loc * N * kb;
+    const uint8_t* w3se = w3_s + (size_t)e_loc * N * kb;
 
     float acc1 = 0.0f, acc3 = 0.0f;
     for (int b = threadIdx.x; b < kb; b += blockDim.x) {
         const uint8_t* a = act_x + b * 32;
-        const uint8_t* b1 = w1 + (size_t)n * (K / 2) + b * 16;
-        const uint8_t* b3 = w3 + (size_t)n * (K / 2) + b * 16;
+        const uint8_t* b1 = w1e + (size_t)n * (K / 2) + b * 16;
+        const uint8_t* b3 = w3e + (size_t)n * (K / 2) + b * 16;
         float d1 = 0.0f, d3 = 0.0f;
 #pragma unroll
         for (int k = 0; k < 16; k++) {
@@ -85,8 +100,8 @@ extern "C" __global__ void expert_glu(
             d3 += e4m3_to_f32(a[2 * k + 1]) * FP4_TABLE[byte3 >> 4];
         }
         float sa = e8m0_to_f32(act_x_s[b]);
-        acc1 += d1 * sa * e8m0_to_f32(w1_s[(size_t)n * kb + b]);
-        acc3 += d3 * sa * e8m0_to_f32(w3_s[(size_t)n * kb + b]);
+        acc1 += d1 * sa * e8m0_to_f32(w1se[(size_t)n * kb + b]);
+        acc3 += d3 * sa * e8m0_to_f32(w3se[(size_t)n * kb + b]);
     }
     __shared__ float red[256];
     red[threadIdx.x] = acc1;
