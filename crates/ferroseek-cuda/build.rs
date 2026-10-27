@@ -54,12 +54,19 @@ fn main() {
             let stem = path.file_stem().unwrap().to_str().unwrap().to_string();
             let ptx = out_dir.join(format!("{stem}.ptx"));
             // sm_121 = GB10 (DGX Spark). PTX lets the driver JIT forward.
-            let status = Command::new(&nvcc)
-                .args(["-ptx", "-arch=compute_121", "-O3", "-o"])
-                .arg(&ptx)
-                .arg(&path)
-                .status()
-                .expect("nvcc run");
+            // moe.cu compiles with FMA contraction OFF: its gate dots must
+            // bit-match the CPU reference's unfused sequential adds — a
+            // 1-ULP contraction difference at a near-tie flipped the
+            // expert ranking and amplified to a full logit divergence
+            // (the synthetic gate's step-1/step-2 flip, root-caused by
+            // per-layer capture + dump diffing).
+            let mut cmd = Command::new(&nvcc);
+            cmd.args(["-ptx", "-arch=compute_121", "-O3"]);
+            if stem == "moe" {
+                cmd.arg("-fmad=false");
+            }
+            cmd.arg("-o").arg(&ptx).arg(&path);
+            let status = cmd.status().expect("nvcc run");
             assert!(status.success(), "nvcc failed for {}", path.display());
             built.push(stem);
         }
