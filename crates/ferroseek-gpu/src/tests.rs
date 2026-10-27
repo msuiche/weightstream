@@ -1149,8 +1149,8 @@ fn uploaded_expert_bytes_match_store_all_layers() {
         for e in 0..cfg.n_routed_experts.unwrap_or(8) as usize {
             for wname in ["w1", "w2", "w3"] {
                 let name = format!("layers.{l}.ffn.experts.{e}.{wname}");
-                let v = store.get(&format!("{name}.weight")).unwrap();
-                let s = store.get(&format!("{name}.scale")).unwrap();
+                let v: Vec<u8> = store.get(&format!("{name}.weight")).unwrap().bytes.to_vec();
+                let s: Vec<u8> = store.get(&format!("{name}.scale")).unwrap().bytes.to_vec();
                 let q4 = &gpu.layers[l].experts[e][(match wname {
                     "w1" => 0,
                     "w2" => 1,
@@ -1163,13 +1163,13 @@ fn uploaded_expert_bytes_match_store_all_layers() {
                 if host != v.bytes {
                     let first = host
                         .iter()
-                        .zip(v.bytes.iter())
+                        .zip(v.iter())
                         .position(|(a, b)| a != b)
                         .unwrap_or(0);
                     eprintln!(
                         "L{l} e{e} {wname}.weight DIFFERS: len {}/{} first@{first} gpu {:02x} store {:02x}",
                         host.len(),
-                        v.bytes.len(),
+                        v.len(),
                         host[first],
                         v.bytes[first],
                     );
@@ -1177,7 +1177,7 @@ fn uploaded_expert_bytes_match_store_all_layers() {
                 }
                 let mut hosts = vec![0u8; sd.len()];
                 sd.copy_to(&mut hosts).unwrap();
-                if hosts != s.bytes {
+                if hosts != s {
                     eprintln!("L{l} e{e} {wname}.scale DIFFERS");
                     bad += 1;
                 }
