@@ -940,7 +940,7 @@ fn indexer_wq_b_rows_vs_all_bytes_identical() {
     let cfg = mini_config();
     let weights = ferroseek_ref::store::SyntheticWeights::generate(&cfg, 42).unwrap();
     use ferroseek_ref::store::WeightStore;
-    let mut store: Box<dyn WeightStore> = Box::new(weights);
+    let mut store = weights;
     let (wv, sv) = store
         .get2(
             "layers.1.attn.indexer.wq_b.weight",
@@ -984,7 +984,7 @@ fn wo_b_cols_shard_identity_probe() {
     let cfg = mini_config();
     let weights = ferroseek_ref::store::SyntheticWeights::generate(&cfg, 42).unwrap();
     use ferroseek_ref::store::WeightStore;
-    let mut store: Box<dyn WeightStore> = Box::new(weights);
+    let mut store = weights;
     let (wv, sv) = store
         .get2("layers.1.attn.wo_b.weight", "layers.1.attn.wo_b.scale")
         .unwrap();
@@ -1030,7 +1030,7 @@ fn recompute_wo_b_adjudicates_attnout() {
     let cfg = mini_config();
     let weights = ferroseek_ref::store::SyntheticWeights::generate(&cfg, 42).unwrap();
     use ferroseek_ref::store::WeightStore;
-    let mut store: Box<dyn WeightStore> = Box::new(weights);
+    let mut store = weights;
     let (w, s) = store
         .get2("layers.1.attn.wo_b.weight", "layers.1.attn.wo_b.scale")
         .unwrap();
@@ -1075,7 +1075,7 @@ fn recompute_routed_adjudicates_yrouted() {
     let cfg = mini_config();
     let weights = ferroseek_ref::store::SyntheticWeights::generate(&cfg, 42).unwrap();
     use ferroseek_ref::store::WeightStore;
-    let mut store: Box<dyn WeightStore> = Box::new(weights);
+    let mut store = weights;
     let cfg = ferroseek_ref::config::RefConfig::from_model_config(&cfg).unwrap();
 
     let cpu_dir = "/tmp/yb2";
