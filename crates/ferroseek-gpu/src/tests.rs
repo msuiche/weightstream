@@ -1075,7 +1075,7 @@ fn recompute_routed_adjudicates_yrouted() {
     let cfg = mini_config();
     let weights = ferroseek_ref::store::SyntheticWeights::generate(&cfg, 42).unwrap();
     use ferroseek_ref::store::WeightStore;
-    let mut store: Box<dyn WeightStore> = Box::new(weights.clone());
+    let mut store: Box<dyn WeightStore> = Box::new(weights);
     let cfg = ferroseek_ref::config::RefConfig::from_model_config(&cfg).unwrap();
 
     let cpu_dir = "/tmp/yb2";
