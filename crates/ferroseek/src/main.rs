@@ -927,6 +927,9 @@ fn serve_decode(
     tk: &ferroseek_tokenizer::Tokenizer,
     prompt: &str,
     max_tokens: u32,
+    temperature: f32,
+    top_p: f32,
+    seed: u64,
     mut sink: Option<std::sync::mpsc::Sender<serve::TokenEvent>>,
 ) -> std::io::Result<()> {
     let ids = tk.encode(prompt);
@@ -942,8 +945,18 @@ fn serve_decode(
         logits = model.decode(t, pos)?;
         pos += 1;
     }
+    // every rank builds the same sampler from the same seed: logits are
+    // bit-identical across ranks, so the draws are too
+    let mut sampler = if temperature > 0.0 {
+        Some(ferroseek_ref::sample::GumbelSampler::new(seed))
+    } else {
+        None
+    };
     for _ in 0..max_tokens {
-        let next = ferroseek_ref::sample::argmax(&logits);
+        let next = match sampler.as_mut() {
+            Some(s) => s.sample_p(&logits, temperature, top_p),
+            None => ferroseek_ref::sample::argmax(&logits),
+        };
         if let Some(tx) = sink.as_ref() {
             let _ = tx.send(serve::TokenEvent::Token(tk.decode(&[next])));
         }
