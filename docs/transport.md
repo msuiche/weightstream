@@ -153,3 +153,19 @@ gate it can reorder experts and amplify to O(1) on later steps while
 both engines stay correct per their own arithmetic; post-flip steps now
 check finiteness + argmax agreement. moe.cu's `-fmad=false` was kept:
 routing is the one place a ULP crosses a comparison boundary.
+
+**6e8ebdc root-cause progress (2026-10-27, dump-walk forensics).** With
+the indexer fix in, the divergence is isolated to the GPU's routed-expert
+path at TP1, step 0, layers 1-3 (L0 bit-exact). Proven identical by
+same-run dump-diffs: gateX, gscores/gorder/gweights, the whole wo_b chain
+(recomputation adjudicates BOTH engines match), fl/act_fl quant inputs,
+engram hash ids + eflat, sparse-attn idxs, kvall overlap, the fp4/fp8
+kernels at the exact synthetic shapes, swiglu semantics, Rows/Cols shard
+byte-identity. The routed recomputation adjudicator pins it: CPU yrouted
+== recompute (0.0); GPU yrouted differs 0.258 from identical inputs. The
+staged-expert probe shows TP1 experts are DEVICE-resident (uploaded at
+build), so the suspect is the device bytes of L1-3 expert uploads vs
+L0's — next step: dump the experts' uploaded buffers and diff against
+the store (suspected offset/aliasing in the upload path at layers >= 1).
+The earlier [2,4]-vs-[4,2] gorder flip was wedged-GPU-era data; on the
+healthy GPU gorder matches everywhere.
