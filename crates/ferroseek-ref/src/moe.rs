@@ -108,6 +108,65 @@ fn expert_hidden(
     x: &[f32],
     routing_weight: f32,
 ) -> io::Result<Vec<f32>> {
+    expert_hidden_impl(cfg, ctx, p, expert, x, routing_weight)
+}
+
+/// Test seam: the same computation against a raw WeightStore (the dump
+/// adjudicator drives it without a Ctx).
+pub fn expert_hidden_for_test(
+    cfg: &RefConfig,
+    store: &mut dyn crate::store::WeightStore,
+    p: &str,
+    expert: usize,
+    x: &[f32],
+    routing_weight: f32,
+) -> io::Result<Vec<f32>> {
+    // Ctx-free mirror: the body is identical; only the fetch differs.
+    let inter = cfg.inter_dim as usize;
+    let dim = cfg.dim as usize;
+    let (gw, gs) = store.get2(
+        &format!("{p}.experts.{expert}.w1.weight"),
+        &format!("{p}.experts.{expert}.w1.scale"),
+    )?;
+    let gate = crate::actquant::fp4_gemv(gw.bytes, gs.bytes, inter, dim, x);
+    let (uw, us) = store.get2(
+        &format!("{p}.experts.{expert}.w3.weight"),
+        &format!("{p}.experts.{expert}.w3.scale"),
+    )?;
+    let up = crate::actquant::fp4_gemv(uw.bytes, us.bytes, inter, dim, x);
+    let limit = cfg.swiglu_limit;
+    let mut h = vec![0.0f32; inter];
+    for i in 0..inter {
+        let u = if limit > 0.0 {
+            up[i].clamp(-limit, limit)
+        } else {
+            up[i]
+        };
+        let g = if limit > 0.0 {
+            gate[i].min(limit)
+        } else {
+            gate[i]
+        };
+        h[i] = num::silu(g) * u * routing_weight;
+    }
+    let (w2, s2) = store.get2(
+        &format!("{p}.experts.{expert}.w2.weight"),
+        &format!("{p}.experts.{expert}.w2.scale"),
+    )?;
+    Ok(crate::actquant::fp4_gemv(
+        w2.bytes, s2.bytes, dim, inter, &h,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expert_hidden_impl(
+    cfg: &RefConfig,
+    ctx: &mut Ctx<'_>,
+    p: &str,
+    expert: usize,
+    x: &[f32],
+    routing_weight: f32,
+) -> io::Result<Vec<f32>> {
     let inter = cfg.inter_dim as usize;
     let dim = cfg.dim as usize;
     let (gw, gs) = ctx.get2(

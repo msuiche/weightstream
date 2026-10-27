@@ -1065,3 +1065,70 @@ fn recompute_wo_b_adjudicates_attnout() {
         );
     }
 }
+
+#[test]
+fn recompute_routed_adjudicates_yrouted() {
+    // The routed path diverges at S0 L1 (yrouted 0.26) with identical
+    // gateX/gorder/gweights. Recompute the routed sum from the synthetic
+    // weights + the dumped routing via the CPU's own expert_hidden and
+    // compare against both engines' yrouted dumps.
+    let cfg = mini_config();
+    let weights = ferroseek_ref::store::SyntheticWeights::generate(&cfg, 42).unwrap();
+    use ferroseek_ref::store::WeightStore;
+    let mut store: Box<dyn WeightStore> = Box::new(weights.clone());
+    let cfg = ferroseek_ref::config::RefConfig::from_model_config(&cfg).unwrap();
+
+    let cpu_dir = "/tmp/yb2";
+    let gpu_dir = "/tmp/yb2/gpu";
+    let readf = |p: &std::path::Path| -> Vec<f32> {
+        let b = std::fs::read(p).unwrap();
+        b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
+    let gate_x = readf(std::path::Path::new(&format!(
+        "{cpu_dir}/d_pos0_gateX1.f32"
+    )));
+    let gorder: Vec<i32> = std::fs::read(format!("{cpu_dir}/d_pos0_gorder1.i32"))
+        .unwrap()
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let gw: Vec<f32> = readf(std::path::Path::new(&format!(
+        "{cpu_dir}/d_pos0_gweights1.f32"
+    )));
+
+    let dim = cfg.dim as usize;
+    let mut expect = vec![0.0f32; dim];
+    // the CPU moe applies route_scale to the normalized weights at emit;
+    // gweights dumps carry the FINAL (scaled) weights already
+    for (&e, &w) in gorder.iter().zip(gw.iter()) {
+        let mut h = ferroseek_ref::moe::expert_hidden_for_test(
+            &cfg,
+            &mut store,
+            "layers.1.ffn",
+            e as usize,
+            &gate_x,
+            w,
+        )
+        .unwrap();
+        for d in 0..dim {
+            expect[d] += h[d];
+        }
+        let _ = &mut h;
+    }
+    for (tag, dir) in [("cpu", cpu_dir), ("gpu", gpu_dir)] {
+        let p = std::path::Path::new(dir).join("d_pos0_yrouted1.f32");
+        if !p.exists() {
+            eprintln!("{tag}: no yrouted dump");
+            continue;
+        }
+        let got = readf(&p);
+        let d: f32 = got
+            .iter()
+            .zip(&expect)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        eprintln!("{tag} yrouted vs recompute: maxdiff {d:.3e}");
+    }
+}
