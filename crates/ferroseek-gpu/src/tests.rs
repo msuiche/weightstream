@@ -1347,7 +1347,7 @@ fn moe_gate_m_and_rmsnorm_m_bitexact() {
         .collect();
     let gate_w: Vec<u16> = rand_vec(n_experts * dim, 29)
         .iter()
-        .map(|&v| ferroseek_core::num::f32_to_bf16((v % 2.0 - 1.0) * 0.25))
+        .map(|&v| ferroseek_core::quant::f32_to_bf16((v % 2.0 - 1.0) * 0.25))
         .collect();
     let bias: Vec<f32> = rand_vec(n_experts, 31).iter().map(|v| v * 0.1).collect();
     let d_x = DeviceBuffer::from_slice(&x).unwrap();
