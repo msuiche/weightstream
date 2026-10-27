@@ -929,3 +929,47 @@ fn gpu_step1_layer0_y_bisect() {
         }
     }
 }
+
+#[test]
+fn indexer_wq_b_rows_vs_all_bytes_identical() {
+    // hybrid bisect isolated the e834f0c regression to the indexer wq_b's
+    // Rows shard at TP1. Rows{0, full} should be byte-identity with All —
+    // assert it directly on the synthetic shapes to see which byte moves.
+    let cfg = mini_config();
+    let weights = ferroseek_ref::store::SyntheticWeights::generate(&cfg, 42).unwrap();
+    use ferroseek_ref::store::WeightStore;
+    let mut store: Box<dyn WeightStore> = Box::new(weights);
+    let (wv, sv) = store
+        .get2(
+            "layers.1.attn.indexer.wq_b.weight",
+            "layers.1.attn.indexer.wq_b.scale",
+        )
+        .unwrap();
+    eprintln!(
+        "indexer wq_b: weight shape {:?} ({} bytes), scale shape {:?} ({} bytes)",
+        wv.shape,
+        wv.bytes.len(),
+        sv.shape,
+        sv.bytes.len()
+    );
+    // TP1 shard: start 0, len = full rows
+    let (rows, cols) = (wv.shape[0], wv.shape[1]);
+    let full = crate::engine::WShard::Rows {
+        start: 0,
+        len: rows,
+    };
+    let all = crate::engine::WShard::All;
+    let wa = crate::engine::shard_weight_pub(wv.bytes, &wv.shape, all).unwrap();
+    let wr = crate::engine::shard_weight_pub(wv.bytes, &wv.shape, full).unwrap();
+    eprintln!("weight All==Rows bytes: {}", wa.as_slice() == wr.as_slice());
+    let sa = crate::engine::shard_scale_pub(sv.bytes, &sv.shape, all).unwrap();
+    let sr = crate::engine::shard_scale_pub(sv.bytes, &sv.shape, full).unwrap();
+    eprintln!(
+        "scale All len {} bytes, Rows len {} bytes, equal: {}",
+        sa.as_slice().len(),
+        sr.as_slice().len(),
+        sa.as_slice() == sr.as_slice()
+    );
+    assert_eq!(sa.as_slice(), sr.as_slice(), "scale differs!");
+    assert_eq!(wa.as_slice(), wr.as_slice(), "weight differs!");
+}

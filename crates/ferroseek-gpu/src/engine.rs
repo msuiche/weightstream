@@ -164,6 +164,23 @@ impl Sharded<'_> {
 /// Slice a row-major fp8 weight's payload per `shard`. `view` gives the
 /// logical [rows, cols]; the scale tile is 32 (spec §12).
 fn shard_weight<'b>(view: &'b [u8], shape: &[usize], shard: WShard) -> io::Result<Sharded<'b>> {
+    shard_weight_impl(view, shape, shard)
+}
+
+/// Test seam: the same fn, pub for the byte-identity probe.
+pub fn shard_weight_pub<'b>(
+    view: &'b [u8],
+    shape: &[usize],
+    shard: WShard,
+) -> io::Result<Sharded<'b>> {
+    shard_weight_impl(view, shape, shard)
+}
+
+fn shard_weight_impl<'b>(
+    view: &'b [u8],
+    shape: &[usize],
+    shard: WShard,
+) -> io::Result<Sharded<'b>> {
     if shard.is_all() {
         return Ok(Sharded::All(view));
     }
@@ -204,6 +221,19 @@ fn shard_weight<'b>(view: &'b [u8], shape: &[usize], shard: WShard) -> io::Resul
 /// Slice the matching ue8m0 scale payload (`[rows/32, cols/32]`) the same
 /// way, keeping the shard's weight tiles aligned with their scale tiles.
 fn shard_scale<'b>(view: &'b [u8], shape: &[usize], shard: WShard) -> io::Result<Sharded<'b>> {
+    shard_scale_impl(view, shape, shard)
+}
+
+/// Test seam: the same fn, pub for the byte-identity probe.
+pub fn shard_scale_pub<'b>(
+    view: &'b [u8],
+    shape: &[usize],
+    shard: WShard,
+) -> io::Result<Sharded<'b>> {
+    shard_scale_impl(view, shape, shard)
+}
+
+fn shard_scale_impl<'b>(view: &'b [u8], shape: &[usize], shard: WShard) -> io::Result<Sharded<'b>> {
     if shard.is_all() {
         return Ok(Sharded::All(view));
     }
