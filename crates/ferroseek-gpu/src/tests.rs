@@ -852,7 +852,7 @@ fn gpu_engine_matches_cpu_reference_per_layer() {
     for (p, &t) in TOKENS.iter().enumerate() {
         let _ = cpu.decode(t, p as u64).unwrap();
         let _ = gpu.decode(t, p as u64).unwrap();
-        if p < 2 {
+        if p < 3 {
             let cx = cpu.debug_take_captures();
             let gx = gpu.debug_take_captures();
             // re-arm both (take() drains)
