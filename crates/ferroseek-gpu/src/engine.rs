@@ -1720,7 +1720,7 @@ impl GpuModel<'static> {
                             c,
                             &s.eflat,
                             ncols * ehd,
-                            format!("d_pos{}_eflat{l}.f32", crate::dump::pos()),
+                            format!("d_pos{}_eflat{}.f32", crate::dump::pos(), layer.layer),
                         );
                     }
                     _ => {
