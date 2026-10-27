@@ -3212,6 +3212,12 @@ fn moe_step(
             }
             let [w1, w2, w3] = &layer.experts[e - e_start];
             let (w1d, w1sd) = (w1.w.stage(c, arena)?, w1.s.stage(c, arena)?);
+            dump_u8(
+                c,
+                &w1d,
+                w1d.len(),
+                format!("d_pos{}_expW1_{}_{l}.u8", crate::dump::pos(), e),
+            );
             let (w3d, w3sd) = (w3.w.stage(c, arena)?, w3.s.stage(c, arena)?);
             k::fp4_gemm(
                 c,
