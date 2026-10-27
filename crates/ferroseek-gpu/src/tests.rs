@@ -869,3 +869,37 @@ fn gpu_engine_matches_cpu_reference_per_layer() {
         }
     }
 }
+
+#[test]
+fn gpu_step1_layer0_y_bisect() {
+    // The engine gate's flip is born in layer 0's FFN at step 1 (per-layer
+    // capture test). Dump both engines' layer-0 y (moe output) at step 1
+    // via the built-in d_pos*_y0 dump and diff the first element to differ.
+    let mut cpu = ref_model(42);
+    let mut gpu = gpu_model(42);
+    // step 0 clean, step 1 diverges
+    for (p, &t) in TOKENS.iter().enumerate().take(2) {
+        let cl = cpu.decode(t, p as u64).unwrap();
+        let gl = gpu.decode(t, p as u64).unwrap();
+        let d = max_abs_diff(&cl, &gl);
+        eprintln!("step {p}: logits diff {d:.3e}");
+    }
+    // both engines wrote d_pos1_y0.f32 into FERROSEEK_DUMP; the test
+    // compares them out-of-band (the dirs differ per engine — the env is
+    // process-wide, so run the CPU first in its own process; here we
+    // verify the GPU dump exists and print its head)
+    let dir = std::env::var_os("FERROSEEK_DUMP_GPU").map(std::path::PathBuf::from);
+    if let Some(d) = dir {
+        let p = d.join("d_pos1_y0.f32");
+        if p.exists() {
+            let b = std::fs::read(&p).unwrap();
+            let v: Vec<f32> = b
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            eprintln!("gpu y0 head: {:?}", &v[..8.min(v.len())]);
+        } else {
+            eprintln!("no gpu dump at {:?}", p);
+        }
+    }
+}
