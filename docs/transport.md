@@ -196,7 +196,28 @@ process):** step-0 clean (7e-7), step-1 flips exactly once at 2.395e-3
 argmax diverges. Cross-run dump comparisons are UNRELIABLE for this
 (divergent gateX/q/kvall with identical logits is self-contradictory —
 the pairing itself is flawed); the honest instrument is single-process
-single-test dump runs. The flip is a single boundary-adjacent value at
-step 1 — same class as the two fixed above. Next: bisect the S1 flip
 with the capture-x test extended past layer 1, no suite, no cross-run
 pairs.
+
+**S1-flip forensics (2026-10-28, close of series).** The in-process
+capture bisector (capture_x + capture_y on both engines — new permanent
+tooling) pins the flip precisely: step 1, layer 3's MoE output, 4.807e-3,
+with every attention input clean that step. Kernel-by-kernel elimination
+closed every remaining suspect at its exact shape: fp8_gemm at the
+shared expert's m1/n256/k64 with tiled scales (new test), fp8_gemm at
+wo_b's K=32, both tiles at the synthetic MoE shapes, the snap kernels'
+scale rules (bit-form ceil(log2) everywhere), swiglu semantics, the
+routed adjudicator. Shared-expert contribution y−yrouted diverges
+exactly at the flip.
+
+What remains does not reconcile: memcheck 0 errors, initcheck 0 errors,
+yet the flip's downstream argmax agreement VARIES between runs of the
+identical single-test binary (S2 agrees in some runs, diverges in
+others), and initcheck serialization trips a DIFFERENT failure (an
+engram hash row out of bounds) that normal runs never produce. With
+both sanitizers clean and the arithmetic proven piecewise, the residual
+points at the box itself — this GB10 took two reboots this session
+after Xid-13 storms; a full power cycle is the next diagnostic, then
+re-run the gate alone. The gate is NOT marked green; the flip is real
+but its run-to-run behavior is not arithmetic. The production path
+(upload-mode TP4, ring-gated ` Paris.` bit-exact) is unaffected.
