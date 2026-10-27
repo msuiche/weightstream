@@ -170,20 +170,33 @@ the store (suspected offset/aliasing in the upload path at layers >= 1).
 The earlier [2,4]-vs-[4,2] gorder flip was wedged-GPU-era data; on the
 healthy GPU gorder matches everywhere.
 
-**Post-reboot update (2026-10-27, late).** The byte audit (new test)
-cleared the expert-upload hypothesis too: every layer's uploaded w1/
-w2/w3 weight+scale bytes match the store exactly. Fresh Xid 13/43 after
-the reboot forced a second one; compute-sanitizer memcheck on the clean
-GPU reports **0 memory errors** across the gate — no kernel OOB. The
-refined live signal: the first material divergence is L1-3's MoE gate
-INPUT (gateX, 0.37-0.54) at step 0 (L0 bit-exact end to end), while the
-attention chain feeding it was adjudicated equal by recomputation, and
-the act-quant of the SAME gateX then diverges wildly — arithmetic that
-cannot both be true of one deterministic run. Combined with the
-divergence MOVING between dump generations (different runs of the same
-binary), the evidence now points at a **host-side race** — the pinned
-staging buffers, the rayon engram gather's `wt/st` slice borrows, or
-scratch reuse across the attention's inline stages — not arithmetic.
-Next session: bisect with dump pairs generated within a single run
-(per-tensor ordering), and audit `Scratch`'s coll/gate/small-stage
-lifetimes against the rayon gather.
+**SOLVED (2026-10-28): the Xid 13 + 'moving divergence' were one bug —
+misaligned vectorized loads.** compute-sanitizer on the FULL suite (not
+per-test: the fault poisoned the channel for every LATER test, which is
+why solo runs passed) caught 622 invalid 16-byte global reads in
+`fp8_gemm` from `attention_step`: streaming mode hands kernels device
+pointers into registered safetensors shards, which align tensors at 8
+bytes — the uint4 vectorization demanded 16. Upload mode (cudaMalloc,
+256-aligned) never faulted, so TP4 was clean while the streaming test
+poisoned the suite. The earlier moe_grouped 'illegal access' revert was
+this same class. Fix: every vectorized load site (fp8_gemm,
+fp4_expert_gemm, both tiles) checks 16-alignment at runtime and falls
+back to the bit-identical byte loop. Memcheck now: 0 errors.
+
+**SOLVED (2026-10-28): two latent scale-boundary bugs** found while
+hunting the residual step-1 flip: `act_quant_ue8m0_snap` and
+`fp4_actquant`'s e8m0 path still computed ceil(log2) with
+`exp2f(ceilf(log2f(...)))` — the exact integer-boundary rounding pitfall
+the repo documents in act_quant_fp8_emit, which uses the bit-extract
+form. Both now match the CPU's log2_ceil bit-exactly.
+
+**Remaining (deterministic, reproducible 3x with the gate ALONE in the
+process):** step-0 clean (7e-7), step-1 flips exactly once at 2.395e-3
+(argmax stable), step-2 amplifies 1.5e-1 (argmax stable), step-3
+argmax diverges. Cross-run dump comparisons are UNRELIABLE for this
+(divergent gateX/q/kvall with identical logits is self-contradictory —
+the pairing itself is flawed); the honest instrument is single-process
+single-test dump runs. The flip is a single boundary-adjacent value at
+step 1 — same class as the two fixed above. Next: bisect the S1 flip
+with the capture-x test extended past layer 1, no suite, no cross-run
+pairs.
