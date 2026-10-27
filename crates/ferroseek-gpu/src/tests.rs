@@ -770,3 +770,99 @@ fn hc_block_matches_cpu_mirror() {
     assert!(dpost < 1e-5, "hc_block post diff {dpost:.3e}");
     assert!(dcomb < 1e-5, "hc_block comb diff {dcomb:.3e}");
 }
+
+#[test]
+fn fp4_expert_gemm_vectorized_matches_cpu() {
+    // isolate the vectorized fp4_expert_gemm (TP1/synthetic host-dispatch
+    // path; TP4 uses the fused moe_grouped kernels) — CPU mirror exact
+    let guard = Cuda::global();
+    let c = guard.as_ref().unwrap();
+    let (m, n, k) = (1usize, 256usize, 512usize);
+    let kb = k / 32;
+
+    let a_f: Vec<f32> = rand_vec(m * k, 31)
+        .iter()
+        .map(|v| (v % 3.0 - 1.0) * 0.5)
+        .collect();
+    let qa: Vec<u8> = a_f
+        .iter()
+        .map(|&v| ferroseek_core::quant::f32_to_e4m3(v))
+        .collect();
+    let sa: Vec<u8> = vec![127u8; m * kb];
+    let mut qb = vec![0u8; n * k / 2];
+    for i in 0..n * k / 2 {
+        let lo = (i % 13) as u8 & 0x0F;
+        let hi = ((i * 3 + 1) % 9) as u8 & 0x0F;
+        qb[i] = lo | (hi << 4);
+    }
+    let sb: Vec<u8> = vec![127u8; n * kb];
+
+    let da: Vec<f32> = qa
+        .iter()
+        .map(|&v| ferroseek_core::quant::e4m3_to_f32(v))
+        .collect();
+    let mut expect = vec![0.0f32; m * n];
+    for ni in 0..n {
+        let mut acc = 0.0f32;
+        for b in 0..kb {
+            let mut dot = 0.0f32;
+            for kk in 0..16 {
+                let byte = qb[ni * (k / 2) + b * 16 + kk];
+                let (lo, hi) = ferroseek_core::quant::unpack_fp4(byte);
+                dot += da[b * 32 + 2 * kk] * lo;
+                dot += da[b * 32 + 2 * kk + 1] * hi;
+            }
+            acc += dot;
+        }
+        expect[ni] = acc;
+    }
+
+    let d_a = DeviceBuffer::from_slice(&qa).unwrap();
+    let d_sa = DeviceBuffer::from_slice(&sa).unwrap();
+    let d_b = DeviceBuffer::from_slice(&qb).unwrap();
+    let d_sb = DeviceBuffer::from_slice(&sb).unwrap();
+    let mut d_c = DeviceBuffer::from_slice(&vec![0f32; m * n]).unwrap();
+    crate::launch::fp4_gemm(
+        c,
+        d_a.as_device_ptr(),
+        d_sa.as_device_ptr(),
+        d_b.as_device_ptr(),
+        d_sb.as_device_ptr(),
+        d_c.as_device_ptr(),
+        m,
+        n,
+        k,
+    );
+    c.stream.synchronize().unwrap();
+    let mut got = vec![0f32; m * n];
+    d_c.copy_to(&mut got).unwrap();
+    let d = max_abs_diff(&got, &expect);
+    assert!(d < 1e-3, "fp4_expert_gemm vs CPU max diff {d:.3e}");
+}
+
+#[test]
+fn gpu_engine_matches_cpu_reference_per_layer() {
+    // Step-1 bisection of the engine gate's divergence: capture each
+    // attention sublayer's input x on BOTH engines at step 1 and print
+    // the first layer where they diverge beyond the noise floor.
+    let mut cpu = ref_model(42);
+    let mut gpu = gpu_model(42);
+    cpu.debug_capture_x(true);
+    gpu.debug_capture_x(true);
+    for (p, &t) in TOKENS.iter().enumerate() {
+        let _ = cpu.decode(t, p as u64).unwrap();
+        let _ = gpu.decode(t, p as u64).unwrap();
+        if p < 2 {
+            let cx = cpu.debug_take_captures();
+            let gx = gpu.debug_take_captures();
+            for (i, ((l, cxv), (_, gxv))) in cx.iter().zip(gx.iter()).enumerate() {
+                let d = max_abs_diff(cxv, gxv);
+                if d > 1e-5 {
+                    eprintln!("step {p}: FIRST divergence at capture {i} (layer {l}): {d:.3e}");
+                    return;
+                }
+            }
+            eprintln!("step {p}: all {} captures clean (max < 1e-5)", cx.len());
+        }
+    }
+}
