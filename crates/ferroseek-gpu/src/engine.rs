@@ -2968,6 +2968,13 @@ fn attention_step(
         og * ol,
     );
     dump_dev(c, &s.fl, og * ol, format!("d_pos{pos}_fl{l}.f32"));
+    dump_u8(c, &s.act_fl, og * ol, format!("d_pos{pos}_actfl{l}.u8"));
+    dump_u8(
+        c,
+        &s.act_fl_s,
+        (og * ol) / 32,
+        format!("d_pos{pos}_actflS{l}.u8"),
+    );
     k::fp8_gemm(
         c,
         k::base(&s.act_fl),
