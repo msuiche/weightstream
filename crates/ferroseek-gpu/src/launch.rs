@@ -186,6 +186,13 @@ pub fn rmsnorm(c: &Cuda, x: F32, w: F32, out: F32, dim: usize, eps: f32) {
     unsafe { launch!(f<<<1u32, 256, 0, stream>>>(x, w, out, dim as i32, eps)).unwrap() }
 }
 
+/// `rmsnorm`, M rows: the kernel already indexes rows by blockIdx.x.
+pub fn rmsnorm_m(c: &Cuda, x: F32, w: F32, out: F32, n_rows: usize, dim: usize, eps: f32) {
+    let f = c.norm.get_function("rmsnorm").unwrap();
+    let stream = &c.stream;
+    unsafe { launch!(f<<<n_rows as u32, 256, 0, stream>>>(x, w, out, dim as i32, eps)).unwrap() }
+}
+
 /// `rope` (rope.cu): rows are positions (`pos_offset + row`).
 pub fn rope(
     c: &Cuda,
@@ -229,6 +236,30 @@ pub fn rope_uniform_pos(
         launch!(
             f<<<(gx(rope_dim / 2, 32), n_rows as u32), 32, 0, stream>>>(
                 x, cos, sin, n_rows as i32, dim as i32, rope_dim as i32, pos as i32, conj as i32
+            )
+        )
+        .unwrap()
+    }
+}
+
+/// `rope_uniform_pos_buf` (rope.cu): per-row positions (M-batch decode).
+pub fn rope_uniform_pos_buf(
+    c: &Cuda,
+    x: F32,
+    cos: F32,
+    sin: F32,
+    pos_per_row: I32,
+    n_rows: usize,
+    dim: usize,
+    rope_dim: usize,
+    conj: bool,
+) {
+    let f = c.rope.get_function("rope_uniform_pos_buf").unwrap();
+    let stream = &c.stream;
+    unsafe {
+        launch!(
+            f<<<(gx(rope_dim / 2, 32), n_rows as u32), 32, 0, stream>>>(
+                x, cos, sin, pos_per_row, n_rows as i32, dim as i32, rope_dim as i32, conj as i32
             )
         )
         .unwrap()
@@ -468,6 +499,34 @@ pub fn sparse_attn(
     }
 }
 
+/// `sparse_attn_m` (attn.cu): M-batch sparse attention — grid (n_heads, m),
+/// bit-identical to m sequential sparse_attn calls per (head, position).
+#[allow(clippy::too_many_arguments)]
+pub fn sparse_attn_m(
+    c: &Cuda,
+    q: F32,
+    kv: F32,
+    idxs: I32,
+    sink: F32,
+    out: F32,
+    n_heads: usize,
+    dim: usize,
+    n_sel: usize,
+    m: usize,
+    scale: f32,
+) {
+    let f = c.attn.get_function("sparse_attn_m").unwrap();
+    let stream = &c.stream;
+    unsafe {
+        launch!(
+            f<<<(n_heads as u32, m as u32), 128, 0, stream>>>(
+                q, kv, idxs, sink, out, n_heads as i32, dim as i32, n_sel as i32, scale
+            )
+        )
+        .unwrap()
+    }
+}
+
 /// `moe_gate` (moe.cu): per-expert parallel gate scoring, one block/expert.
 pub fn moe_gate(
     c: &Cuda,
@@ -483,6 +542,29 @@ pub fn moe_gate(
     unsafe {
         launch!(
             f<<<n_experts as u32, 256, 0, stream>>>(
+                x, gate_w, bias, scores, dim as i32, n_experts as i32
+            )
+        )
+        .unwrap()
+    }
+}
+
+/// `moe_gate_m` (moe.cu): M-batch gate scoring — grid (n_experts, m).
+pub fn moe_gate_m(
+    c: &Cuda,
+    x: F32,
+    gate_w: U16,
+    bias: F32,
+    scores: F32,
+    m: usize,
+    dim: usize,
+    n_experts: usize,
+) {
+    let f = c.moe.get_function("moe_gate_m").unwrap();
+    let stream = &c.stream;
+    unsafe {
+        launch!(
+            f<<<(n_experts as u32, m as u32), 256, 0, stream>>>(
                 x, gate_w, bias, scores, dim as i32, n_experts as i32
             )
         )

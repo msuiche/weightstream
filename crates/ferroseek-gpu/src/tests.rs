@@ -1169,3 +1169,259 @@ fn qa_dequant(q: &[u8]) -> Vec<f32> {
         .map(|&v| ferroseek_core::quant::e4m3_to_f32(v))
         .collect()
 }
+
+#[test]
+fn sparse_attn_m_bitexact_vs_sequential() {
+    // The M-batch attention kernel must be bit-identical to m sequential
+    // sparse_attn calls: grid (n_heads, m) runs the same per-block
+    // arithmetic for each (head, position) pair. Causal idx lists:
+    // position i selects a growing window, -1-padded to n_sel.
+    let guard = Cuda::global();
+    let c = guard.as_ref().unwrap();
+    let (n_heads, dim, n_sel, m, n_rows) = (8usize, 512usize, 24usize, 4usize, 40usize);
+    let scale = 0.0625f32;
+
+    let kv: Vec<f32> = rand_vec(n_rows * dim, 7)
+        .iter()
+        .map(|v| (v % 2.0 - 1.0) * 0.5)
+        .collect();
+    let q: Vec<f32> = rand_vec(m * n_heads * dim, 11)
+        .iter()
+        .map(|v| (v % 2.0 - 1.0) * 0.5)
+        .collect();
+    let sink: Vec<f32> = rand_vec(n_heads, 13).iter().map(|v| v * 0.25).collect();
+    // causal: position i sees rows [0..6+i*3) then -1 padding
+    let mut idxs = vec![-1i32; m * n_sel];
+    for pos in 0..m {
+        let seen = 6 + pos * 3;
+        for j in 0..seen.min(n_sel) {
+            idxs[pos * n_sel + j] = j as i32;
+        }
+    }
+
+    let d_kv = DeviceBuffer::from_slice(&kv).unwrap();
+    let d_q = DeviceBuffer::from_slice(&q).unwrap();
+    let d_idxs = DeviceBuffer::from_slice(&idxs).unwrap();
+    let d_sink = DeviceBuffer::from_slice(&sink).unwrap();
+
+    // batched: one launch
+    let mut d_out_m = DeviceBuffer::from_slice(&vec![0f32; m * n_heads * dim]).unwrap();
+    crate::launch::sparse_attn_m(
+        c,
+        d_q.as_device_ptr(),
+        d_kv.as_device_ptr(),
+        d_idxs.as_device_ptr(),
+        d_sink.as_device_ptr(),
+        d_out_m.as_device_ptr(),
+        n_heads,
+        dim,
+        n_sel,
+        m,
+        scale,
+    );
+    c.stream.synchronize().unwrap();
+    let mut got = vec![0f32; m * n_heads * dim];
+    d_out_m.copy_to(&mut got).unwrap();
+
+    // sequential: m launches of the m=1 kernel on the same inputs
+    let mut expect = vec![0f32; m * n_heads * dim];
+    for pos in 0..m {
+        let q_pos = &q[pos * n_heads * dim..(pos + 1) * n_heads * dim];
+        let i_pos = &idxs[pos * n_sel..(pos + 1) * n_sel];
+        let d_qp = DeviceBuffer::from_slice(q_pos).unwrap();
+        let d_ip = DeviceBuffer::from_slice(i_pos).unwrap();
+        let mut d_op = DeviceBuffer::from_slice(&vec![0f32; n_heads * dim]).unwrap();
+        crate::launch::sparse_attn(
+            c,
+            d_qp.as_device_ptr(),
+            d_kv.as_device_ptr(),
+            d_ip.as_device_ptr(),
+            d_sink.as_device_ptr(),
+            d_op.as_device_ptr(),
+            n_heads,
+            dim,
+            n_sel,
+            scale,
+        );
+        c.stream.synchronize().unwrap();
+        d_op.copy_to(&mut expect[pos * n_heads * dim..(pos + 1) * n_heads * dim])
+            .unwrap();
+    }
+
+    assert_eq!(
+        got, expect,
+        "sparse_attn_m diverged from sequential sparse_attn"
+    );
+    eprintln!(
+        "sparse_attn_m: bit-identical across {m} positions x {n_heads} heads (n_sel {n_sel})"
+    );
+}
+
+#[test]
+fn rope_uniform_pos_buf_bitexact_vs_scalar() {
+    // Per-row rope positions must be bit-identical to per-position scalar
+    // launches: same rotation arithmetic, position read from a buffer.
+    let guard = Cuda::global();
+    let c = guard.as_ref().unwrap();
+    let (n_rows, dim, rope_dim, base_pos) = (12usize, 128usize, 64usize, 100usize);
+    let x: Vec<f32> = rand_vec(n_rows * dim, 17)
+        .iter()
+        .map(|v| (v % 2.0 - 1.0) * 0.75)
+        .collect();
+    // rope tables: [max_pos, rope_dim/2]
+    let max_pos = 256usize;
+    let half = rope_dim / 2;
+    let cos_t: Vec<f32> = (0..max_pos * half)
+        .map(|i| ((i % 97) as f32 * 0.0103).cos())
+        .collect();
+    let sin_t: Vec<f32> = (0..max_pos * half)
+        .map(|i| ((i % 97) as f32 * 0.0103).sin())
+        .collect();
+    // positions: 4 tokens x 3 rows each (heads share a token's position)
+    let pos_per_row: Vec<i32> = (0..n_rows).map(|r| (base_pos + r / 3) as i32).collect();
+
+    let d_cos = DeviceBuffer::from_slice(&cos_t).unwrap();
+    let d_sin = DeviceBuffer::from_slice(&sin_t).unwrap();
+    let d_pos = DeviceBuffer::from_slice(&pos_per_row).unwrap();
+
+    // batched: one launch
+    let mut d_xb = DeviceBuffer::from_slice(&x).unwrap();
+    crate::launch::rope_uniform_pos_buf(
+        c,
+        d_xb.as_device_ptr(),
+        d_cos.as_device_ptr(),
+        d_sin.as_device_ptr(),
+        d_pos.as_device_ptr(),
+        n_rows,
+        dim,
+        rope_dim,
+        false,
+    );
+    c.stream.synchronize().unwrap();
+    let mut got = vec![0f32; n_rows * dim];
+    d_xb.copy_to(&mut got).unwrap();
+
+    // sequential: one scalar launch per distinct position over its rows
+    let mut d_xs = DeviceBuffer::from_slice(&x).unwrap();
+    for tok in 0..(n_rows / 3) {
+        // rows [3*tok, 3*tok+3) rotate at base_pos+tok — launch on the
+        // sub-slice via raw offset (3 contiguous rows)
+        let off = tok * 3 * dim;
+        let ptr = unsafe { d_xs.as_device_ptr().offset(off as isize) };
+        crate::launch::rope_uniform_pos(
+            c,
+            ptr,
+            d_cos.as_device_ptr(),
+            d_sin.as_device_ptr(),
+            3,
+            dim,
+            rope_dim,
+            (base_pos + tok) as u64,
+            false,
+        );
+    }
+    c.stream.synchronize().unwrap();
+    let mut expect = vec![0f32; n_rows * dim];
+    d_xs.copy_to(&mut expect).unwrap();
+
+    assert_eq!(
+        got, expect,
+        "rope_uniform_pos_buf diverged from scalar launches"
+    );
+    eprintln!("rope_uniform_pos_buf: bit-identical over {n_rows} rows / 4 positions");
+}
+
+#[test]
+fn moe_gate_m_and_rmsnorm_m_bitexact() {
+    // moe_gate_m: grid (experts, m), same per-block reduction — bit-exact
+    // vs m sequential moe_gate calls. rmsnorm_m: the kernel already
+    // indexes rows by blockIdx.x — bit-exact vs per-row launches.
+    let guard = Cuda::global();
+    let c = guard.as_ref().unwrap();
+
+    // --- moe_gate_m ---
+    let (m, dim, n_experts) = (4usize, 64usize, 16usize);
+    let x: Vec<f32> = rand_vec(m * dim, 23)
+        .iter()
+        .map(|v| (v % 2.0 - 1.0) * 0.5)
+        .collect();
+    let gate_w: Vec<u16> = rand_vec(n_experts * dim, 29)
+        .iter()
+        .map(|&v| ferroseek_core::num::f32_to_bf16((v % 2.0 - 1.0) * 0.25))
+        .collect();
+    let bias: Vec<f32> = rand_vec(n_experts, 31).iter().map(|v| v * 0.1).collect();
+    let d_x = DeviceBuffer::from_slice(&x).unwrap();
+    let d_gw = DeviceBuffer::from_slice(&gate_w).unwrap();
+    let d_b = DeviceBuffer::from_slice(&bias).unwrap();
+    let mut d_sm = DeviceBuffer::from_slice(&vec![0f32; m * n_experts]).unwrap();
+    crate::launch::moe_gate_m(
+        c,
+        d_x.as_device_ptr(),
+        d_gw.as_device_ptr(),
+        d_b.as_device_ptr(),
+        d_sm.as_device_ptr(),
+        m,
+        dim,
+        n_experts,
+    );
+    c.stream.synchronize().unwrap();
+    let mut got = vec![0f32; m * n_experts];
+    d_sm.copy_to(&mut got).unwrap();
+    let mut expect = vec![0f32; m * n_experts];
+    for pos in 0..m {
+        let d_xp = DeviceBuffer::from_slice(&x[pos * dim..(pos + 1) * dim]).unwrap();
+        let mut d_sp = DeviceBuffer::from_slice(&vec![0f32; n_experts]).unwrap();
+        crate::launch::moe_gate(
+            c,
+            d_xp.as_device_ptr(),
+            d_gw.as_device_ptr(),
+            d_b.as_device_ptr(),
+            d_sp.as_device_ptr(),
+            dim,
+            n_experts,
+        );
+        c.stream.synchronize().unwrap();
+        d_sp.copy_to(&mut expect[pos * n_experts..(pos + 1) * n_experts])
+            .unwrap();
+    }
+    assert_eq!(got, expect, "moe_gate_m diverged from sequential moe_gate");
+
+    // --- rmsnorm_m ---
+    let eps = 1e-5f32;
+    let w: Vec<f32> = rand_vec(dim, 37)
+        .iter()
+        .map(|v| 0.5 + v.abs() % 1.0)
+        .collect();
+    let d_w = DeviceBuffer::from_slice(&w).unwrap();
+    let mut d_om = DeviceBuffer::from_slice(&vec![0f32; m * dim]).unwrap();
+    crate::launch::rmsnorm_m(
+        c,
+        d_x.as_device_ptr(),
+        d_w.as_device_ptr(),
+        d_om.as_device_ptr(),
+        m,
+        dim,
+        eps,
+    );
+    c.stream.synchronize().unwrap();
+    let mut got_n = vec![0f32; m * dim];
+    d_om.copy_to(&mut got_n).unwrap();
+    let mut expect_n = vec![0f32; m * dim];
+    for pos in 0..m {
+        let d_xp = DeviceBuffer::from_slice(&x[pos * dim..(pos + 1) * dim]).unwrap();
+        let mut d_op = DeviceBuffer::from_slice(&vec![0f32; dim]).unwrap();
+        crate::launch::rmsnorm(
+            c,
+            d_xp.as_device_ptr(),
+            d_w.as_device_ptr(),
+            d_op.as_device_ptr(),
+            dim,
+            eps,
+        );
+        c.stream.synchronize().unwrap();
+        d_op.copy_to(&mut expect_n[pos * dim..(pos + 1) * dim])
+            .unwrap();
+    }
+    assert_eq!(got_n, expect_n, "rmsnorm_m diverged from per-row rmsnorm");
+    eprintln!("moe_gate_m + rmsnorm_m: bit-identical over {m} rows");
+}

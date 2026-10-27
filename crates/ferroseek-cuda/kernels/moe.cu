@@ -154,3 +154,35 @@ extern "C" __global__ void swiglu_limit10(
     float silu = g * (1.0f / (1.0f + expf(-g)));
     out[i] = silu * u * routing_weight;
 }
+
+// moe_gate_m: M-batch gate scoring — grid (n_experts, m). Identical
+// per-block arithmetic to moe_gate (bit-exact per row).
+extern "C" __global__ void moe_gate_m(
+    const float* __restrict__ x,          // [m, dim]
+    const uint16_t* __restrict__ gate_w,  // [n_experts, dim] bf16
+    const float* __restrict__ bias,       // [n_experts]
+    float* __restrict__ scores,           // [m, n_experts]
+    int dim, int n_experts)
+{
+    int e = blockIdx.x;
+    int pos = blockIdx.y;
+    if (e >= n_experts) return;
+    const float* xr = x + (size_t)pos * dim;
+    const uint16_t* w = gate_w + (size_t)e * dim;
+    __shared__ float red[256];
+    float part = 0.0f;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        part += xr[d] * bf16_to_f32(w[d]);
+    }
+    red[threadIdx.x] = part;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float dot = red[0];
+        float sp = (dot > 20.0f) ? dot : logf(1.0f + expf(dot));
+        scores[(size_t)pos * n_experts + e] = sqrtf(sp);
+    }
+}

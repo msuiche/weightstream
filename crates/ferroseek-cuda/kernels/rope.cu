@@ -54,3 +54,30 @@ extern "C" __global__ void rope_uniform_pos(
     base[0] = x0 * c - x1 * s;
     base[1] = x1 * c + x0 * s;
 }
+
+// rope_uniform_pos_buf: per-row positions variant for M-batch decode —
+// row r rotates by pos_per_row[r]. Identical per-row arithmetic to
+// rope_uniform_pos (bit-exact vs per-position launches).
+extern "C" __global__ void rope_uniform_pos_buf(
+    float* __restrict__ x,
+    const float* __restrict__ cos_t,
+    const float* __restrict__ sin_t,
+    const int* __restrict__ pos_per_row,
+    int n_rows, int dim, int rope_dim,
+    int conjugate)
+{
+    int pair = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y;
+    if (row >= n_rows || pair >= rope_dim / 2) return;
+
+    int pos = pos_per_row[row];
+    float c = cos_t[(size_t)pos * (rope_dim / 2) + pair];
+    float s = sin_t[(size_t)pos * (rope_dim / 2) + pair];
+    if (conjugate) s = -s;
+
+    float* base = x + (size_t)row * dim + (dim - rope_dim) + 2 * pair;
+    float x0 = base[0];
+    float x1 = base[1];
+    base[0] = x0 * c - x1 * s;
+    base[1] = x1 * c + x0 * s;
+}

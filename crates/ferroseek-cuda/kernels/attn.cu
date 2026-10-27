@@ -78,3 +78,74 @@ extern "C" __global__ void sparse_attn(
         oh[d] = acc[k] / s;
     }
 }
+
+// sparse_attn_m: M-batch variant — grid (n_heads, m). Each block runs the
+// exact sparse_attn arithmetic for one (head, position) pair: same dot
+// order, same online softmax, so outputs are bit-identical to m sequential
+// sparse_attn calls. idxs is [m, n_sel] with each position's own (causal)
+// selection list into the shared gathered kv table.
+extern "C" __global__ void sparse_attn_m(
+    const float* __restrict__ q,        // [m, n_heads, dim]
+    const float* __restrict__ kv,       // [n_rows, dim]
+    const int*   __restrict__ idxs,     // [m, n_sel]
+    const float* __restrict__ sink,     // [n_heads]
+    float* __restrict__ out,            // [m, n_heads, dim]
+    int n_heads, int dim, int n_sel, float scale)
+{
+    int h = blockIdx.x;
+    int pos = blockIdx.y;
+    if (h >= n_heads) return;
+    const float* qh = q + ((size_t)pos * n_heads + h) * dim;
+    const int* pidx = idxs + (size_t)pos * n_sel;
+    float* oh = out + ((size_t)pos * n_heads + h) * dim;
+
+    __shared__ float s_max;
+    __shared__ float s_sum;
+    __shared__ float s_dot;
+
+    float m = -1e30f;
+    float s = 0.0f;
+    float acc[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) acc[i] = 0.0f;
+
+    for (int i = 0; i < n_sel; i++) {
+        int idx = pidx[i];
+        float partial = 0.0f;
+        if (idx >= 0) {
+            const float* row = kv + (size_t)idx * dim;
+            for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+                partial += qh[d] * row[d];
+            }
+        }
+        if (threadIdx.x == 0) s_dot = 0.0f;
+        __syncthreads();
+        block_reduce_sum(partial, &s_dot);
+        __syncthreads();
+
+        float logit = (idx >= 0) ? s_dot * scale : __int_as_float(0xff800000);
+        float mnew = fmaxf(m, logit);
+        float corr = expf(m - mnew);
+        float w = expf(logit - mnew);
+        s = s * corr + w;
+        if (idx >= 0) {
+            const float* row = kv + (size_t)idx * dim;
+            int k = 0;
+            for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) {
+                acc[k] = acc[k] * corr + w * row[d];
+            }
+        } else {
+            int k = 0;
+            for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) {
+                acc[k] *= corr;
+            }
+        }
+        m = mnew;
+    }
+
+    s += expf(sink[h] - m);
+    int k = 0;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) {
+        oh[d] = acc[k] / s;
+    }
+}
