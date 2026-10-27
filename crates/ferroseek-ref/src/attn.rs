@@ -239,6 +239,10 @@ pub fn attention(
             &format!("layers.{l}.attn.wo_b.weight"),
             &format!("layers.{l}.attn.wo_b.scale"),
         )?;
+        if std::env::var_os("FERROSEEK_DUMP").is_some() {
+            let qa = crate::actquant::fp8_act_values(&fl, 32);
+            crate::dump::f32s(format!("d_pos{pos}_actflQA{l}.f32"), &qa);
+        }
         fp8_gemv(w.bytes, s.bytes, dim, og * ol, &fl)
     };
     crate::dump::f32s(format!("d_pos{pos}_attnout{l}.f32"), &out);

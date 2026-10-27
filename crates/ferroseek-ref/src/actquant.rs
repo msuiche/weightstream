@@ -117,10 +117,7 @@ pub fn fp8_gemv(w: &[u8], scales: &[u8], rows: usize, cols: usize, x: &[f32]) ->
     let kb_n = cols / 32;
     assert_eq!(scales.len(), rows.div_ceil(32) * kb_n);
     let qa = fp8_act_values(x, 32);
-    if let Some(dir) = std::env::var_os("FERROSEEK_DUMP") {
-        let bytes: Vec<u8> = qa.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let _ = std::fs::write(std::path::Path::new(&dir).join("actfl_qa.f32"), bytes);
-    }
+
     let mut y = vec![0.0f32; rows];
     for n in 0..rows {
         let row = &w[n * cols..(n + 1) * cols];
