@@ -172,6 +172,16 @@ trait Decoder {
     fn reset(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+    /// Prefill a whole prompt (serving). The GPU engine's override uses
+    /// the prefix cache — the default is the plain per-token decode.
+    fn decode_prefill(&mut self, ids: &[u32]) -> std::io::Result<Vec<f32>> {
+        let mut logits = Vec::new();
+        for (n, &t) in ids.iter().enumerate() {
+            logits = self.decode(t, n as u64)?;
+        }
+        Ok(logits)
+    }
+
     /// Transport accounting for run reports ("" when there is none).
     fn coll_stats(&self) -> String {
         String::new()
@@ -199,6 +209,9 @@ impl Decoder for ferroseek_gpu::engine::GpuModel<'static> {
     }
     fn reset(&mut self) -> std::io::Result<()> {
         ferroseek_gpu::engine::GpuModel::reset(self)
+    }
+    fn decode_prefill(&mut self, ids: &[u32]) -> std::io::Result<Vec<f32>> {
+        ferroseek_gpu::engine::GpuModel::decode_prefill(self, ids)
     }
     fn coll_stats(&self) -> String {
         let coll = self.comm.as_ref().map(|c| c.stats()).unwrap_or_default();
@@ -939,12 +952,8 @@ fn serve_decode(
             "empty prompt",
         ));
     }
-    let mut logits = Vec::new();
-    let mut pos = 0u64;
-    for &t in ids.iter() {
-        logits = model.decode(t, pos)?;
-        pos += 1;
-    }
+    let mut logits = model.decode_prefill(&ids)?;
+    let mut pos = ids.len() as u64;
     // every rank builds the same sampler from the same seed: logits are
     // bit-identical across ranks, so the draws are too
     let mut sampler = if temperature > 0.0 {

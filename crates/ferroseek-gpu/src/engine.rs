@@ -566,6 +566,7 @@ struct GpuCaches {
 
 /// Cross-layer shared state (model.py:1169-1183): one slot per published
 /// artifact, host-tracked lengths.
+#[derive(Clone)]
 struct RunState {
     compress_len: Vec<usize>,
     index_k_src: usize,
@@ -573,6 +574,19 @@ struct RunState {
     shared_n_sel: usize,
     /// Debug: when Some, every attention sublayer records (layer, x).
     capture_x: Option<Vec<(u32, Vec<f32>)>>,
+}
+
+/// Prefix-cache snapshot (see `GpuModel::snapshot`): device copies of
+/// every per-request cache plus the run state and position, restorable
+/// with `GpuModel::restore`.
+pub struct CacheSnapshot {
+    pub pos: u64,
+    kv_all: Vec<D<f32>>,
+    index_k: Vec<D<f32>>,
+    comp_kv: Vec<D<f32>>,
+    comp_score: Vec<D<f32>>,
+    run: RunState,
+    eng_cache: Vec<i64>,
 }
 
 /// The GPU decode engine.
@@ -612,7 +626,14 @@ pub struct GpuModel<'a> {
     pub comm: Option<Box<dyn Collectives>>,
     /// Decode-section profiler (`FERROSEEK_PROF`, see [`Prof`]).
     pub prof: Prof,
+    /// Prefix cache (serving): snapshots of per-request state keyed by
+    /// the token ids that produced them, so a request sharing a prefix
+    /// prefills only the remainder (see `decode_prefill`). Bounded —
+    /// each snapshot is ~82 MB of device memory.
+    prefix_cache: Vec<(Vec<u32>, CacheSnapshot)>,
 }
+
+const PREFIX_CACHE_MAX: usize = 8;
 
 // ---------------------------------------------------------------------------
 // upload helpers
@@ -1277,6 +1298,127 @@ impl GpuModel<'static> {
         };
         self.pos = 0;
         Ok(())
+    }
+
+    /// Prefix-cache snapshot: the full per-request decode state at the
+    /// current position. `restore` replays it, so a request sharing the
+    /// token prefix pays only the tokens past the prefix (a 1000-token
+    /// prompt is ~90 s of prefill at 90 ms/token; the snapshot is ~82 MB
+    /// of device-to-device copies, well under a millisecond). Same
+    /// weights, so the restored state is exactly the state a fresh decode
+    /// of that prefix would have produced.
+    pub fn snapshot(&self) -> io::Result<CacheSnapshot> {
+        let clone_buf = |b: &D<f32>| -> io::Result<D<f32>> {
+            let mut out = DeviceBuffer::uninitialized(b.len()).map_err(cuda_err)?;
+            out.copy_from(b).map_err(cuda_err)?;
+            Ok(out)
+        };
+        let mut kv_all = Vec::with_capacity(self.caches.kv_all.len());
+        for b in &self.caches.kv_all {
+            kv_all.push(clone_buf(b)?);
+        }
+        let mut index_k = Vec::with_capacity(self.caches.index_k.len());
+        for b in &self.caches.index_k {
+            index_k.push(clone_buf(b)?);
+        }
+        let mut comp_kv = Vec::with_capacity(self.caches.comp_kv.len());
+        for b in self.caches.comp_kv.iter().flatten() {
+            comp_kv.push(clone_buf(b)?);
+        }
+        let mut comp_score = Vec::with_capacity(self.caches.comp_score.len());
+        for b in self.caches.comp_score.iter().flatten() {
+            comp_score.push(clone_buf(b)?);
+        }
+        Ok(CacheSnapshot {
+            pos: self.pos,
+            kv_all,
+            index_k,
+            comp_kv,
+            comp_score,
+            run: self.run.clone(),
+            eng_cache: self.eng_cache.clone(),
+        })
+    }
+
+    /// Replay a `snapshot` taken after the shared prefix's last token.
+    /// `decode` continues from `snapshot.pos` — the caller feeds only the
+    /// tokens past the prefix. Every rank must restore the same snapshot
+    /// (same prefix, same weights, bit-identical state) before stepping.
+    pub fn restore(&mut self, snap: &CacheSnapshot) -> io::Result<()> {
+        for (dst, src) in self.caches.kv_all.iter_mut().zip(&snap.kv_all) {
+            dst.copy_from(src).map_err(cuda_err)?;
+        }
+        for (dst, src) in self.caches.index_k.iter_mut().zip(&snap.index_k) {
+            dst.copy_from(src).map_err(cuda_err)?;
+        }
+        for (dst, src) in self.caches.comp_kv.iter_mut().flatten().zip(&snap.comp_kv) {
+            dst.copy_from(src).map_err(cuda_err)?;
+        }
+        for (dst, src) in self
+            .caches
+            .comp_score
+            .iter_mut()
+            .flatten()
+            .zip(&snap.comp_score)
+        {
+            dst.copy_from(src).map_err(cuda_err)?;
+        }
+        self.run = snap.run.clone();
+        self.eng_cache = snap.eng_cache.clone();
+        self.pos = snap.pos;
+        Ok(())
+    }
+
+    /// Prefill a whole prompt with the prefix cache: find the longest
+    /// cached token prefix, restore its snapshot, decode only the tokens
+    /// past it, then cache the full prompt's state for the next request.
+    /// Returns the logits after the last prompt token (same contract as
+    /// `decode` at the final position). All ranks see the same requests,
+    /// so the cache evolves identically on every rank and the lockstep
+    /// contract holds. A shared 1000-token prefix is ~90 s of prefill
+    /// saved for an ~82 MB restore (device copies, well under a ms).
+    pub fn decode_prefill(&mut self, ids: &[u32]) -> io::Result<Vec<f32>> {
+        // longest strictly-shorter cached prefix of `ids`
+        let mut best: Option<usize> = None;
+        let mut best_len = 0usize;
+        for (i, (key, _)) in self.prefix_cache.iter().enumerate() {
+            if key.len() >= ids.len() {
+                continue; // equal keys are stale (generation moved past)
+            }
+            let shared = key.iter().zip(ids).take_while(|(a, b)| a == b).count();
+            if shared == key.len() && shared > best_len {
+                best_len = shared;
+                best = Some(i);
+            }
+        }
+        let mut logits = Vec::new();
+        let start = match best {
+            Some(i) => {
+                let snap_pos;
+                {
+                    let (_, snap) = &self.prefix_cache[i];
+                    snap_pos = snap.pos;
+                }
+                let snap = &self.prefix_cache[i].1;
+                self.restore(snap)?;
+                snap_pos
+            }
+            None => {
+                self.reset()?;
+                0
+            }
+        };
+        for (n, &t) in ids.iter().enumerate().skip(start as usize) {
+            logits = self.decode(t, n as u64)?;
+        }
+        if !ids.is_empty() {
+            if self.prefix_cache.len() >= PREFIX_CACHE_MAX {
+                self.prefix_cache.remove(0);
+            }
+            let snap = self.snapshot()?;
+            self.prefix_cache.push((ids.to_vec(), snap));
+        }
+        Ok(logits)
     }
 
     /// Debug: capture every attention sublayer's input x (gate tooling).
@@ -2318,6 +2460,7 @@ impl<'a> GpuModel<'a> {
             sharding: *sh,
             comm: None,
             prof: Prof::from_env(),
+            prefix_cache: Vec::new(),
             arena: None,
             store_keepalive: None,
         })
