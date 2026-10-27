@@ -1248,3 +1248,68 @@ fn gpu_engine_flip_bisect_in_process() {
         eprintln!("step {p}: clean (max {d:.3e})",);
     }
 }
+
+#[test]
+fn fp8_gemm_shared_expert_shape_matches_cpu() {
+    // The S1-L3 flip bisects to the shared expert; this is its exact
+    // GEMV shape (m=1, n=256, k=64), never directly gated before.
+    let guard = Cuda::global();
+    let c = guard.as_ref().unwrap();
+    let (m, n, k) = (1usize, 256usize, 64usize);
+    let kb = k / 32;
+
+    let a_f: Vec<f32> = rand_vec(m * k, 77)
+        .iter()
+        .map(|v| (v % 3.0 - 1.0) * 0.5)
+        .collect();
+    let b_f: Vec<f32> = rand_vec(n * k, 78)
+        .iter()
+        .map(|v| (v % 3.0 - 1.0) * 0.25)
+        .collect();
+    // quantize to e4m3 + ue8m0 per-1x32 (act) and 32x32 (weight) blocks
+    let qa: Vec<u8> = a_f
+        .iter()
+        .map(|&v| ferroseek_core::quant::f32_to_e4m3(v))
+        .collect();
+    let qb: Vec<u8> = b_f
+        .iter()
+        .map(|&v| ferroseek_core::quant::f32_to_e4m3(v))
+        .collect();
+    let sa: Vec<u8> = vec![127u8; m * kb];
+    // weight scales: [n/32, kb] tiles — exercise NON-UNITY scales too
+    let mut sb = vec![0u8; (n / 32) * kb];
+    for i in 0..sb.len() {
+        sb[i] = 120u8 + (i % 5) as u8; // 2^-7 .. 2^-3
+    }
+
+    // CPU mirror: ferroseek_ref's own fp8_gemv
+    let expect = ferroseek_ref::actquant::fp8_gemv(&qb, &sb, n, k, &qa_dequant(&qa));
+
+    let d_a = DeviceBuffer::from_slice(&qa).unwrap();
+    let d_sa = DeviceBuffer::from_slice(&sa).unwrap();
+    let d_b = DeviceBuffer::from_slice(&qb).unwrap();
+    let d_sb = DeviceBuffer::from_slice(&sb).unwrap();
+    let mut d_c = DeviceBuffer::from_slice(&vec![0f32; m * n]).unwrap();
+    crate::launch::fp8_gemm(
+        c,
+        d_a.as_device_ptr(),
+        d_sa.as_device_ptr(),
+        d_b.as_device_ptr(),
+        d_sb.as_device_ptr(),
+        d_c.as_device_ptr(),
+        m,
+        n,
+        k,
+    );
+    c.stream.synchronize().unwrap();
+    let mut got = vec![0f32; m * n];
+    d_c.copy_to(&mut got).unwrap();
+    let d = max_abs_diff(&got, &expect);
+    assert!(d < 1e-3, "fp8_gemm shared shape vs CPU: {d:.3e}");
+}
+
+fn qa_dequant(q: &[u8]) -> Vec<f32> {
+    q.iter()
+        .map(|&v| ferroseek_core::quant::e4m3_to_f32(v))
+        .collect()
+}
