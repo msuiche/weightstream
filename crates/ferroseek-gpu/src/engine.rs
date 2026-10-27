@@ -979,7 +979,7 @@ fn upload_layer(
     let mut w2s_all: Option<D<u8>> = None;
     let mut w3_all: Option<D<u8>> = None;
     let mut w3s_all: Option<D<u8>> = None;
-    if arena.is_none() && e_len > 0 {
+    if arena.is_none() && e_len > 0 && sh.world_size == 4 {
         let inter = cfg.inter_dim as usize;
         let dim = cfg.dim as usize;
         let one_w = |store: &mut dyn WeightStore, name: &str| -> io::Result<Vec<u8>> {
