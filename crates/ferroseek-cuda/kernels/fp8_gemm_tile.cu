@@ -49,6 +49,8 @@ extern "C" __global__ void fp8_gemm_tile(
     const int n = n0 + (lane & 31);
     const bool active = (m < M) && (n < N);
 
+    const bool vec = ((((uintptr_t)A) | ((uintptr_t)B)) & 15) == 0;
+
     float acc = 0.0f;
     if (!active) return;
 
@@ -62,18 +64,25 @@ extern "C" __global__ void fp8_gemm_tile(
         const uint8_t* bp = b_row + b * 32;
         float dot = 0.0f;
         // two 16B vectorized loads, ascending k order
-        const uint4 va0 = *reinterpret_cast<const uint4*>(a);
-        const uint4 va1 = *reinterpret_cast<const uint4*>(a + 16);
-        const uint4 vb0 = *reinterpret_cast<const uint4*>(bp);
-        const uint4 vb1 = *reinterpret_cast<const uint4*>(bp + 16);
-        const uint8_t* a8 = reinterpret_cast<const uint8_t*>(&va0);
-        const uint8_t* a8h = reinterpret_cast<const uint8_t*>(&va1);
-        const uint8_t* b8 = reinterpret_cast<const uint8_t*>(&vb0);
-        const uint8_t* b8h = reinterpret_cast<const uint8_t*>(&vb1);
+        if (vec) {
+            const uint4 va0 = *reinterpret_cast<const uint4*>(a);
+            const uint4 va1 = *reinterpret_cast<const uint4*>(a + 16);
+            const uint4 vb0 = *reinterpret_cast<const uint4*>(bp);
+            const uint4 vb1 = *reinterpret_cast<const uint4*>(bp + 16);
+            const uint8_t* a8 = reinterpret_cast<const uint8_t*>(&va0);
+            const uint8_t* a8h = reinterpret_cast<const uint8_t*>(&va1);
+            const uint8_t* b8 = reinterpret_cast<const uint8_t*>(&vb0);
+            const uint8_t* b8h = reinterpret_cast<const uint8_t*>(&vb1);
 #pragma unroll
-        for (int k = 0; k < 16; k++) {
-            dot += e4m3_to_f32(a8[k]) * e4m3_to_f32(b8[k]);
-            dot += e4m3_to_f32(a8h[k]) * e4m3_to_f32(b8h[k]);
+            for (int k = 0; k < 16; k++) {
+                dot += e4m3_to_f32(a8[k]) * e4m3_to_f32(b8[k]);
+                dot += e4m3_to_f32(a8h[k]) * e4m3_to_f32(b8h[k]);
+            }
+        } else {
+#pragma unroll
+            for (int k = 0; k < 32; k++) {
+                dot += e4m3_to_f32(a[k]) * e4m3_to_f32(bp[k]);
+            }
         }
         float sa = e8m0_to_f32(sa_row[b]);
         float sb = e8m0_to_f32(sb_row[b]);

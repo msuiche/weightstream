@@ -36,26 +36,37 @@ extern "C" __global__ void fp4_gemm_tile(
     const uint8_t* sa_row = sA + (size_t)m * kb;
     const uint8_t* sb_row = sB + (size_t)n * kb;
 
+    const bool vec = ((((uintptr_t)A) | ((uintptr_t)B)) & 15) == 0;
+
     float acc = 0.0f;
     for (int b = 0; b < kb; b++) {
         const uint8_t* a = a_row + b * 32;
         const uint8_t* bp = b_row + b * 16;
-        const uint4 act0 = *reinterpret_cast<const uint4*>(a);
-        const uint4 act1 = *reinterpret_cast<const uint4*>(a + 16);
-        const uint4 pack = *reinterpret_cast<const uint4*>(bp);
-        const uint8_t* a0 = reinterpret_cast<const uint8_t*>(&act0);
-        const uint8_t* a1 = reinterpret_cast<const uint8_t*>(&act1);
-        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&pack);
         float dot = 0.0f;
+        if (vec) {
+            const uint4 act0 = *reinterpret_cast<const uint4*>(a);
+            const uint4 act1 = *reinterpret_cast<const uint4*>(a + 16);
+            const uint4 pack = *reinterpret_cast<const uint4*>(bp);
+            const uint8_t* a0 = reinterpret_cast<const uint8_t*>(&act0);
+            const uint8_t* a1 = reinterpret_cast<const uint8_t*>(&act1);
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&pack);
 #pragma unroll
-        for (int k = 0; k < 8; k++) {
-            dot += e4m3_to_f32(a0[2 * k]) * FP4_TABLE[bytes[k] & 0x0F];
-            dot += e4m3_to_f32(a0[2 * k + 1]) * FP4_TABLE[bytes[k] >> 4];
-        }
+            for (int k = 0; k < 8; k++) {
+                dot += e4m3_to_f32(a0[2 * k]) * FP4_TABLE[bytes[k] & 0x0F];
+                dot += e4m3_to_f32(a0[2 * k + 1]) * FP4_TABLE[bytes[k] >> 4];
+            }
 #pragma unroll
-        for (int k = 8; k < 16; k++) {
-            dot += e4m3_to_f32(a1[2 * k - 16]) * FP4_TABLE[bytes[k] & 0x0F];
-            dot += e4m3_to_f32(a1[2 * k - 15]) * FP4_TABLE[bytes[k] >> 4];
+            for (int k = 8; k < 16; k++) {
+                dot += e4m3_to_f32(a1[2 * k - 16]) * FP4_TABLE[bytes[k] & 0x0F];
+                dot += e4m3_to_f32(a1[2 * k - 15]) * FP4_TABLE[bytes[k] >> 4];
+            }
+        } else {
+#pragma unroll
+            for (int k = 0; k < 16; k++) {
+                uint8_t byte = bp[k];
+                dot += e4m3_to_f32(a[2 * k]) * FP4_TABLE[byte & 0x0F];
+                dot += e4m3_to_f32(a[2 * k + 1]) * FP4_TABLE[byte >> 4];
+            }
         }
         float sa = e8m0_to_f32(sa_row[b]);
         float sb = e8m0_to_f32(sb_row[b]);
