@@ -1309,7 +1309,7 @@ impl GpuModel<'static> {
     /// of that prefix would have produced.
     pub fn snapshot(&self) -> io::Result<CacheSnapshot> {
         let clone_buf = |b: &D<f32>| -> io::Result<D<f32>> {
-            let mut out = DeviceBuffer::uninitialized(b.len()).map_err(cuda_err)?;
+            let mut out = unsafe { DeviceBuffer::uninitialized(b.len()) }.map_err(cuda_err)?;
             out.copy_from(b).map_err(cuda_err)?;
             Ok(out)
         };
@@ -1394,14 +1394,14 @@ impl GpuModel<'static> {
         let mut logits = Vec::new();
         let start = match best {
             Some(i) => {
-                let snap_pos;
-                {
-                    let (_, snap) = &self.prefix_cache[i];
-                    snap_pos = snap.pos;
-                }
-                let snap = &self.prefix_cache[i].1;
-                self.restore(snap)?;
-                snap_pos
+                // take the snapshot out (avoids the &self/&mut self
+                // overlap), restore, put it back
+                let (key, snap) = self.prefix_cache.remove(i);
+                let pos = snap.pos;
+                self.restore(&snap)?;
+                self.prefix_cache
+                    .insert(i.min(self.prefix_cache.len()), (key, snap));
+                pos
             }
             None => {
                 self.reset()?;
