@@ -1693,14 +1693,25 @@ impl GpuModel<'static> {
                                 chunk.copy_from_slice(&row);
                             });
                         if flat.iter().any(|v| v.is_nan()) {
-                            let bad = rows
-                                .iter()
-                                .find(|&&r| r * ehd + ehd > wt.len())
-                                .copied()
-                                .unwrap_or(0);
+                            // distinguish: a row id beyond the table (fill
+                            // branch) vs NaN inside a dequantized valid row
+                            let bad_row = rows.iter().find(|&&r| r * ehd + ehd > wt.len()).copied();
+                            let nan_idx = flat.iter().position(|v| v.is_nan()).unwrap();
+                            let nan_row = nan_idx / ehd;
+                            let rid = rows.get(nan_row).copied().unwrap_or(usize::MAX);
+                            let s_cols = ehd.div_ceil(32);
+                            let sbyte = st.get(rid * s_cols).copied().unwrap_or(u8::MAX);
+                            let wbytes: Vec<u8> = wt
+                                .get(rid * ehd..rid * ehd + 8)
+                                .map(|s| s.to_vec())
+                                .unwrap_or_default();
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidInput,
-                                format!("engram hash row {bad} out of table ({})", wt.len() / ehd),
+                                format!(
+                                    "engram gather NaN: bad_id={bad_row:?} nan_slot={nan_row} row_id={rid} table_rows={} wt={} ehd={ehd} scale_byte={sbyte:#04x} w={wbytes:02x?} ids={ids:?}",
+                                    wt.len() / ehd,
+                                    wt.len(),
+                                ),
                             ));
                         }
                         // pinned async staging: the two pageable copy_from
@@ -2080,7 +2091,14 @@ impl GpuModel<'static> {
         let rcfg = RefConfig::from_model_config(&cfg)?;
         let mut store: Box<dyn WeightStore> = Box::new(weights);
         validate_dims(&rcfg)?;
-        Self::build(rcfg, store.as_mut(), 1024, None, &Sharding::default())
+        let mut model = Self::build(rcfg, store.as_mut(), 1024, None, &Sharding::default())?;
+        // the engram embed tables are host-backed: raw pointers into the
+        // store's tensors. The store MUST outlive the model — dropping it
+        // here left those pointers dangling (use-after-free; read as
+        // garbage only once the heap recycled, i.e. only in later tests
+        // of a shared process).
+        model.store_keepalive = Some(store);
+        Ok(model)
     }
 
     /// Raise the decode-position bound (must be set before the first step).
