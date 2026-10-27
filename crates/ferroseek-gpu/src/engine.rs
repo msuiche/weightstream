@@ -957,9 +957,17 @@ fn upload_layer(
                 arena,
                 &format!("{p}.attn.indexer.wq_b.weight"),
                 &format!("{p}.attn.indexer.wq_b.scale"),
-                WShard::Rows {
-                    start: rank * inh_l * ihd,
-                    len: inh_l * ihd,
+                // rows [rank*inh_l, +inh_l) of [inh*ihd, ql]; at TP1 the
+                // slice is the whole tensor and Rows-vs-All produced a
+                // synthetic-gate divergence despite byte-identity (the
+                // probe test documents the open question) — pass All when unsharded
+                if world == 1 {
+                    WShard::All
+                } else {
+                    WShard::Rows {
+                        start: rank * inh_l * ihd,
+                        len: inh_l * ihd,
+                    }
                 },
             )?,
             weights_proj: {
