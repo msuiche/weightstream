@@ -307,6 +307,33 @@ pub fn fp4_gemm(c: &Cuda, a: U8, sa: U8, b: U8, sb: U8, out: F32, m: usize, n: u
     }
 }
 
+/// `fp4_gemm_tile` (fp4_gemm_tile.cu): M-batch tiled form of the fp4
+/// expert GEMM — one 16x32 output tile per block, whole-K per thread.
+/// For M > 1 batched steps (DSpark verify); M=1 keeps the fused
+/// grouped-expert path.
+pub fn fp4_gemm_tile(
+    c: &Cuda,
+    a: U8,
+    sa: U8,
+    b: U8,
+    sb: U8,
+    out: F32,
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    let f = c.fp4_gemm_tile.get_function("fp4_gemm_tile").unwrap();
+    let stream = &c.stream;
+    let gx = n.div_ceil(32) as u32;
+    let gy = m.div_ceil(16) as u32;
+    unsafe {
+        launch!(
+            f<<<(gx, gy), 512, 0, stream>>>(a, sa, b, sb, out, m as i32, n as i32, k as i32)
+        )
+        .unwrap()
+    }
+}
+
 /// `hc_mixes` (hc.cu): one warp per dot row, grid (mix_hc, n_tokens) —
 /// the dots spread across SMs instead of 8 warps of one block.
 pub fn hc_mixes(

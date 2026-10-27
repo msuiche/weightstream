@@ -613,3 +613,100 @@ fn fp8_gemm_tile_matches_cpu_and_m1() {
     let d1 = max_abs_diff(&got, &got1);
     assert!(d1 < GATE_ABS_TOL, "tile vs M=1 max diff {d1:.3e}");
 }
+
+#[test]
+fn fp4_gemm_tile_matches_cpu_and_m1() {
+    // M-batch tiled fp4 expert GEMM: CPU mirror (unpack fp4 per the
+    // engine's table) + per-row cross-check against the M=1 fp4_gemm at
+    // the gate tolerance (reduction-order divergence class, engine docs).
+    let guard = Cuda::global();
+    let c = guard.as_ref().unwrap();
+    let (m, n, k) = (6usize, 512usize, 1024usize);
+    let kb = k / 32;
+
+    // A: fp8 activations, scale 1.0
+    let a_f: Vec<f32> = rand_vec(m * k, 55)
+        .iter()
+        .map(|v| (v % 3.0 - 1.0) * 0.5)
+        .collect();
+    let qa: Vec<u8> = a_f
+        .iter()
+        .map(|&v| ferroseek_core::quant::f32_to_e4m3(v))
+        .collect();
+    let sa: Vec<u8> = vec![127u8; m * kb];
+
+    // B: packed fp4 (low nibble = even k), scale 1.0
+    let mut qb = vec![0u8; n * k / 2];
+    for i in 0..n * k / 2 {
+        let lo = (i % 7) as u8 & 0x0F;
+        let hi = ((i * 5 + 3) % 11) as u8 & 0x0F;
+        qb[i] = lo | (hi << 4);
+    }
+    let sb: Vec<u8> = vec![127u8; n * kb];
+
+    // CPU mirror: fp4 table unpack in the kernel's pairing
+    let da: Vec<f32> = qa
+        .iter()
+        .map(|&v| ferroseek_core::quant::e4m3_to_f32(v))
+        .collect();
+    let mut expect = vec![0.0f32; m * n];
+    for mi in 0..m {
+        for ni in 0..n {
+            let mut acc = 0.0f32;
+            for b in 0..kb {
+                let mut dot = 0.0f32;
+                for kk in 0..16 {
+                    let byte = qb[ni * (k / 2) + b * 16 + kk];
+                    let (lo, hi) = ferroseek_core::quant::unpack_fp4(byte);
+                    dot += da[mi * k + b * 32 + 2 * kk] * lo;
+                    dot += da[mi * k + b * 32 + 2 * kk + 1] * hi;
+                }
+                acc += dot;
+            }
+            expect[mi * n + ni] = acc;
+        }
+    }
+
+    let d_a = DeviceBuffer::from_slice(&qa).unwrap();
+    let d_sa = DeviceBuffer::from_slice(&sa).unwrap();
+    let d_b = DeviceBuffer::from_slice(&qb).unwrap();
+    let d_sb = DeviceBuffer::from_slice(&sb).unwrap();
+    let mut d_c = DeviceBuffer::from_slice(&vec![0f32; m * n]).unwrap();
+    crate::launch::fp4_gemm_tile(
+        c,
+        d_a.as_device_ptr(),
+        d_sa.as_device_ptr(),
+        d_b.as_device_ptr(),
+        d_sb.as_device_ptr(),
+        d_c.as_device_ptr(),
+        m,
+        n,
+        k,
+    );
+    c.stream.synchronize().unwrap();
+    let mut got = vec![0f32; m * n];
+    d_c.copy_to(&mut got).unwrap();
+    let d = max_abs_diff(&got, &expect);
+    assert!(d < 1e-3, "fp4 tile vs CPU max diff {d:.3e}");
+
+    // per-row cross-check against the M=1 fp4_expert_gemm
+    let mut d_c1 = DeviceBuffer::from_slice(&vec![0f32; m * n]).unwrap();
+    for mi in 0..m {
+        crate::launch::fp4_gemm(
+            c,
+            crate::launch::row_u8(&d_a, mi * k, k),
+            crate::launch::row_u8(&d_sa, mi * kb, kb),
+            d_b.as_device_ptr(),
+            d_sb.as_device_ptr(),
+            crate::launch::row(&d_c1, mi * n, n),
+            1,
+            n,
+            k,
+        );
+    }
+    c.stream.synchronize().unwrap();
+    let mut got1 = vec![0f32; m * n];
+    d_c1.copy_to(&mut got1).unwrap();
+    let d1 = max_abs_diff(&got, &got1);
+    assert!(d1 < GATE_ABS_TOL, "fp4 tile vs M=1 max diff {d1:.3e}");
+}
