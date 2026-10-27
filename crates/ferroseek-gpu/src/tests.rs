@@ -1163,7 +1163,7 @@ fn uploaded_expert_bytes_match_store_all_layers() {
                 if host != v.bytes {
                     let first = host
                         .iter()
-                        .zip(&v.bytes)
+                        .zip(v.bytes.iter())
                         .position(|(a, b)| a != b)
                         .unwrap_or(0);
                     eprintln!(
