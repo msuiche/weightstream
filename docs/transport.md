@@ -169,3 +169,21 @@ L0's — next step: dump the experts' uploaded buffers and diff against
 the store (suspected offset/aliasing in the upload path at layers >= 1).
 The earlier [2,4]-vs-[4,2] gorder flip was wedged-GPU-era data; on the
 healthy GPU gorder matches everywhere.
+
+**Post-reboot update (2026-10-27, late).** The byte audit (new test)
+cleared the expert-upload hypothesis too: every layer's uploaded w1/
+w2/w3 weight+scale bytes match the store exactly. Fresh Xid 13/43 after
+the reboot forced a second one; compute-sanitizer memcheck on the clean
+GPU reports **0 memory errors** across the gate — no kernel OOB. The
+refined live signal: the first material divergence is L1-3's MoE gate
+INPUT (gateX, 0.37-0.54) at step 0 (L0 bit-exact end to end), while the
+attention chain feeding it was adjudicated equal by recomputation, and
+the act-quant of the SAME gateX then diverges wildly — arithmetic that
+cannot both be true of one deterministic run. Combined with the
+divergence MOVING between dump generations (different runs of the same
+binary), the evidence now points at a **host-side race** — the pinned
+staging buffers, the rayon engram gather's `wt/st` slice borrows, or
+scratch reuse across the attention's inline stages — not arithmetic.
+Next session: bisect with dump pairs generated within a single run
+(per-tensor ordering), and audit `Scratch`'s coll/gate/small-stage
+lifetimes against the rayon gather.
