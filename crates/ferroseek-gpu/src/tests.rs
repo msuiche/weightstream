@@ -855,6 +855,9 @@ fn gpu_engine_matches_cpu_reference_per_layer() {
         if p < 2 {
             let cx = cpu.debug_take_captures();
             let gx = gpu.debug_take_captures();
+            // re-arm both (take() drains)
+            cpu.debug_capture_x(true);
+            gpu.debug_capture_x(true);
             for (i, ((l, cxv), (_, gxv))) in cx.iter().zip(gx.iter()).enumerate() {
                 let d = max_abs_diff(cxv, gxv);
                 if d > 1e-5 {
