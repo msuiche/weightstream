@@ -88,6 +88,7 @@ pub fn moe(cfg: &RefConfig, ctx: &mut Ctx<'_>, layer: u32, x: &[f32]) -> io::Res
     for d in 0..dim {
         y[d] += shared[d];
     }
+    crate::dump::f32s(format!("d_pos{}_y{layer}.f32", crate::dump::pos()), &y);
     Ok(y)
 }
 
