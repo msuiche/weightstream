@@ -221,6 +221,7 @@ pub fn attention(
     for g in 0..og {
         fp8_snap(&mut o[g * gdim..(g + 1) * gdim], 32);
     }
+    crate::dump::f32s(format!("d_pos{pos}_osnapS{l}.f32"), &o);
     let mut fl = vec![0.0f32; og * ol];
     {
         // block-diagonal einsum: group g projects only its own heads
