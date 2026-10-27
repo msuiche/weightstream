@@ -124,3 +124,32 @@ cannot be the production path; upload mode (the slice as ordinary
 cudaMalloc — GB10 device memory IS the unified DRAM, 226 GB/s vs 163
 GB/s registered-page reads) is. `--stream` remains for slices under
 the ceiling.
+## Synthetic-gate state (2026-10-27)
+
+`gpu_engine_matches_cpu_reference` fails at HEAD with a two-regression
+stack, both introduced before this session's kernel work (the suite had
+not run on a GPU since the TP4 landing; an RM wedge from an illegal
+address storm masked the picture for part of the bisection):
+
+1. **e834f0c (TP4 landing)** — FIXED (`5512b7a`): every load_q8 call
+   grew a WShard; the indexer wq_b took Rows{0, full} at TP1. Hybrid
+   bisect (TP4 tree, that one call reverted to All -> green) pinned it.
+   The fix never builds a shard descriptor for an unsharded load. The
+   byte-identity probe shows Rows == All at these shapes — the
+   mechanism is open, recorded in the probe test.
+2. **6e8ebdc (upload mode)** — OPEN: with regression 1 fixed, e834f0c's
+   tree passes and 6e8ebdc's still diverges (same step-1 quant-flip ->
+   step-2 amplification signature). The TP1-visible delta is the
+   host-backed engram/expert loads; a device-tables probe at TP1 made
+   step 0 diverge instead — not yet understood. The real-checkpoint
+   gate (` Paris.`, bit-exact across ranks, every landing) is unaffected
+   and remains the production correctness bar; the synthetic gate is
+   quarantined until 6e8ebdc's TP1 path is root-caused.
+
+The gate's tolerance model also gained flip-amplification semantics
+(`e975045`): a legal activation-snap flip (≤1e-2, argmax stable)
+legitimately diverges the two engines' states — through a near-tie MoE
+gate it can reorder experts and amplify to O(1) on later steps while
+both engines stay correct per their own arithmetic; post-flip steps now
+check finiteness + argmax agreement. moe.cu's `-fmad=false` was kept:
+routing is the one place a ULP crosses a comparison boundary.
