@@ -710,3 +710,63 @@ fn fp4_gemm_tile_matches_cpu_and_m1() {
     let d1 = max_abs_diff(&got, &got1);
     assert!(d1 < GATE_ABS_TOL, "fp4 tile vs M=1 max diff {d1:.3e}");
 }
+
+#[test]
+fn hc_block_matches_cpu_mirror() {
+    // isolate hc_block (the TP1/synthetic path) against the CPU
+    // hc_mixes: same inputs, tolerance = the fp32 reduction-shape class
+    let guard = Cuda::global();
+    let c = guard.as_ref().unwrap();
+    let (hc, dim) = (4usize, 64usize);
+    let mix_hc = (2 + hc) * hc; // 24
+    let hc_dim = hc * dim;
+
+    let h: Vec<f32> = rand_vec(hc_dim, 3);
+    let hc_fn: Vec<f32> = rand_vec(mix_hc * hc_dim, 7)
+        .iter()
+        .map(|v| (v % 2.0 - 1.0) * 0.3)
+        .collect();
+    let hc_base: Vec<f32> = rand_vec(mix_hc, 9)
+        .iter()
+        .map(|v| (v % 2.0 - 1.0) * 0.5)
+        .collect();
+    let hc_scale = vec![1.0f32, 0.8, 1.2];
+
+    let expect =
+        ferroseek_ref::hc::hc_mixes(&h, &hc_fn, &hc_scale, &hc_base, hc, dim, 1e-20, 19, 1e-4);
+
+    let d_h = DeviceBuffer::from_slice(&h).unwrap();
+    let d_fn = DeviceBuffer::from_slice(&hc_fn).unwrap();
+    let d_base = DeviceBuffer::from_slice(&hc_base).unwrap();
+    let d_scale = DeviceBuffer::from_slice(&hc_scale).unwrap();
+    let d_pre = DeviceBuffer::from_slice(&vec![0f32; 4]).unwrap();
+    let d_post = DeviceBuffer::from_slice(&vec![0f32; 4]).unwrap();
+    let d_comb = DeviceBuffer::from_slice(&vec![0f32; 16]).unwrap();
+    crate::launch::hc_block(
+        c,
+        d_h.as_device_ptr(),
+        d_fn.as_device_ptr(),
+        d_base.as_device_ptr(),
+        d_scale.as_device_ptr(),
+        d_pre.as_device_ptr(),
+        d_post.as_device_ptr(),
+        d_comb.as_device_ptr(),
+        1,
+        hc_dim,
+        mix_hc,
+        1e-4,
+    );
+    c.stream.synchronize().unwrap();
+    let mut pre = vec![0f32; 4];
+    let mut post = vec![0f32; 4];
+    let mut comb = vec![0f32; 16];
+    d_pre.copy_to(&mut pre).unwrap();
+    d_post.copy_to(&mut post).unwrap();
+    d_comb.copy_to(&mut comb).unwrap();
+    let dpre = max_abs_diff(&pre, &expect.pre);
+    let dpost = max_abs_diff(&post, &expect.post);
+    let dcomb = max_abs_diff(&comb, &expect.comb);
+    assert!(dpre < 1e-5, "hc_block pre diff {dpre:.3e}");
+    assert!(dpost < 1e-5, "hc_block post diff {dpost:.3e}");
+    assert!(dcomb < 1e-5, "hc_block comb diff {dcomb:.3e}");
+}
