@@ -38,7 +38,7 @@ extern "C" __global__ void moe_gate(
     }
     if (threadIdx.x == 0) {
         float dot = red[0];
-        float sp = (dot > 20.0f) ? dot : log1pf(expf(dot));
+        float sp = (dot > 20.0f) ? dot : logf(1.0f + expf(dot));
         scores[e] = sqrtf(sp);
     }
 }
@@ -111,7 +111,7 @@ extern "C" __global__ void moe_route(
         const uint16_t* w = gate_w + (size_t)e * dim;
         float dot = 0.0f;
         for (int d = 0; d < dim; d++) dot += x[d] * bf16_to_f32(w[d]);
-        float sp = (dot > 20.0f) ? dot : log1pf(expf(dot));
+        float sp = (dot > 20.0f) ? dot : logf(1.0f + expf(dot));
         s_scores[e] = sqrtf(sp);
     }
     __syncthreads();
