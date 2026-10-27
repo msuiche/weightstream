@@ -124,12 +124,13 @@ cannot be the production path; upload mode (the slice as ordinary
 cudaMalloc — GB10 device memory IS the unified DRAM, 226 GB/s vs 163
 GB/s registered-page reads) is. `--stream` remains for slices under
 the ceiling.
-## Synthetic-gate state (2026-10-27)
+## Synthetic-gate state (2026-10-27) — GREEN
 
-`gpu_engine_matches_cpu_reference` fails at HEAD with a two-regression
-stack, both introduced before this session's kernel work (the suite had
-not run on a GPU since the TP4 landing; an RM wedge from an illegal
-address storm masked the picture for part of the bisection):
+`gpu_engine_matches_cpu_reference` passes at HEAD (one legal
+quant-flip, no amplification). History: it failed with a
+two-regression stack, both introduced before the kernel work (the
+suite had not run on a GPU since the TP4 landing; an RM wedge from an
+illegal address storm masked the picture for part of the bisection):
 
 1. **e834f0c (TP4 landing)** — FIXED (`5512b7a`): every load_q8 call
    grew a WShard; the indexer wq_b took Rows{0, full} at TP1. Hybrid
@@ -190,14 +191,10 @@ hunting the residual step-1 flip: `act_quant_ue8m0_snap` and
 the repo documents in act_quant_fp8_emit, which uses the bit-extract
 form. Both now match the CPU's log2_ceil bit-exactly.
 
-**Remaining (deterministic, reproducible 3x with the gate ALONE in the
-process):** step-0 clean (7e-7), step-1 flips exactly once at 2.395e-3
-(argmax stable), step-2 amplifies 1.5e-1 (argmax stable), step-3
-argmax diverges. Cross-run dump comparisons are UNRELIABLE for this
-(divergent gateX/q/kvall with identical logits is self-contradictory —
-the pairing itself is flawed); the honest instrument is single-process
-with the capture-x test extended past layer 1, no suite, no cross-run
-pairs.
+**Remaining:** none. The "step-2/3 amplification" described here was
+the use-after-free below, not arithmetic — retracted. The gate is
+GREEN: `gpu_engine_matches_cpu_reference` passes with one legal flip
+(2.4e-3 at step 1, argmax stable) and every other step at 4.8e-7.
 
 **S1-flip forensics (2026-10-28, close of series).** The in-process
 capture bisector (capture_x + capture_y on both engines — new permanent
@@ -210,24 +207,22 @@ scale rules (bit-form ceil(log2) everywhere), swiglu semantics, the
 routed adjudicator. Shared-expert contribution y−yrouted diverges
 exactly at the flip.
 
-What remains does not reconcile: memcheck 0 errors, initcheck 0 errors,
-yet the flip's downstream argmax agreement VARIES between runs of the
-identical single-test binary (S2 agrees in some runs, diverges in
-others), and initcheck serialization trips a DIFFERENT failure (an
-engram hash row out of bounds) that normal runs never produce. With
-both sanitizers clean and the arithmetic proven piecewise, the residual
-points at the box itself — this GB10 took two reboots this session
-after Xid-13 storms; a full power cycle is the next diagnostic, then
-re-run the gate alone. The gate is NOT marked green; the flip is real
-but its run-to-run behavior is not arithmetic. The production path
-(upload-mode TP4, ring-gated ` Paris.` bit-exact) is unaffected.
-
-**Infra note (2026-10-27).** spark-4687 was powered off for the cycle.
-Wake-on-LAN is not armed on the DGX Spark (never configured via
-`ethtool -s <iface> wol g`, and the firmware may not honor magic
-packets from S5 anyway): packets from both the router (MAC
-`f0:68:e3:b3:6a:76`, from the DHCP lease) and a worker produced no
-boot. The node needs a physical power-button press, then:
-`cargo test --release -p ferroseek-gpu --features cuda gpu_engine_matches -- --test-threads=1`.
-To arm WoL for next time (unverified on GB10):
-`sudo ethtool -s <lan-iface> wol g` plus checking `/sys/class/net/<iface>/device/power/wakeup`.
+**RESOLVED (2026-10-27) — one use-after-free, not hardware.**
+`GpuModel::from_synthetic` returned `Self::build(...)` directly and
+dropped the weight store on return; every host-backed engram
+`embed_w`/`embed_s` is a raw pointer into that store. First model in a
+process read still-intact freed heap (tests pass); later models read
+recycled heap — NaN engram rows, ASLR-dependent run-to-run variation,
+occasional deferred illegal-access — all with memcheck/initcheck clean
+because the bug is host-side. The entire "post-flip O(1) amplification"
+above was this UAF, not arithmetic: with the store kept alive
+(`store_keepalive`, same as the checkpoint constructors), the gate on a
+freshly-booted box is step-1's genuine legal quant-flip (2.4e-3, argmax
+stable) followed by CLEAN steps at 4.8e-7. The dump-pairing
+"amplification" forensics and the box-degradation verdict are retracted.
+The real checkpoint path always held the store and was never affected.
+The gate floor is reclassified accordingly: a legal flip requires every
+pre-flip step clean and argmax stable at the flip and the next step;
+no amplification steps exist. Full GPU suite 19/19 x3 on a fresh box;
+the step-1 flip itself remains the documented rare quant-boundary class
+(engine.rs header), deterministic across boxes.
