@@ -1020,3 +1020,48 @@ fn wo_b_cols_shard_identity_probe() {
     assert_eq!(sa.as_slice(), sc.as_slice(), "scale Cols differs!");
     assert_eq!(wa.as_slice(), wc.as_slice(), "weight Cols differs!");
 }
+
+#[test]
+fn recompute_wo_b_adjudicates_attnout() {
+    // Every wo_b ingredient dumped bit-identical (fl, act_fl, weights by
+    // the Cols probe, kernel by the K=32 test), yet attnout dumps differ
+    // at S0 L1-3. Recompute wo_b(fl) directly from the synthetic weights
+    // with the CPU routine and compare against BOTH engines' dumps.
+    let cfg = mini_config();
+    let weights = ferroseek_ref::store::SyntheticWeights::generate(&cfg, 42).unwrap();
+    use ferroseek_ref::store::WeightStore;
+    let mut store: Box<dyn WeightStore> = Box::new(weights);
+    let (w, s) = store
+        .get2("layers.1.attn.wo_b.weight", "layers.1.attn.wo_b.scale")
+        .unwrap();
+    let cpu_dir = "/tmp/yb2";
+    let gpu_dir = "/tmp/yb2/gpu";
+    let fl_f = std::fs::read(format!("{cpu_dir}/d_pos0_fl1.f32")).unwrap();
+    let fl: Vec<f32> = fl_f
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let expect = ferroseek_ref::actquant::fp8_gemv(w.bytes, s.bytes, 64, 32, &fl);
+    for (tag, dir) in [("cpu", cpu_dir), ("gpu", gpu_dir)] {
+        let p = std::path::Path::new(dir).join("d_pos0_attnout1.f32");
+        if !p.exists() {
+            eprintln!("{tag}: no attnout dump at {p:?}");
+            continue;
+        }
+        let b = std::fs::read(&p).unwrap();
+        let got: Vec<f32> = b
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let d: f32 = got
+            .iter()
+            .zip(&expect)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        eprintln!(
+            "{tag} attnout vs recompute: maxdiff {d:.3e} (len {}/{})",
+            got.len(),
+            expect.len()
+        );
+    }
+}
