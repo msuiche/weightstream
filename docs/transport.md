@@ -94,6 +94,15 @@ bit-identical. On the drained box (ferroseek as the sole tenant):
      SSE (' Tokyo', ',', ' which', ...) over one load. Batching several
      requests per lockstep step and prefix-cache reuse are the next
      serving milestones; sampling parameters (temperature/top_p) after.
+     — Sampling shipped after that: `temperature`/`top_p`/`seed` on
+     decode (`--temperature/--top-p/--seed`) and in every serve request,
+     broadcast with `Phase::Next` so all ranks draw identically
+     (verified live: T=0 exact greedy ' Paris.', seeded T=1.0 repeatable
+     ' Paris. The Eiffel Tower is', top_p=0.1 narrows to the greedy
+     nucleus; workers error-free). The base model spec is
+     temperature-only (spec §12.10) — top_p is an engine-side
+     vLLM-compat option; sampled replay against the reference RNG
+     diverges by design, the spec's documented limitation.
 
 ## The registration ceiling (measured 2026-10-26)
 
