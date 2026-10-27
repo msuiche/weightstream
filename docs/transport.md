@@ -103,6 +103,13 @@ bit-identical. On the drained box (ferroseek as the sole tenant):
      temperature-only (spec §12.10) — top_p is an engine-side
      vLLM-compat option; sampled replay against the reference RNG
      diverges by design, the spec's documented limitation.
+     Prefix-cache reuse also shipped: `GpuModel::decode_prefill` finds
+     the longest cached token prefix, restores its per-request state
+     snapshot (~82 MB of device copies, well under a ms) and prefills
+     only the remainder — verified live on the ring: a 60-token shared
+     prefix cost 11.1 s cold and ~1 s warm with identical greedy output
+     against a no-cache control run (LRU bound 8, ~650 MB device memory;
+     every rank's cache evolves identically, so lockstep holds).
 
 ## The registration ceiling (measured 2026-10-26)
 
