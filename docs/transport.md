@@ -221,3 +221,13 @@ after Xid-13 storms; a full power cycle is the next diagnostic, then
 re-run the gate alone. The gate is NOT marked green; the flip is real
 but its run-to-run behavior is not arithmetic. The production path
 (upload-mode TP4, ring-gated ` Paris.` bit-exact) is unaffected.
+
+**Infra note (2026-10-27).** spark-4687 was powered off for the cycle.
+Wake-on-LAN is not armed on the DGX Spark (never configured via
+`ethtool -s <iface> wol g`, and the firmware may not honor magic
+packets from S5 anyway): packets from both the router (MAC
+`f0:68:e3:b3:6a:76`, from the DHCP lease) and a worker produced no
+boot. The node needs a physical power-button press, then:
+`cargo test --release -p ferroseek-gpu --features cuda gpu_engine_matches -- --test-threads=1`.
+To arm WoL for next time (unverified on GB10):
+`sudo ethtool -s <lan-iface> wol g` plus checking `/sys/class/net/<iface>/device/power/wakeup`.
