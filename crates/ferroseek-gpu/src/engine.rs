@@ -147,7 +147,7 @@ impl WShard {
 
 /// Sharded weight bytes: a borrow for the unsharded case (zero-copy, TP1
 /// path unchanged), an owned gather for slices.
-enum Sharded<'b> {
+pub enum Sharded<'b> {
     All(&'b [u8]),
     Owned(Vec<u8>),
 }
