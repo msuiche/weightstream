@@ -543,8 +543,8 @@ fn fp8_gemm_tile_matches_cpu_and_m1() {
     // op-order divergence (~1e-6 per element here; 1e-4 is the gate).
     let guard = Cuda::global();
     let c = guard.as_ref().unwrap();
-    // K=32 exercises the wo_b shape (kb=1: one K-block, single-thread dot)
-    let (m, n, k) = (1usize, 64usize, 32usize);
+    // synthetic MoE shape: N=inter=256, K=dim=64 (the gate-test experts)
+    let (m, n, k) = (1usize, 256usize, 64usize);
     let kb = k / 32;
 
     // A: fp8 + per-row-32 scales; B: fp8 + 32x32-block scales
@@ -648,8 +648,8 @@ fn fp4_gemm_tile_matches_cpu_and_m1() {
     // the gate tolerance (reduction-order divergence class, engine docs).
     let guard = Cuda::global();
     let c = guard.as_ref().unwrap();
-    // K=32 exercises the wo_b shape (kb=1: one K-block, single-thread dot)
-    let (m, n, k) = (1usize, 64usize, 32usize);
+    // synthetic MoE shape: N=inter=256, K=dim=64 (the gate-test experts)
+    let (m, n, k) = (1usize, 256usize, 64usize);
     let kb = k / 32;
 
     // A: fp8 activations, scale 1.0
