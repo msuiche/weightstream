@@ -2875,7 +2875,7 @@ fn attention_step(
                 .copy_from(&idxs_host)
                 .map_err(cuda_err)?;
             run.shared_n_sel = idxs_host.len();
-            crate::dump::i32s(format!("d_pos{pos}_idxsHost{l}.i32", l), &idxs_host);
+            crate::dump::i32s(format!("d_pos{pos}_idxsHost{l}.i32"), &idxs_host);
         }
 
         // latent tail: rope at the group's first-token position, fp4(16,
