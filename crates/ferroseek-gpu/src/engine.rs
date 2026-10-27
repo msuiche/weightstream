@@ -1954,6 +1954,7 @@ impl GpuModel<'static> {
                 sharding,
                 comm_opt.as_deref_mut(),
                 prof,
+                run,
             )?;
             prof.add_us(1, t_moe);
 
@@ -2522,6 +2523,7 @@ impl<'a> GpuModel<'a> {
                 candidates: Vec::new(),
                 shared_n_sel: 0,
                 capture_x: None,
+                capture_y: None,
             },
             pos: 0,
             max_seq,
