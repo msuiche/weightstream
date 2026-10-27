@@ -241,6 +241,7 @@ pub fn attention(
         )?;
         fp8_gemv(w.bytes, s.bytes, dim, og * ol, &fl)
     };
+    crate::dump::f32s(format!("d_pos{pos}_attnout{l}.f32"), &out);
     Ok(out)
 }
 
