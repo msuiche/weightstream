@@ -975,3 +975,48 @@ fn indexer_wq_b_rows_vs_all_bytes_identical() {
     assert_eq!(sa.as_slice(), sr.as_slice(), "scale differs!");
     assert_eq!(wa.as_slice(), wr.as_slice(), "weight differs!");
 }
+
+#[test]
+fn wo_b_cols_shard_identity_probe() {
+    // the wo_b load is the only Cols shard; TP1 slices it full-width.
+    // Assert Cols{0, full-cols} == All byte-identity on the synthetic
+    // shapes (the Rows twin of this probe passed; Cols is untested).
+    let cfg = mini_config();
+    let weights = ferroseek_ref::store::SyntheticWeights::generate(&cfg, 42).unwrap();
+    use ferroseek_ref::store::WeightStore;
+    let mut store: Box<dyn WeightStore> = Box::new(weights);
+    let (wv, sv) = store
+        .get2("layers.1.attn.wo_b.weight", "layers.1.attn.wo_b.scale")
+        .unwrap();
+    eprintln!(
+        "wo_b: weight {:?} ({} bytes), scale {:?} ({} bytes)",
+        wv.shape,
+        wv.bytes.len(),
+        sv.shape,
+        sv.bytes.len()
+    );
+    let cols = wv.shape[1];
+    let all = crate::engine::WShard::All;
+    let full_cols = crate::engine::WShard::Cols {
+        start: 0,
+        len: cols,
+    };
+    let wa = crate::engine::shard_weight_pub(wv.bytes, &wv.shape, all).unwrap();
+    let wc = crate::engine::shard_weight_pub(wv.bytes, &wv.shape, full_cols).unwrap();
+    let sa = crate::engine::shard_scale_pub(sv.bytes, &sv.shape, all).unwrap();
+    let sc = crate::engine::shard_scale_pub(sv.bytes, &sv.shape, full_cols).unwrap();
+    eprintln!(
+        "weight All==Cols: {} (lens {}/{})",
+        wa.as_slice() == wc.as_slice(),
+        wa.as_slice().len(),
+        wc.as_slice().len()
+    );
+    eprintln!(
+        "scale All==Cols: {} (lens {}/{})",
+        sa.as_slice() == sc.as_slice(),
+        sa.as_slice().len(),
+        sc.as_slice().len()
+    );
+    assert_eq!(sa.as_slice(), sc.as_slice(), "scale Cols differs!");
+    assert_eq!(wa.as_slice(), wc.as_slice(), "weight Cols differs!");
+}
