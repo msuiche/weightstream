@@ -1458,8 +1458,27 @@ impl GpuModel<'static> {
                 0
             }
         };
-        for (n, &t) in ids.iter().enumerate().skip(start as usize) {
-            logits = self.decode(t, n as u64)?;
+        // chunked M-batch prefill (decode_m): ring-safe chunks, falling
+        // back to the sequential loop where decode_m is unsupported
+        // (streaming mode, TP)
+        let mut n = start as usize;
+        while n < ids.len() {
+            let win = self.cfg.window_size as usize;
+            let room = win - (self.pos as usize % win);
+            let chunk = (ids.len() - n).min(room);
+            match self.decode_m(&ids[n..n + chunk]) {
+                Ok(rows) => {
+                    logits = rows.into_iter().last().unwrap_or_default();
+                    n += chunk;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => {
+                    for (m, &t) in ids.iter().enumerate().skip(n) {
+                        logits = self.decode(t, m as u64)?;
+                    }
+                    n = ids.len();
+                }
+                Err(e) => return Err(e),
+            }
         }
         if !ids.is_empty() {
             if self.prefix_cache.len() >= PREFIX_CACHE_MAX {
@@ -3689,8 +3708,14 @@ impl<'a> GpuModel<'a> {
                     ones[i * hc + j] = 1.0;
                 }
             }
-            sm.pre_ffn.copy_from(&pre).map_err(cuda_err)?;
-            sm.ones_hc.copy_from(&ones).map_err(cuda_err)?;
+            sm.pre_ffn
+                .index(0..m * hc)
+                .copy_from(&pre)
+                .map_err(cuda_err)?;
+            sm.ones_hc
+                .index(0..m * hc)
+                .copy_from(&ones)
+                .map_err(cuda_err)?;
         }
         k::hc_post(
             c,
@@ -3708,11 +3733,17 @@ impl<'a> GpuModel<'a> {
             for (i, wi) in (0..m).map(|i| (i, window_topk_idxs(win, pos0 + i as u64))) {
                 w[i * win..(i + 1) * win].copy_from_slice(&wi);
             }
-            sm.win_idxs.copy_from(&w).map_err(cuda_err)?;
+            sm.win_idxs
+                .index(0..m * win)
+                .copy_from(&w)
+                .map_err(cuda_err)?;
             let pos_q: Vec<i32> = (0..m * heads)
                 .map(|r| (pos0 + (r / heads) as u64) as i32)
                 .collect();
-            sm.pos_q.copy_from(&pos_q).map_err(cuda_err)?;
+            sm.pos_q
+                .index(0..m * heads)
+                .copy_from(&pos_q)
+                .map_err(cuda_err)?;
         }
 
         let mut h_cur = 0usize;
@@ -3933,7 +3964,10 @@ impl<'a> GpuModel<'a> {
             );
         }
         let mut out = vec![0.0f32; m * cfg.vocab as usize];
-        sm.logits.copy_to(&mut out).map_err(cuda_err)?;
+        sm.logits
+            .index(0..m * cfg.vocab as usize)
+            .copy_to(&mut out)
+            .map_err(cuda_err)?;
         self.pos += m as u64;
         Ok(out.chunks(cfg.vocab as usize).map(|c| c.to_vec()).collect())
     }

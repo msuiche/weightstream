@@ -1491,3 +1491,43 @@ fn decode_m_matches_sequential_decode() {
     );
 }
 
+
+#[test]
+fn decode_prefill_m_matches_sequential_and_reuses_prefix() {
+    // The chunked-prefill wiring: a fresh decode_prefill must land
+    // bit-exact with sequential decode per token, and a second call
+    // sharing a prefix must reuse the cache (decode only the suffix)
+    // while staying bit-exact with a from-scratch prefill.
+    let ids: Vec<u32> = TOKENS.to_vec();
+
+    let mut seq = gpu_model(42);
+    let mut last = Vec::new();
+    for (p, &t) in ids.iter().enumerate() {
+        last = seq.decode(t, p as u64).unwrap();
+    }
+
+    let mut bat = gpu_model(42);
+    let got = bat.decode_prefill(&ids).unwrap();
+    let d = max_abs_diff(&last, &got);
+    assert!(d < GATE_ABS_TOL, "chunked prefill diverged: {d:.3e}");
+    assert_eq!(ferroseek_ref::argmax(&last), ferroseek_ref::argmax(&got));
+    eprintln!("prefill batch: bit-exact vs sequential ({d:.3e})");
+
+    // prefix reuse: prefill [ids], then [ids + suffix] — the second call
+    // must decode ONLY the suffix (pos resumes at ids.len()) and match a
+    // from-scratch prefill of the full sequence.
+    let suffix = [29u32, 31];
+    let mut full: Vec<u32> = ids.clone();
+    full.extend_from_slice(&suffix);
+
+    let mut ref1 = gpu_model(42);
+    let want = ref1.decode_prefill(&full).unwrap();
+
+    let _ = bat.decode_prefill(&ids).unwrap();
+    assert_eq!(bat.next_position(), ids.len() as u64);
+    let got2 = bat.decode_prefill(&full).unwrap();
+    let d2 = max_abs_diff(&want, &got2);
+    assert!(d2 < GATE_ABS_TOL, "prefix-reuse prefill diverged: {d2:.3e}");
+    assert_eq!(bat.next_position(), full.len() as u64);
+    eprintln!("prefill prefix reuse: bit-exact ({d2:.3e}), resumed at {}", ids.len());
+}
