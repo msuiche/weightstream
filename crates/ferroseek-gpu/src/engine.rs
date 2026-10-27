@@ -1954,7 +1954,7 @@ impl GpuModel<'static> {
                 sharding,
                 comm_opt.as_deref_mut(),
                 prof,
-                run,
+                Some(run),
             )?;
             prof.add_us(1, t_moe);
 
