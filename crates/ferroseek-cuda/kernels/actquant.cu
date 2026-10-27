@@ -23,8 +23,14 @@ extern "C" __global__ void act_quant_ue8m0_snap(
         __syncthreads();
     }
     amax = fmaxf(partial[0], 1e-4f);
-    // s = 2^ceil(log2(amax/448))
-    float s = exp2f(ceilf(log2f(amax / 448.0f)));
+    // ceil(log2(amax/448)) by exponent/mantissa bits — bit-identical to
+    // the CPU reference's log2_ceil (log2f+ceilf can round across an
+    // integer boundary and pick a different scale; act_quant_fp8_emit
+    // already used this form — the snap kernel was left behind, which
+    // flipped a boundary amax at step 1 and diverged the engines).
+    int bits = __float_as_int(amax / 448.0f);
+    int e = ((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0 ? 1 : 0);
+    float s = exp2f((float)e);
 
     if (threadIdx.x < 32) {
         float y = g[threadIdx.x] / s;

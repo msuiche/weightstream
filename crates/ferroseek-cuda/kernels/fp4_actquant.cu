@@ -39,7 +39,11 @@ extern "C" __global__ void fp4_act_quant_snap(
         s = e4m3_to_f32(f32_to_e4m3_bits(amax / 6.0f));
     } else {
         amax = fmaxf(amax, 6.0f * 0x1p-126f);
-        s = exp2f(ceilf(log2f(amax / 6.0f)));
+        // bit-form ceil(log2): matches the CPU log2_ceil exactly
+        // (log2f+ceilf can round across an integer boundary)
+        int bits = __float_as_int(amax / 6.0f);
+        int e = ((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0 ? 1 : 0);
+        s = exp2f((float)e);
     }
 
     if (threadIdx.x < block_size) {
