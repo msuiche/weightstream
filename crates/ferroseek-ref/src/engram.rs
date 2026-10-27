@@ -263,7 +263,10 @@ pub fn merge(
         let row = fp8_row_scaled(emb_w.bytes, emb_s.bytes, r, ehd);
         flat[c * ehd..(c + 1) * ehd].copy_from_slice(&row);
     }
-
+    crate::dump::f32s(
+        format!("d_pos{}_eflat{layer}.f32", crate::dump::pos()),
+        &flat,
+    );
     // wkv: fp8 Linear over the flattened rows -> key per copy + shared value
     let (wkv_w, wkv_s) = store.get2(
         &format!("layers.{layer}.engram.wkv.weight"),

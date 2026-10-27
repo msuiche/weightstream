@@ -1716,6 +1716,12 @@ impl GpuModel<'static> {
                             )?;
                             s.small_stage.sync(stream)?;
                         }
+                        dump_dev(
+                            c,
+                            &s.eflat,
+                            ncols * ehd,
+                            format!("d_pos{}_eflat{l}.f32", crate::dump::pos()),
+                        );
                     }
                     _ => {
                         k::gather_fp8(
