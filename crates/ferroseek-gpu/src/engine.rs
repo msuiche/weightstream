@@ -153,7 +153,7 @@ enum Sharded<'b> {
 }
 
 impl Sharded<'_> {
-    fn as_slice(&self) -> &[u8] {
+    pub fn as_slice(&self) -> &[u8] {
         match self {
             Sharded::All(b) => b,
             Sharded::Owned(v) => v,
