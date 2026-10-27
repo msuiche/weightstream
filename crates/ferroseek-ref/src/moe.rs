@@ -173,6 +173,10 @@ fn expert_hidden_impl(
         &format!("{p}.experts.{expert}.w1.weight"),
         &format!("{p}.experts.{expert}.w1.scale"),
     )?;
+    if expert == 0 {
+        let qa = crate::actquant::fp8_act_values(x, 32);
+        crate::dump::f32s(format!("d_pos{}_actXqa{p}.f32", crate::dump::pos()), &qa);
+    }
     let gate = fp4_gemv(gw.bytes, gs.bytes, inter, dim, x);
     let (uw, us) = ctx.get2(
         &format!("{p}.experts.{expert}.w3.weight"),

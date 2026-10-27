@@ -3106,6 +3106,18 @@ fn moe_step(
         k::base(&s.act_x_s),
         dim,
     );
+    dump_u8(
+        c,
+        &s.act_x,
+        dim,
+        format!("d_pos{}_actX{}.u8", crate::dump::pos(), l),
+    );
+    dump_u8(
+        c,
+        &s.act_x_s,
+        dim / 32,
+        format!("d_pos{}_actXs{}.u8", crate::dump::pos(), l),
+    );
     prof.add_us(2, t_gate);
 
     if layer.w1_all.is_some() {
