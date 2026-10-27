@@ -1160,7 +1160,7 @@ fn uploaded_expert_bytes_match_store_all_layers() {
                 let sd = q4.s.own_for_test().expect("TP1 scales upload");
                 let mut host = vec![0u8; wd.len()];
                 wd.copy_to(&mut host).unwrap();
-                if host != v.bytes {
+                if host != v {
                     let first = host
                         .iter()
                         .zip(v.iter())
@@ -1171,7 +1171,7 @@ fn uploaded_expert_bytes_match_store_all_layers() {
                         host.len(),
                         v.len(),
                         host[first],
-                        v.bytes[first],
+                        v[first],
                     );
                     bad += 1;
                 }
