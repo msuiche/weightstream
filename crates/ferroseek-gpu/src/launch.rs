@@ -270,6 +270,33 @@ pub fn fp8_gemm(c: &Cuda, a: U8, sa: U8, b: U8, sb: U8, out: F32, m: usize, n: u
     }
 }
 
+/// `fp8_gemm_tile` (fp8_gemm_tile.cu): M-batch tiled form of fp8_gemm —
+/// one 16x32 output tile per block, each thread owning one output
+/// accumulated over whole K-blocks (no block_reduce). For M > 1 batched
+/// steps; the M=1 path keeps fp8_gemm (bit-exact with the gate history).
+pub fn fp8_gemm_tile(
+    c: &Cuda,
+    a: U8,
+    sa: U8,
+    b: U8,
+    sb: U8,
+    out: F32,
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    let f = c.fp8_gemm_tile.get_function("fp8_gemm_tile").unwrap();
+    let stream = &c.stream;
+    let gx = n.div_ceil(32) as u32;
+    let gy = m.div_ceil(16) as u32;
+    unsafe {
+        launch!(
+            f<<<(gx, gy), 512, 0, stream>>>(a, sa, b, sb, out, m as i32, n as i32, k as i32)
+        )
+        .unwrap()
+    }
+}
+
 /// `fp4_expert_gemm` (fp4_expert_gemm.cu): fp8 act × packed fp4 weight.
 #[allow(clippy::too_many_arguments)]
 pub fn fp4_gemm(c: &Cuda, a: U8, sa: U8, b: U8, sb: U8, out: F32, m: usize, n: usize, k: usize) {

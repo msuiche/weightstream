@@ -20,6 +20,7 @@ const INDEXER_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/indexer.ptx"))
 const ENGRAM_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/engram.ptx"));
 const SAMPLE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/sample.ptx"));
 const MOE_GROUPED_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_grouped.ptx"));
+const FP8_GEMM_TILE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fp8_gemm_tile.ptx"));
 
 pub struct Cuda {
     pub context: Context,
@@ -41,6 +42,7 @@ pub struct Cuda {
     pub engram: Module,
     pub sample: Module,
     pub moe_grouped: Module,
+    pub fp8_gemm_tile: Module,
 }
 
 static CUDA: Mutex<Option<Cuda>> = Mutex::new(None);
@@ -79,6 +81,8 @@ impl Cuda {
             let engram = Module::from_ptx(ENGRAM_PTX, &[]).expect("engram module");
             let sample = Module::from_ptx(SAMPLE_PTX, &[]).expect("sample module");
             let moe_grouped = Module::from_ptx(MOE_GROUPED_PTX, &[]).expect("moe_grouped module");
+            let fp8_gemm_tile =
+                Module::from_ptx(FP8_GEMM_TILE_PTX, &[]).expect("fp8_gemm_tile module");
             *guard = Some(Cuda {
                 context,
                 device,
@@ -99,6 +103,7 @@ impl Cuda {
                 engram,
                 sample,
                 moe_grouped,
+                fp8_gemm_tile,
             });
         }
         // tests run on many threads; the lock holder always becomes current

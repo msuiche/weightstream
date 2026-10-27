@@ -507,3 +507,109 @@ fn gpu_streaming_checkpoint_matches_upload() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn fp8_gemm_tile_matches_cpu_and_m1() {
+    // The M-batch tile kernel: same math as fp8_gemm, different reduction
+    // order (whole-K per thread, no block_reduce tree) — assert against
+    // the CPU mirror within the engine gate's tolerance class, and
+    // against the M=1 kernel at the tolerance the engine documents for
+    // op-order divergence (~1e-6 per element here; 1e-4 is the gate).
+    let guard = Cuda::global();
+    let c = guard.as_ref().unwrap();
+    let (m, n, k) = (6usize, 512usize, 1024usize);
+    let kb = k / 32;
+
+    // A: fp8 + per-row-32 scales; B: fp8 + 32x32-block scales
+    let a_f: Vec<f32> = rand_vec(m * k, 99)
+        .iter()
+        .map(|v| (v % 3.0 - 1.0) * 0.5)
+        .collect();
+    let b_f: Vec<f32> = rand_vec(n * k, 123)
+        .iter()
+        .map(|v| (v % 3.0 - 1.0) * 0.25)
+        .collect();
+    let qa: Vec<u8> = a_f
+        .iter()
+        .map(|&v| ferroseek_core::quant::f32_to_e4m3(v))
+        .collect();
+    let qb: Vec<u8> = b_f
+        .iter()
+        .map(|&v| ferroseek_core::quant::f32_to_e4m3(v))
+        .collect();
+    let sa: Vec<u8> = vec![127u8; m * kb]; // scale 1.0
+    let sb: Vec<u8> = vec![127u8; (n / 32) * kb];
+
+    // CPU mirror: dequant fp8, dot in the kernel's k order
+    let da: Vec<f32> = qa
+        .iter()
+        .map(|&v| ferroseek_core::quant::e4m3_to_f32(v))
+        .collect();
+    let db: Vec<f32> = qb
+        .iter()
+        .map(|&v| ferroseek_core::quant::e4m3_to_f32(v))
+        .collect();
+    let mut expect = vec![0.0f32; m * n];
+    for mi in 0..m {
+        for ni in 0..n {
+            let mut acc = 0.0f32;
+            for b in 0..kb {
+                let mut dot = 0.0f32;
+                for kk in 0..32 {
+                    dot += da[mi * k + b * 32 + kk] * db[ni * k + b * 32 + kk];
+                }
+                acc += dot;
+            }
+            expect[mi * n + ni] = acc;
+        }
+    }
+
+    let d_a = DeviceBuffer::from_slice(&qa).unwrap();
+    let d_sa = DeviceBuffer::from_slice(&sa).unwrap();
+    let d_b = DeviceBuffer::from_slice(&qb).unwrap();
+    let d_sb = DeviceBuffer::from_slice(&sb).unwrap();
+    let mut d_c = DeviceBuffer::from_slice(&vec![0f32; m * n]).unwrap();
+    crate::launch::fp8_gemm_tile(
+        c,
+        d_a.as_device_ptr(),
+        d_sa.as_device_ptr(),
+        d_b.as_device_ptr(),
+        d_sb.as_device_ptr(),
+        d_c.as_device_ptr(),
+        m,
+        n,
+        k,
+    );
+    c.stream.synchronize().unwrap();
+    let mut got = vec![0f32; m * n];
+    d_c.copy_to(&mut got).unwrap();
+    let d = max_abs_diff(&got, &expect);
+    assert!(d < 1e-3, "tile vs CPU max diff {d:.3e}");
+    assert!(
+        got.iter()
+            .zip(&expect)
+            .all(|(g, e)| (g - e).abs() < 1e-3 * (1.0 + e.abs())),
+        "tile vs CPU per-element diff above tolerance"
+    );
+
+    // cross-check every row against the M=1 kernel (the gate-history path)
+    let mut d_c1 = DeviceBuffer::from_slice(&vec![0f32; m * n]).unwrap();
+    for mi in 0..m {
+        crate::launch::fp8_gemm(
+            c,
+            crate::launch::row_u8(&d_a, mi * k, k),
+            crate::launch::row_u8(&d_sa, mi * kb, kb),
+            d_b.as_device_ptr(),
+            d_sb.as_device_ptr(),
+            crate::launch::row(&d_c1, mi * n, n),
+            1,
+            n,
+            k,
+        );
+    }
+    c.stream.synchronize().unwrap();
+    let mut got1 = vec![0f32; m * n];
+    d_c1.copy_to(&mut got1).unwrap();
+    let d1 = max_abs_diff(&got, &got1);
+    assert!(d1 < GATE_ABS_TOL, "tile vs M=1 max diff {d1:.3e}");
+}
