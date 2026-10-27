@@ -13,6 +13,7 @@ USAGE:
     ferroseek decode <model-dir> <prompt> [max-tokens] [--engine cpu|gpu] [--stream] [--max-seq N]
                                    [--tp4 --rank N --ring nodes-ring4.local.json]
                                    [--prompts-file path]  More requests after the first (one per line)
+                                   [--temperature T] [--top-p P] [--seed N]  Sampling (0 = greedy)
                                    Greedy decode (default: cpu reference engine;
                                    gpu + --stream reads weights straight from the
                                    registered checkpoint mmaps, docs/streaming.md)
@@ -330,6 +331,9 @@ fn cmd_decode(args: &[String]) -> ExitCode {
     let mut tp_ring = String::new();
     let mut tp_port: u16 = 29871;
     let mut prompts_file: Option<String> = None;
+    let mut temperature: f32 = 0.0;
+    let mut top_p: f32 = 1.0;
+    let mut seed: u64 = ferroseek_ref::REFERENCE_SEED;
     let mut tp_wait_ms: u64 = 60_000;
     let mut i = 4;
     while i < args.len() {
@@ -343,6 +347,18 @@ fn cmd_decode(args: &[String]) -> ExitCode {
             }
             "--prompts-file" if i + 1 < args.len() => {
                 prompts_file = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--temperature" if i + 1 < args.len() => {
+                temperature = args[i + 1].parse().unwrap_or(0.0);
+                i += 2;
+            }
+            "--top-p" if i + 1 < args.len() => {
+                top_p = args[i + 1].parse().unwrap_or(1.0);
+                i += 2;
+            }
+            "--seed" if i + 1 < args.len() => {
+                seed = args[i + 1].parse().unwrap_or(seed);
                 i += 2;
             }
             "--logits-out" if i + 1 < args.len() => {
@@ -819,8 +835,27 @@ fn cmd_serve(args: &[String]) -> ExitCode {
                         .to_string();
                     let max_tokens =
                         cmd.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(64) as u32;
+                    let temperature = cmd
+                        .get("temperature")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0) as f32;
+                    let top_p = cmd.get("top_p").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                    let seed = cmd
+                        .get("seed")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(ferroseek_ref::REFERENCE_SEED);
                     if prompt.is_empty()
-                        || serve_decode(&mut model, &tk, &prompt, max_tokens, None).is_err()
+                        || serve_decode(
+                            &mut model,
+                            &tk,
+                            &prompt,
+                            max_tokens,
+                            temperature,
+                            top_p,
+                            seed,
+                            None,
+                        )
+                        .is_err()
                     {
                         break;
                     }
@@ -860,12 +895,24 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         if let Err(e) = session.next_request(Some(serde_json::json!({
             "prompt": req.prompt,
             "max_tokens": req.max_tokens,
+            "temperature": req.temperature,
+            "top_p": req.top_p,
+            "seed": req.seed,
         }))) {
             eprintln!("tp4 next_request: {e}");
             let _ = tok_tx.send(serve::TokenEvent::Done);
             break;
         }
-        let _ = serve_decode(&mut model, &tk, &req.prompt, req.max_tokens, Some(tok_tx));
+        let _ = serve_decode(
+            &mut model,
+            &tk,
+            &req.prompt,
+            req.max_tokens,
+            req.temperature,
+            req.top_p,
+            req.seed,
+            Some(tok_tx),
+        );
         let _ = model.reset();
     }
     let _ = http.join();

@@ -44,8 +44,20 @@ impl GumbelSampler {
         (-(1.0 - u).ln()) as f32
     }
 
-    /// One sample from `logits` at `temperature`.
+    /// One sample from `logits` at `temperature` (spec §10's Gumbel-max;
+    /// `temperature == 0` is argmax — the exact greedy gate path).
     pub fn sample(&mut self, logits: &[f32], temperature: f32) -> u32 {
+        self.sample_p(logits, temperature, 1.0)
+    }
+
+    /// `sample` with nucleus filtering: keep the smallest set of
+    /// highest-probability tokens whose cumulative probability reaches
+    /// `top_p` (at least one token), then Gumbel-max over the nucleus.
+    /// `top_p >= 1.0` disables filtering — identical to `sample`.
+    /// vLLM-compat serving surface; the base model spec itself is
+    /// temperature-only (spec §12.10), so top_p here is an engine-side
+    /// option documented to diverge from the reference's sampler.
+    pub fn sample_p(&mut self, logits: &[f32], temperature: f32, top_p: f32) -> u32 {
         if temperature == 0.0 {
             return argmax(logits);
         }
@@ -67,10 +79,29 @@ impl GumbelSampler {
         for p in probs.iter_mut() {
             *p /= sum;
         }
-        // argmax(probs / Exp(1))
+        // nucleus: indices sorted by probability descending, accumulate
+        // until the mass reaches top_p (always keep the top token)
+        let mut order: Vec<u32> = (0..logits.len() as u32).collect();
+        order.sort_by(|&a, &b| probs[b as usize].total_cmp(&probs[a as usize]));
+        let mut in_nucleus = vec![false; logits.len()];
+        let mut acc = 0.0f32;
+        let mut keep = 0usize;
+        for &i in &order {
+            in_nucleus[i as usize] = true;
+            acc += probs[i as usize];
+            keep += 1;
+            if acc >= top_p {
+                break;
+            }
+        }
+        let _ = keep;
+        // Gumbel-max over the nucleus (argmax(probs / Exp(1)))
         let mut best = 0usize;
         let mut bv = f32::NEG_INFINITY;
         for (i, &p) in probs.iter().enumerate() {
+            if !in_nucleus[i] {
+                continue;
+            }
             let s = p / self.exp1();
             if s > bv {
                 bv = s;
@@ -104,5 +135,26 @@ mod tests {
         let logits: Vec<f32> = (0..64).map(|i| if i == 33 { 30.0 } else { 0.0 }).collect();
         let hits = (0..20).filter(|_| g.sample(&logits, 0.01) == 33).count();
         assert!(hits >= 18, "{hits}/20");
+    }
+
+    #[test]
+    fn nucleus_top_p_zero_is_argmax() {
+        // top_p -> 0 keeps only the top token: exact greedy
+        let mut s = GumbelSampler::new(7);
+        let logits = [0.1, 5.0, 0.2, 4.9];
+        for _ in 0..10 {
+            assert_eq!(s.sample_p(&logits, 1.0, 0.0), 1);
+        }
+    }
+
+    #[test]
+    fn nucleus_top_p_one_matches_sample() {
+        // top_p = 1.0 keeps everything: identical draws to sample()
+        let mut a = GumbelSampler::new(42);
+        let mut b = GumbelSampler::new(42);
+        let logits = [1.0f32, 2.0, 3.0, 4.0];
+        for _ in 0..8 {
+            assert_eq!(a.sample_p(&logits, 0.9, 1.0), b.sample(&logits, 0.9));
+        }
     }
 }

@@ -26,6 +26,9 @@ pub struct ServeRequest {
     pub prompt: String,
     pub max_tokens: u32,
     pub stream: bool,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub seed: u64,
 }
 
 /// The decode loop's answer: generated tokens, streamed one at a time.
@@ -95,6 +98,15 @@ pub fn read_request(stream: &mut TcpStream) -> Result<(ServeRequest, String), (u
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let temperature = json
+        .get("temperature")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0) as f32;
+    let top_p = json.get("top_p").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+    let seed = json
+        .get("seed")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(ferroseek_ref::REFERENCE_SEED);
     if prompt.is_empty() {
         return Err((400u16, "empty prompt"));
     }
@@ -103,11 +115,13 @@ pub fn read_request(stream: &mut TcpStream) -> Result<(ServeRequest, String), (u
             prompt,
             max_tokens,
             stream,
+            temperature,
+            top_p,
+            seed,
         },
         version,
     ))
 }
-
 pub fn write_status(
     stream: &mut TcpStream,
     code: u16,
