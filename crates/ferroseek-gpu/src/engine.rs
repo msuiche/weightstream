@@ -907,25 +907,8 @@ fn upload_layer(
         }
         let prod: Vec<f32> = qw.iter().zip(&kw).map(|(&a, &b)| a * b).collect();
         Some(GpuEngram {
-            // the 98 GB real-checkpoint slab must stay host-gathered; at
-            // TP1 (synthetic gate) upload — matches the pre-6e8ebdc
-            // device-gather the gate history validated
-            embed_w: if sh.world_size == 1 {
-                W8::device(up_u8(
-                    c,
-                    &view_bytes(store, &format!("{p}.engram.embed.weight"))?,
-                )?)
-            } else {
-                W8::host_backed(store.get(&format!("{p}.engram.embed.weight"))?.bytes)
-            },
-            embed_s: if sh.world_size == 1 {
-                W8::device(up_u8(
-                    c,
-                    &view_bytes(store, &format!("{p}.engram.embed.scale"))?,
-                )?)
-            } else {
-                W8::host_backed(store.get(&format!("{p}.engram.embed.scale"))?.bytes)
-            },
+            embed_w: W8::host_backed(store.get(&format!("{p}.engram.embed.weight"))?.bytes),
+            embed_s: W8::host_backed(store.get(&format!("{p}.engram.embed.scale"))?.bytes),
             wkv: load_q8(
                 store,
                 c,
