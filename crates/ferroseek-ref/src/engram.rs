@@ -267,6 +267,14 @@ pub fn merge(
         format!("d_pos{}_eflat{layer}.f32", crate::dump::pos()),
         &flat,
     );
+    crate::dump::f32s(
+        format!("d_pos{}_hashids{layer}.f32", crate::dump::pos()),
+        &hash_ids
+            .iter()
+            .take(cols)
+            .map(|&v| v as f32)
+            .collect::<Vec<f32>>(),
+    );
     // wkv: fp8 Linear over the flattened rows -> key per copy + shared value
     let (wkv_w, wkv_s) = store.get2(
         &format!("layers.{layer}.engram.wkv.weight"),

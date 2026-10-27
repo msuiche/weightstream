@@ -1722,6 +1722,10 @@ impl GpuModel<'static> {
                             ncols * ehd,
                             format!("d_pos{}_eflat{}.f32", crate::dump::pos(), layer.layer),
                         );
+                        crate::dump::f32s(
+                            format!("d_pos{}_hashids{}.f32", crate::dump::pos(), layer.layer),
+                            &ids.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+                        );
                     }
                     _ => {
                         k::gather_fp8(
