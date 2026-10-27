@@ -11,6 +11,7 @@ use std::io;
 /// One MoE sublayer: gate scoring, top-`n_activated` routed experts, the
 /// shared expert on every token. Returns the fp32-assembled output `[dim]`.
 pub fn moe(cfg: &RefConfig, ctx: &mut Ctx<'_>, layer: u32, x: &[f32]) -> io::Result<Vec<f32>> {
+    crate::dump::f32s(format!("d_pos{}_gateX{layer}.f32", crate::dump::pos()), x);
     let dim = cfg.dim as usize;
     let nrouted = cfg.n_routed as usize;
     let topk = cfg.n_activated as usize;

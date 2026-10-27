@@ -3047,6 +3047,12 @@ fn moe_step(
     let e_len = n_experts / world;
 
     let t_gate = Instant::now();
+    dump_dev(
+        c,
+        &s.x,
+        dim,
+        format!("d_pos{}_gateX{l}.f32", crate::dump::pos()),
+    );
     if layer.w1_all.is_some() {
         // parallel gate (moe.cu): one block per expert; the one-block form
         // did 384 serial 5120-dots (1.1 ms/call, 20% of GPU time in nsys)
