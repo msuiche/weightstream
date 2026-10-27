@@ -1,3 +1,5 @@
+mod serve;
+
 use ferroseek_core::{kv, ModelConfig};
 use std::path::Path;
 use std::process::ExitCode;
@@ -10,10 +12,14 @@ USAGE:
     ferroseek tokens <model-dir> <text>  Encode text, print token ids
     ferroseek decode <model-dir> <prompt> [max-tokens] [--engine cpu|gpu] [--stream] [--max-seq N]
                                    [--tp4 --rank N --ring nodes-ring4.local.json]
+                                   [--prompts-file path]  More requests after the first (one per line)
                                    Greedy decode (default: cpu reference engine;
                                    gpu + --stream reads weights straight from the
                                    registered checkpoint mmaps, docs/streaming.md)
-    ferroseek serve <model-dir>    OpenAI-compatible endpoint (phase 3)
+    ferroseek serve <model-dir> [--tp4 --ring nodes-ring4.local.json] [--port N]
+                                   OpenAI-compatible endpoint on the head rank;
+                                   POST /v1/completions (prompt, max_tokens, stream);
+                                   workers wait on the control channel
     ferroseek bench <model-dir>    Decode/prefill microbench (phase 4)
 
 Docs: docs/architecture.md
@@ -26,11 +32,15 @@ fn main() -> ExitCode {
         Some("weights") => cmd_weights(args.get(1)),
         Some("tokens") => cmd_tokens(args.get(1), args.get(2)),
         Some("decode") => cmd_decode(&args),
-        Some("serve") | Some("bench") => {
-            eprintln!(
-                "{}: not yet — phases and kernel strategy in docs/architecture.md",
-                args[0]
-            );
+        #[cfg(all(feature = "cuda", target_os = "linux"))]
+        Some("serve") => cmd_serve(&args),
+        #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+        Some("serve") => {
+            eprintln!("serve needs the cuda feature on linux");
+            ExitCode::from(2)
+        }
+        Some("bench") => {
+            eprintln!("bench: not yet — phases and kernel strategy in docs/architecture.md");
             ExitCode::from(2)
         }
         _ => {
@@ -701,6 +711,206 @@ fn cmd_decode(args: &[String]) -> ExitCode {
     overall
 }
 
+/// `serve <model-dir> [--tp4 --rank N --ring ...] [--port N]` — the
+/// OpenAI-compatible endpoint (docs/transport.md milestone 4). The head
+/// rank owns the engine and the HTTP listener; workers loop on the tp4
+/// control channel (`Session::next_request`), decoding whatever the head
+/// broadcasts in lockstep. One request at a time — the ring's SPMD
+/// contract serializes requests by design; batching is a later milestone.
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn cmd_serve(args: &[String]) -> ExitCode {
+    let Some(dir) = args.get(1) else {
+        eprint!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    let mut port: u16 = 8000;
+    let mut tp_ring = String::new();
+    let mut tp_rank: Option<u8> = None;
+    let mut tp_port: u16 = 29871;
+    let mut max_seq: u64 = 4096;
+    let mut tp_wait_ms: u64 = 60_000;
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--port" if i + 1 < args.len() => {
+                port = args[i + 1].parse().unwrap_or(port);
+                i += 2;
+            }
+            "--tp4" => {
+                i += 1;
+            }
+            "--rank" if i + 1 < args.len() => {
+                tp_rank = args[i + 1].parse().ok();
+                i += 2;
+            }
+            "--ring" if i + 1 < args.len() => {
+                tp_ring = args[i + 1].clone();
+                i += 2;
+            }
+            "--tp-port" if i + 1 < args.len() => {
+                tp_port = args[i + 1].parse().unwrap_or(tp_port);
+                i += 2;
+            }
+            "--max-seq" if i + 1 < args.len() => {
+                max_seq = args[i + 1].parse().unwrap_or(max_seq);
+                i += 2;
+            }
+            "--tp-wait-ms" if i + 1 < args.len() => {
+                tp_wait_ms = args[i + 1].parse().unwrap_or(tp_wait_ms);
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    if tp_ring.is_empty() {
+        eprintln!("serve --tp4 needs --ring <nodes-ring4.local.json>");
+        return ExitCode::from(2);
+    }
+
+    let tk = match ferroseek_tokenizer::Tokenizer::from_model_dir(Path::new(dir)) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("tokenizer: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let ckpt = match ferroseek_core::Checkpoint::open(Path::new(dir)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("checkpoint: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let t0_load = std::time::Instant::now();
+    let (mut model, mut session) = match build_engine_tp4(
+        ckpt, &tp_ring, tp_rank, tp_port, max_seq, tp_wait_ms,
+        false, // upload mode — the production path (docs/transport.md)
+    ) {
+        Ok((m, s)) => (m, s),
+        Err(e) => {
+            eprintln!("tp4: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = session.start_barrier() {
+        eprintln!("tp4 start barrier: {e}");
+        return ExitCode::FAILURE;
+    }
+    eprintln!(
+        "tp4 rank {}: all ranks loaded in {:?}",
+        session.rank,
+        t0_load.elapsed()
+    );
+    match ferroseek_tokenizer::engram_map::build_compressed_token_map(&tk) {
+        Ok(map) => model.set_token_map(map),
+        Err(e) => eprintln!("warning: engram token map not built ({e})"),
+    }
+
+    let is_head = session.rank == 0;
+    if !is_head {
+        // worker: decode whatever the head broadcasts, forever
+        loop {
+            match session.next_request(None) {
+                Ok(Some(cmd)) => {
+                    let prompt = cmd
+                        .get("prompt")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let max_tokens =
+                        cmd.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(64) as u32;
+                    if prompt.is_empty()
+                        || serve_decode(&mut model, &tk, &prompt, max_tokens, None).is_err()
+                    {
+                        break;
+                    }
+                    if model.reset().is_err() {
+                        break;
+                    }
+                }
+                _ => break, // Bye or error: done
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    // head: the submit queue carries (request, token-sender) pairs; the
+    // HTTP thread creates the per-request channel, the decode owner
+    // replies on it. One request at a time — the ring is lockstep SPMD.
+    let (tx, rx) = std::sync::mpsc::channel::<(
+        serve::ServeRequest,
+        std::sync::mpsc::Sender<serve::TokenEvent>,
+    )>();
+    let http = std::thread::spawn(move || {
+        let _ = serve::serve_forever(
+            &format!("0.0.0.0:{port}"),
+            move |req: serve::ServeRequest| {
+                let (tok_tx, tok_rx) = std::sync::mpsc::channel::<serve::TokenEvent>();
+                tx.send((req, tok_tx)).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string())
+                })?;
+                Ok(tok_rx)
+            },
+        );
+    });
+
+    // decode owner: one request at a time, lockstep with the workers
+    while let Ok((req, tok_tx)) = rx.recv() {
+        // broadcast to the workers (they mirror the decode in lockstep)
+        if let Err(e) = session.next_request(Some(serde_json::json!({
+            "prompt": req.prompt,
+            "max_tokens": req.max_tokens,
+        }))) {
+            eprintln!("tp4 next_request: {e}");
+            let _ = tok_tx.send(serve::TokenEvent::Done);
+            break;
+        }
+        let _ = serve_decode(&mut model, &tk, &req.prompt, req.max_tokens, Some(tok_tx));
+        let _ = model.reset();
+    }
+    let _ = http.join();
+    session.finish();
+    ExitCode::SUCCESS
+}
+
+/// Decode `prompt` streaming each generated token to `sink` (when Some).
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn serve_decode(
+    model: &mut Box<dyn Decoder>,
+    tk: &ferroseek_tokenizer::Tokenizer,
+    prompt: &str,
+    max_tokens: u32,
+    mut sink: Option<std::sync::mpsc::Sender<serve::TokenEvent>>,
+) -> std::io::Result<()> {
+    let ids = tk.encode(prompt);
+    if ids.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty prompt",
+        ));
+    }
+    let mut logits = Vec::new();
+    let mut pos = 0u64;
+    for &t in ids.iter() {
+        logits = model.decode(t, pos)?;
+        pos += 1;
+    }
+    for _ in 0..max_tokens {
+        let next = ferroseek_ref::sample::argmax(&logits);
+        if let Some(tx) = sink.as_ref() {
+            let _ = tx.send(serve::TokenEvent::Token(tk.decode(&[next])));
+        }
+        if Some(next) == tk.eos_token_id {
+            break;
+        }
+        logits = model.decode(next, pos)?;
+        pos += 1;
+    }
+    if let Some(tx) = sink.as_ref() {
+        let _ = tx.send(serve::TokenEvent::Done);
+    }
+    Ok(())
+}
 fn cmd_tokens(dir: Option<&String>, text: Option<&String>) -> ExitCode {
     let (Some(dir), Some(text)) = (dir, text) else {
         eprint!("{USAGE}");
