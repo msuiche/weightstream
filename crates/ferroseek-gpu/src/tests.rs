@@ -1191,3 +1191,60 @@ fn uploaded_expert_bytes_match_store_all_layers() {
     assert_eq!(bad, 0, "{bad} expert tensors differ from the store");
     eprintln!("all uploaded expert bytes match the store at every layer");
 }
+
+#[test]
+fn gpu_engine_flip_bisect_in_process() {
+    // The deterministic S1 flip, bisected IN-PROCESS (immune to the
+    // cross-run dump-pairing artifacts): capture x (attention input)
+    // and y (MoE output) per step on BOTH engines, report the first
+    // (step, layer, boundary) that diverges beyond the noise floor.
+    let mut cpu = ref_model(42);
+    let mut gpu = gpu_model(42);
+    cpu.debug_capture_x(true);
+    gpu.debug_capture_x(true);
+    cpu.debug_capture_y(true);
+    gpu.debug_capture_y(true);
+    let mut flipped = false;
+    for (p, &t) in TOKENS.iter().enumerate() {
+        let cl = cpu.decode(t, p as u64).unwrap();
+        let gl = gpu.decode(t, p as u64).unwrap();
+        let cx = cpu.debug_take_captures();
+        let gx = gpu.debug_take_captures();
+        let cy = cpu.debug_take_y();
+        let gy = gpu.debug_take_y();
+        cpu.debug_capture_x(true); // re-arm
+        gpu.debug_capture_x(true);
+        cpu.debug_capture_y(true);
+        gpu.debug_capture_y(true);
+        for (i, ((lx, cxv), (_, gxv))) in cx.iter().zip(gx.iter()).enumerate() {
+            let d = max_abs_diff(cxv, gxv);
+            if d > 1e-5 {
+                eprintln!(
+                    "step {p}: FIRST divergence at ATTENTION INPUT, layer {lx} (cap {i}): {d:.3e}"
+                );
+                assert!(p > 0, "divergence at step 0 input — structural");
+                return;
+            }
+        }
+        for (i, ((ly, cyv), (_, gyv))) in cy.iter().zip(gy.iter()).enumerate() {
+            let d = max_abs_diff(cyv, gyv);
+            if d > 1e-5 {
+                eprintln!(
+                    "step {p}: FIRST divergence at MOE OUTPUT, layer {ly} (cap {i}): {d:.3e}",
+                );
+                let cd = max_abs_diff(&cl, &gl);
+                eprintln!("step {p}: logits diff at same step: {cd:.3e}");
+                flipped = true;
+                if p >= 2 {
+                    return;
+                }
+                break;
+            }
+        }
+        if flipped {
+            break;
+        }
+        let d = max_abs_diff(&cl, &gl);
+        eprintln!("step {p}: clean (max {d:.3e})",);
+    }
+}

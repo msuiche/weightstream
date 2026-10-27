@@ -69,6 +69,7 @@ pub struct Runtime {
     pub pos: u64,
     /// Debug: when Some, every attention sublayer records (layer, x).
     pub capture_x: Option<Vec<(u32, Vec<f32>)>>,
+    pub capture_y: Option<Vec<(u32, Vec<f32>)>>,
 }
 
 /// Borrow bundle passed through the layer pipeline.
@@ -204,6 +205,7 @@ impl<'a> RefModel<'a> {
             token_map: None,
             pos: 0,
             capture_x: None,
+            capture_y: None,
         };
         Ok(Self {
             cfg,
@@ -291,6 +293,16 @@ impl<'a> RefModel<'a> {
     /// Debug: capture every attention sublayer's input x (gate tooling).
     pub fn debug_capture_x(&mut self, on: bool) {
         self.rt.capture_x = if on { Some(Vec::new()) } else { None };
+    }
+
+    /// Debug: capture every MoE sublayer's output y.
+    pub fn debug_capture_y(&mut self, on: bool) {
+        self.rt.capture_y = if on { Some(Vec::new()) } else { None };
+    }
+
+    /// Debug: take the captured (layer, y) pairs.
+    pub fn debug_take_y(&mut self) -> Vec<(u32, Vec<f32>)> {
+        self.rt.capture_y.take().unwrap_or_default()
     }
 
     /// Debug: take the captured (layer, x) pairs.
@@ -478,6 +490,9 @@ impl<'a> RefModel<'a> {
                 x
             };
             let mut x = moe::moe(cfg, &mut ctx, l, &x)?;
+            if let Some(cap) = rt.capture_y.as_mut() {
+                cap.push((l, x.clone()));
+            }
             dump(format!("pos{position}_ffn{l}.f32"), &x);
             snap_bf16(&mut x);
             let mut h2 = hc::hc_post(&x, &h, &f_post, &f_comb, hc, dim);

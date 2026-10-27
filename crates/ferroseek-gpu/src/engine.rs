@@ -609,6 +609,8 @@ struct RunState {
     index_k_src: usize,
     candidates: Vec<bool>,
     shared_n_sel: usize,
+    /// Debug: capture every MoE sublayer's output y (gate bisection).
+    capture_y: Option<Vec<(u32, Vec<f32>)>>,
     /// Debug: when Some, every attention sublayer records (layer, x).
     capture_x: Option<Vec<(u32, Vec<f32>)>>,
 }
@@ -1339,6 +1341,7 @@ impl GpuModel<'static> {
             index_k_src: 0,
             candidates: Vec::new(),
             shared_n_sel: 0,
+            capture_y: None,
             capture_x: None,
         };
         self.pos = 0;
@@ -1469,6 +1472,16 @@ impl GpuModel<'static> {
     /// Debug: capture every attention sublayer's input x (gate tooling).
     pub fn debug_capture_x(&mut self, on: bool) {
         self.run.capture_x = if on { Some(Vec::new()) } else { None };
+    }
+
+    /// Debug: capture every MoE sublayer's output y.
+    pub fn debug_capture_y(&mut self, on: bool) {
+        self.run.capture_y = if on { Some(Vec::new()) } else { None };
+    }
+
+    /// Debug: take the captured (layer, y) pairs.
+    pub fn debug_take_y(&mut self) -> Vec<(u32, Vec<f32>)> {
+        self.run.capture_y.take().unwrap_or_default()
     }
 
     /// Debug: take the captured (layer, x) pairs.
@@ -3040,6 +3053,7 @@ fn moe_step(
     sh: Sharding,
     mut comm: Option<&mut (dyn Collectives + 'static)>,
     prof: &mut Prof,
+    run: Option<&mut RunState>,
 ) -> io::Result<()> {
     let l = layer.layer;
     let dim = cfg.dim as usize;
@@ -3367,5 +3381,12 @@ fn moe_step(
         dim,
         format!("d_pos{}_y{l}.f32", crate::dump::pos()),
     );
+    if let Some(run) = run {
+        if run.capture_y.is_some() {
+            let mut host = vec![0.0f32; dim];
+            s.y_moe.copy_to(&mut host).map_err(cuda_err)?;
+            run.capture_y.as_mut().unwrap().push((l, host));
+        }
+    }
     Ok(())
 }
