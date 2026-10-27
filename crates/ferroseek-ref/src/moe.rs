@@ -84,6 +84,10 @@ pub fn moe(cfg: &RefConfig, ctx: &mut Ctx<'_>, layer: u32, x: &[f32]) -> io::Res
     }
 
     // shared expert on every token, no routing weight (model.py:905)
+    crate::dump::f32s(
+        format!("d_pos{}_yrouted{layer}.f32", crate::dump::pos()),
+        &y,
+    );
     let shared = shared_expert_hidden(cfg, ctx, &p, x)?;
     for d in 0..dim {
         y[d] += shared[d];

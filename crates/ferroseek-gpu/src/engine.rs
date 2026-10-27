@@ -3279,7 +3279,12 @@ fn moe_step(
         let red = comm.allreduce(&s.coll_stage.as_f32()[..dim])?;
         s.y_moe.copy_from(&red).map_err(cuda_err)?;
     }
-
+    dump_dev(
+        c,
+        &s.y_moe,
+        dim,
+        format!("d_pos{}_yrouted{l}.f32", crate::dump::pos()),
+    );
     // shared expert on every token, added last (model.py:905)
     let [w1, w2, w3] = &layer.shared_experts;
     k::fp8_gemm(
