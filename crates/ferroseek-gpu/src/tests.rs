@@ -1425,3 +1425,69 @@ fn moe_gate_m_and_rmsnorm_m_bitexact() {
     assert_eq!(got_n, expect_n, "rmsnorm_m diverged from per-row rmsnorm");
     eprintln!("moe_gate_m + rmsnorm_m: bit-identical over {m} rows");
 }
+
+#[test]
+fn decode_m_matches_sequential_decode() {
+    // THE M-batch gate: decode_m(TOKENS) must match sequential decode()
+    // per position within the engine's documented op-order class (the
+    // GEMM m>1 reduction order differs from the m=1 GEMV path), with
+    // argmax agreement, and the post-pass model state must be identical:
+    // two further sequential steps on both models must match too.
+    let mut seq = gpu_model(42);
+    let mut bat = gpu_model(42);
+
+    let seq_logits: Vec<Vec<f32>> = TOKENS
+        .iter()
+        .enumerate()
+        .map(|(p, &t)| seq.decode(t, p as u64).unwrap())
+        .collect();
+    let bat_logits = bat.decode_m(&TOKENS).unwrap();
+
+    let mut worst = 0.0f32;
+    for (p, (a, b)) in seq_logits.iter().zip(bat_logits.iter()).enumerate() {
+        let d = max_abs_diff(a, b);
+        worst = worst.max(d);
+        eprintln!(
+            "step {p}: decode_m max diff {d:.3e} (argmax {} vs {})",
+            ferroseek_ref::argmax(a),
+            ferroseek_ref::argmax(b)
+        );
+    }
+    assert!(
+        worst < GATE_ABS_TOL,
+        "decode_m diverged from sequential: {worst:.3e} beyond the {GATE_ABS_TOL:.0e} floor"
+    );
+
+    // state equivalence: continue both sequentially
+    for (j, &t) in [29u32, 31].iter().enumerate() {
+        let p = TOKENS.len() + j;
+        let a = seq.decode(t, p as u64).unwrap();
+        let b = bat.decode(t, p as u64).unwrap();
+        let d = max_abs_diff(&a, &b);
+        assert!(
+            d < GATE_ABS_TOL,
+            "post-pass state diverged at step {p}: {d:.3e}"
+        );
+        eprintln!("post step {p}: state match {d:.3e}");
+    }
+    eprintln!("decode_m: 8-position batch matches sequential within {worst:.3e}");
+
+    // wall time: the batch amortizes ~240 kernel launches per position
+    let mut seq2 = gpu_model(42);
+    let t0 = std::time::Instant::now();
+    for (p, &t) in TOKENS.iter().enumerate() {
+        let _ = seq2.decode(t, p as u64).unwrap();
+    }
+    let t_seq = t0.elapsed();
+    let mut bat2 = gpu_model(42);
+    let t0 = std::time::Instant::now();
+    let _ = bat2.decode_m(&TOKENS).unwrap();
+    let t_bat = t0.elapsed();
+    eprintln!(
+        "decode_m wall: {:?} vs sequential {:?} ({:.1}x)",
+        t_bat,
+        t_seq,
+        t_seq.as_secs_f64() / t_bat.as_secs_f64().max(1e-9)
+    );
+}
+

@@ -42,3 +42,30 @@ fusion behind a profile.
   in device memory.
 - Ring buffers (window KV, index caches) are pre-allocated at
   `max_seq_len` and never reallocated mid-sequence.
+
+## M-batch decode (decode_m, 2026-10-27)
+
+`GpuModel::decode_m(&[u32])` runs one teacher-forced pass over m known
+tokens (prefill chunks, speculative verification) instead of m
+sequential `decode` calls. Batched: embedding, every GEMM (fp8_gemm's
+grid is (N, M) — same per-block reduction per output, so results are
+bit-identical to the m=1 GEMV path), hc (all kernels already grid over
+n_tokens), rmsnorm_m, moe_gate_m, rope_uniform_pos_buf, sparse_attn_m
+(grid (n_heads, m) over per-position causal idx lists, -1-padded).
+Sequential per position: ring writes, the CSA compressor state machine,
+indexer key append + selection, engram hashing — the position-dependent
+state, evolved in order so the post-pass model state equals m
+sequential decodes. Two batching pitfalls found by the gate: the
+cand_src layer's candidate blocks must be kept per position (the
+source's sequential loop would otherwise leak the last position's set
+into every consumer), and the h-init's ones upload must precede the
+first hc_post.
+
+Gate (`decode_m_matches_sequential_decode`): 8-position batch vs
+sequential — bit-exact (0.0) on every position AND on two further
+sequential continuation steps; wall 8.0 ms vs 13.9 ms (1.7x) on the
+4-layer synthetic. v1 bounds (explicit errors): upload mode, world==1,
+no ring wrap inside a batch (chunk at the window boundary); TP4 and
+streaming modes keep the m=1 path. New kernels gated bit-exact vs
+sequential launches: sparse_attn_m, rope_uniform_pos_buf, moe_gate_m,
+rmsnorm_m (same kernel, grid.x = rows).

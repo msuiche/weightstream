@@ -647,6 +647,8 @@ pub struct GpuModel<'a> {
     head: D<f32>,
     final_norm: D<f32>,
     scratch: Scratch,
+    /// M-row scratch for `decode_m`, grown on first use (None until then).
+    scratch_m: Option<ScratchM>,
     /// Publisher fan-out: for kv-source ordinal s, the layers attending its
     /// compressed rows (source included).
     bands: Vec<Vec<usize>>,
@@ -2534,6 +2536,7 @@ impl<'a> GpuModel<'a> {
             head,
             final_norm,
             scratch,
+            scratch_m: None,
             bands,
             run: RunState {
                 compress_len: vec![0; n_sources],
@@ -3408,5 +3411,1170 @@ fn moe_step(
             run.capture_y.as_mut().unwrap().push((l, host));
         }
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// M-batch decode (teacher-forced): one engine pass over m known tokens.
+// Batched: embedding, hc, norms, rope, projections, sparse_attn, gate.
+// Sequential per position: ring writes, the CSA compressor state machine,
+// indexer key append + selection, engram hashing — the position-dependent
+// state, evolved in order so the post-pass state equals m sequential
+// decode() calls. v1 bounds (explicit errors): upload-mode (w1_all),
+// world == 1, and the batch must not wrap the attention ring.
+
+/// M-row scratch, grown on demand.
+struct ScratchM {
+    m_max: usize,
+    h: [D<f32>; 2],
+    x: D<f32>,
+    qr: D<f32>,
+    q: D<f32>,
+    kvrow: D<f32>,
+    o: D<f32>,
+    fl: D<f32>,
+    attn_out: D<f32>,
+    y_moe: D<f32>,
+    expert_y: D<f32>,
+    gate_buf: D<f32>,
+    up_buf: D<f32>,
+    h_e: D<f32>,
+    eflat: D<f32>,
+    ekv: D<f32>,
+    emb_row: D<f32>,
+    pre_attn: D<f32>,
+    pre_ffn: D<f32>,
+    post: D<f32>,
+    comb: D<f32>,
+    zeros_h: D<f32>,
+    ones_hc: D<f32>,
+    comb_zero: D<f32>,
+    act_x: D<u8>,
+    act_x_s: D<u8>,
+    act_qr: D<u8>,
+    act_qr_s: D<u8>,
+    act_fl: D<u8>,
+    act_fl_s: D<u8>,
+    act_h: D<u8>,
+    act_h_s: D<u8>,
+    act_e: D<u8>,
+    act_e_s: D<u8>,
+    gate_scores: D<f32>,
+    qidx: D<f32>,
+    widx: D<f32>,
+    win_idxs: D<i32>,
+    shared_idxs: D<i32>,
+    pos_q: D<i32>,
+    logits: D<f32>,
+    /// Per-position candidate blocks (host): the cand_src layer computes
+    /// them for all m positions in its sequential loop; uses_cand layers
+    /// consume position i's set at position i. `run.candidates` alone
+    /// would leak the LAST position's set into every position.
+    candidates_m: Vec<Vec<bool>>,
+}
+
+impl ScratchM {
+    fn new(cfg: &RefConfig, engram: &EngramLayout, m: usize) -> io::Result<Self> {
+        let dim = cfg.dim as usize;
+        let hc = cfg.hc_mult as usize;
+        let hd = cfg.head_dim as usize;
+        let heads = cfg.n_heads as usize;
+        let og = cfg.o_groups as usize;
+        let ol = cfg.o_lora as usize;
+        let inter = cfg.inter_dim as usize;
+        let win = cfg.window_size as usize;
+        let ql = cfg.q_lora as usize;
+        let inh = cfg.index_n_heads as usize;
+        let ihd = cfg.index_head_dim as usize;
+        let vocab = cfg.vocab as usize;
+        let ncols = engram.n_hash_cols;
+        let ehd = engram.head_dim;
+        let alloc = |n: usize| -> io::Result<D<f32>> {
+            DeviceBuffer::from_slice(&vec![0.0f32; n.max(1)]).map_err(cuda_err)
+        };
+        let alloc_i = |n: usize| -> io::Result<D<i32>> {
+            DeviceBuffer::from_slice(&vec![0i32; n.max(1)]).map_err(cuda_err)
+        };
+        let alloc_u = |n: usize| -> io::Result<D<u8>> {
+            DeviceBuffer::from_slice(&vec![0u8; n.max(1)]).map_err(cuda_err)
+        };
+        Ok(Self {
+            m_max: m,
+            h: [alloc(m * hc * dim)?, alloc(m * hc * dim)?],
+            x: alloc(m * dim)?,
+            qr: alloc(m * ql)?,
+            q: alloc(m * heads * hd)?,
+            kvrow: alloc(m * hd)?,
+            o: alloc(m * heads * hd)?,
+            fl: alloc(m * og * ol)?,
+            attn_out: alloc(m * dim)?,
+            y_moe: alloc(m * dim)?,
+            expert_y: alloc(m * dim)?,
+            gate_buf: alloc(m * inter)?,
+            up_buf: alloc(m * inter)?,
+            h_e: alloc(m * inter)?,
+            eflat: alloc(m * ncols * ehd)?,
+            ekv: alloc(m * (hc + 1) * dim)?,
+            emb_row: alloc(m * dim)?,
+            pre_attn: alloc(m * hc)?,
+            pre_ffn: alloc(m * hc)?,
+            post: alloc(m * hc)?,
+            comb: alloc(m * hc)?,
+            zeros_h: alloc(m * hc * dim)?,
+            ones_hc: alloc(m * hc)?,
+            comb_zero: alloc(m * hc)?,
+            act_x: alloc_u(m * dim)?,
+            act_x_s: alloc_u(m * dim / 32)?,
+            act_qr: alloc_u(m * ql)?,
+            act_qr_s: alloc_u(m * ql / 32)?,
+            act_fl: alloc_u(m * og * ol)?,
+            act_fl_s: alloc_u(m * og * ol / 32)?,
+            act_h: alloc_u(m * inter)?,
+            act_h_s: alloc_u(m * inter / 32)?,
+            act_e: alloc_u(m * ncols * ehd)?,
+            act_e_s: alloc_u(m * ncols * ehd / 32)?,
+            gate_scores: alloc(m * cfg.n_routed as usize)?,
+            qidx: alloc(m * inh * ihd)?,
+            widx: alloc(m * inh)?,
+            win_idxs: alloc_i(m * win)?,
+            shared_idxs: alloc_i(m * (win + cfg.index_topk as usize))?,
+            pos_q: alloc_i(m * heads)?,
+            logits: alloc(m * vocab)?,
+            candidates_m: vec![Vec::new(); m],
+        })
+    }
+}
+
+impl<'a> GpuModel<'a> {
+    /// Teacher-forced M-batch decode: one engine pass over `tokens`,
+    /// positions [self.pos, self.pos + m). Returns m logit rows. Batched
+    /// where the math allows (embedding, hc, norms, rope, every GEMM,
+    /// sparse_attn, gate); position-dependent state (ring writes, CSA
+    /// compressor, indexer, engram hashes) evolves sequentially per
+    /// position, so the post-pass model state equals m sequential
+    /// `decode` calls. v1 bounds: upload mode, world == 1, and the batch
+    /// must not wrap the attention ring (chunk at the window boundary).
+    pub fn decode_m(&mut self, tokens: &[u32]) -> io::Result<Vec<Vec<f32>>> {
+        let m = tokens.len();
+        if m == 0 {
+            return Ok(Vec::new());
+        }
+        if self.sharding.world_size != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "decode_m: TP (world > 1) not yet supported",
+            ));
+        }
+        if self.arena.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "decode_m: streaming mode not yet supported",
+            ));
+        }
+        let win = self.cfg.window_size as usize;
+        let pos0 = self.pos;
+        if pos0 + m as u64 > self.max_seq {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "batch beyond max_seq_len"));
+        }
+        if (pos0 as usize % win) + m > win {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "decode_m batch wraps the attention ring: chunk at the window boundary",
+            ));
+        }
+        if tokens.iter().any(|&t| t >= self.cfg.vocab) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "token id out of vocab"));
+        }
+        let guard = Cuda::global();
+        let c = guard
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "cuda init"))?;
+
+        // embedding rows (host bf16 dequant like decode(), or device gather)
+        let dim0 = self.cfg.dim as usize;
+        let mut emb_host: Option<Vec<f32>> = None;
+        if self.emb.is_none() {
+            if let Some(store) = self.store_keepalive.as_mut() {
+                let v = store.get("embed.weight")?;
+                let mut rows = vec![0.0f32; m * dim0];
+                for (i, &t) in tokens.iter().enumerate() {
+                    let start = t as usize * dim0 * 2;
+                    if start + dim0 * 2 > v.bytes.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "token out of vocab",
+                        ));
+                    }
+                    for (j, b) in v.bytes[start..start + dim0 * 2].chunks_exact(2).enumerate() {
+                        rows[i * dim0 + j] =
+                            ferroseek_core::quant::bf16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+                    }
+                }
+                emb_host = Some(rows);
+            }
+        }
+
+        // engram hashes per position (sequential, ordered — eng_cache state)
+        let mut hashes_m: Vec<Vec<Vec<u64>>> = Vec::with_capacity(m);
+        for (i, &t) in tokens.iter().enumerate() {
+            if self.engram.layer_ids.is_empty() {
+                hashes_m.push(Vec::new());
+            } else {
+                let token_map = self.token_map.clone();
+                hashes_m.push(hash_ids(
+                    &self.cfg,
+                    &self.engram,
+                    &mut self.eng_cache,
+                    token_map.as_deref(),
+                    t,
+                    pos0 + i as u64,
+                ));
+            }
+        }
+
+        // grow the m-row scratch on demand
+        if self.scratch_m.as_ref().map(|s| s.m_max).unwrap_or(0) < m {
+            self.scratch_m = Some(ScratchM::new(&self.cfg, &self.engram, m)?);
+        }
+
+        let GpuModel {
+            cfg,
+            layers,
+            caches,
+            scratch: s1,
+            scratch_m,
+            rope_cos,
+            rope_sin,
+            emb,
+            head,
+            final_norm,
+            bands,
+            run,
+            engram,
+            ..
+        } = self;
+        let sm = scratch_m.as_mut().unwrap();
+
+        let dim = cfg.dim as usize;
+        let hc = cfg.hc_mult as usize;
+        let heads = cfg.n_heads as usize;
+        let eps = cfg.norm_eps;
+
+        // h init: embedding rows -> hc copies (one-hot pre per row)
+        if let Some(rows) = &emb_host {
+            sm.emb_row.index(0..m * dim).copy_from(rows).map_err(cuda_err)?;
+        } else {
+            for (i, &t) in tokens.iter().enumerate() {
+                let idx = [t as i64];
+                let d_idx = DeviceBuffer::from_slice(&idx).map_err(cuda_err)?;
+                k::gather_f32(
+                    c,
+                    k::base(emb.as_ref().unwrap()),
+                    k::base(&d_idx),
+                    k::row(&sm.emb_row, i * dim, dim),
+                    1,
+                    dim,
+                );
+            }
+        }
+        {
+            // one-hot pre per row; ones_hc all ones — MUST upload before
+            // the h-init hc_post below (post=ones expands the embedding
+            // into hc identical copies; zeros would zero the stream)
+            let mut pre = vec![0.0f32; m * hc];
+            let mut ones = vec![0.0f32; m * hc];
+            for i in 0..m {
+                pre[i * hc] = 1.0;
+                for j in 0..hc {
+                    ones[i * hc + j] = 1.0;
+                }
+            }
+            sm.pre_ffn.copy_from(&pre).map_err(cuda_err)?;
+            sm.ones_hc.copy_from(&ones).map_err(cuda_err)?;
+        }
+        k::hc_post(
+            c,
+            k::base(&sm.emb_row),
+            k::base(&sm.zeros_h),
+            k::base(&sm.ones_hc),
+            k::base(&sm.comb_zero),
+            k::base(&sm.h[0]),
+            m,
+            dim,
+        );
+        {
+            // per-position window idx lists and rope position rows
+            let mut w = vec![-1i32; m * win];
+            for (i, wi) in (0..m).map(|i| (i, window_topk_idxs(win, pos0 + i as u64))) {
+                w[i * win..(i + 1) * win].copy_from_slice(&wi);
+            }
+            sm.win_idxs.copy_from(&w).map_err(cuda_err)?;
+            let pos_q: Vec<i32> = (0..m * heads)
+                .map(|r| (pos0 + (r / heads) as u64) as i32)
+                .collect();
+            sm.pos_q.copy_from(&pos_q).map_err(cuda_err)?;
+        }
+
+        let mut h_cur = 0usize;
+        for li in 0..layers.len() {
+            let layer = &layers[li];
+
+            // engram merge (per position: gather -> batched wkv -> merge)
+            if let Some(ei) = layer.engram {
+                let e = layer.engram_w.as_ref().unwrap();
+                let ncols = engram.n_hash_cols;
+                let ehd = engram.head_dim;
+                for (i, hash_p) in hashes_m.iter().enumerate() {
+                    let hash = &hash_p[ei];
+                    let ids: Vec<i64> = hash.iter().map(|&h| h as i64).collect();
+                    match (e.embed_w.host(), e.embed_s.host()) {
+                        (Some((wp, wlen)), Some((sp, slen))) => {
+                            let (wt, st) = unsafe {
+                                (
+                                    std::slice::from_raw_parts(wp, wlen),
+                                    std::slice::from_raw_parts(sp, slen),
+                                )
+                            };
+                            let rows: Vec<usize> =
+                                ids.iter().take(ncols).map(|&id| id as usize).collect();
+                            let mut flat = vec![0.0f32; rows.len() * ehd];
+                            flat.par_chunks_mut(ehd)
+                                .zip(rows.par_iter())
+                                .for_each(|(chunk, &r)| {
+                                    if r * ehd + ehd > wt.len() {
+                                        chunk.fill(f32::NAN);
+                                        return;
+                                    }
+                                    let row = ferroseek_ref::store::fp8_row_scaled(wt, st, r, ehd);
+                                    chunk.copy_from_slice(&row);
+                                });
+                            if flat.iter().any(|v| v.is_nan()) {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "engram gather NaN (decode_m)",
+                                ));
+                            }
+                            sm.eflat
+                                .index(i * ncols * ehd..(i + 1) * ncols * ehd)
+                                .copy_from(&flat)
+                                .map_err(cuda_err)?;
+                        }
+                        _ => {
+                            s1.hash_ids.copy_from(&ids).map_err(cuda_err)?;
+                            k::gather_fp8(
+                                c,
+                                e.embed_w.ptr(),
+                                e.embed_s.ptr(),
+                                k::base(&s1.hash_ids),
+                                k::row(&sm.eflat, i * ncols * ehd, ncols * ehd),
+                                ncols,
+                                ehd,
+                            );
+                        }
+                    }
+                }
+                k::emit8(
+                    c,
+                    k::base(&sm.eflat),
+                    k::base(&sm.act_e),
+                    k::base(&sm.act_e_s),
+                    m * ncols * ehd,
+                );
+                k::fp8_gemm(
+                    c,
+                    k::base(&sm.act_e),
+                    k::base(&sm.act_e_s),
+                    e.wkv.w.ptr(),
+                    e.wkv.s.ptr(),
+                    k::base(&sm.ekv),
+                    m,
+                    dim * (hc + 1),
+                    ncols * ehd,
+                );
+                let inv = (dim as f32).sqrt().recip();
+                for i in 0..m {
+                    for j in 0..hc {
+                        k::engram_merge(
+                            c,
+                            k::row(&sm.h[h_cur], i * hc * dim + j * dim, dim),
+                            k::row(&sm.ekv, i * (hc + 1) * dim + j * dim, dim),
+                            k::row(&sm.ekv, i * (hc + 1) * dim + hc * dim, dim),
+                            k::row(&e.w_prod, j * dim, dim),
+                            dim,
+                            inv,
+                        );
+                    }
+                }
+            }
+
+            // attention wiring (hc mix + collapse + norm)
+            let hc_dim = hc * dim;
+            let mix_hc = cfg.mix_hc();
+            k::hc_block(
+                c,
+                k::base(&sm.h[h_cur]),
+                k::base(&layer.hc_attn_fn),
+                k::base(&layer.hc_attn_base),
+                k::base(&layer.hc_attn_scale),
+                k::base(&sm.pre_attn),
+                k::base(&sm.post),
+                k::base(&sm.comb),
+                m,
+                hc_dim,
+                mix_hc,
+                cfg.hc_eps,
+            );
+            k::hc_pre(
+                c,
+                k::base(&sm.h[h_cur]),
+                k::base(&sm.pre_ffn),
+                k::base(&sm.x),
+                m,
+                dim,
+            );
+            k::rmsnorm_m(
+                c,
+                k::base(&sm.x),
+                k::base(&layer.attn_norm_w),
+                k::base(&sm.x),
+                m,
+                dim,
+                eps,
+            );
+
+            attention_step_m(
+                c, cfg, layer, sm, s1, caches, run, bands, rope_cos, rope_sin, pos0, m,
+            )?;
+
+            {
+                let h_next = 1 - h_cur;
+                k::hc_post(
+                    c,
+                    k::base(&sm.attn_out),
+                    k::base(&sm.h[h_cur]),
+                    k::base(&sm.post),
+                    k::base(&sm.comb),
+                    k::base(&sm.h[h_next]),
+                    m,
+                    dim,
+                );
+                h_cur = h_next;
+            }
+
+            // ffn wiring
+            k::hc_block(
+                c,
+                k::base(&sm.h[h_cur]),
+                k::base(&layer.hc_ffn_fn),
+                k::base(&layer.hc_ffn_base),
+                k::base(&layer.hc_ffn_scale),
+                k::base(&sm.pre_ffn),
+                k::base(&sm.post),
+                k::base(&sm.comb),
+                m,
+                hc_dim,
+                mix_hc,
+                cfg.hc_eps,
+            );
+            k::hc_pre(
+                c,
+                k::base(&sm.h[h_cur]),
+                k::base(&sm.pre_attn),
+                k::base(&sm.x),
+                m,
+                dim,
+            );
+            k::rmsnorm_m(
+                c,
+                k::base(&sm.x),
+                k::base(&layer.ffn_norm_w),
+                k::base(&sm.x),
+                m,
+                dim,
+                eps,
+            );
+
+            moe_step_m(c, cfg, layer, sm, s1, m)?;
+
+            {
+                let h_next = 1 - h_cur;
+                k::hc_post(
+                    c,
+                    k::base(&sm.y_moe),
+                    k::base(&sm.h[h_cur]),
+                    k::base(&sm.post),
+                    k::base(&sm.comb),
+                    k::base(&sm.h[h_next]),
+                    m,
+                    dim,
+                );
+                h_cur = h_next;
+            }
+        }
+
+        // tail: collapse, final norm, head per row
+        k::hc_pre(
+            c,
+            k::base(&sm.h[h_cur]),
+            k::base(&sm.pre_ffn),
+            k::base(&sm.x),
+            m,
+            dim,
+        );
+        k::rmsnorm_m(c, k::base(&sm.x), k::base(final_norm), k::base(&sm.x), m, dim, eps);
+        for i in 0..m {
+            k::f32_gemv(
+                c,
+                k::base(head),
+                k::row(&sm.x, i * dim, dim),
+                k::row(&sm.logits, i * cfg.vocab as usize, cfg.vocab as usize),
+                cfg.vocab as usize,
+                dim,
+            );
+        }
+        let mut out = vec![0.0f32; m * cfg.vocab as usize];
+        sm.logits.copy_to(&mut out).map_err(cuda_err)?;
+        self.pos += m as u64;
+        Ok(out.chunks(cfg.vocab as usize).map(|c| c.to_vec()).collect())
+    }
+}
+
+/// The M-batch attention sublayer: batched q/kv projections and rope,
+/// sequential per-position cache writes + CSA compressor + indexer,
+/// one sparse_attn_m over per-position causal idx lists.
+#[allow(clippy::too_many_arguments)]
+fn attention_step_m(
+    c: &Cuda,
+    cfg: &RefConfig,
+    layer: &GpuLayer,
+    sm: &mut ScratchM,
+    s1: &mut Scratch,
+    caches: &mut GpuCaches,
+    run: &mut RunState,
+    bands: &[Vec<usize>],
+    rope_cos: &[D<f32>; 2],
+    rope_sin: &[D<f32>; 2],
+    pos0: u64,
+    m: usize,
+) -> io::Result<()> {
+    let l = layer.layer as usize;
+    let dim = cfg.dim as usize;
+    let hd = cfg.head_dim as usize;
+    let rd = cfg.rope_dim as usize;
+    let heads = cfg.n_heads as usize;
+    let win = cfg.window_size as usize;
+    let eps = cfg.norm_eps;
+    let og = cfg.o_groups as usize;
+    let ol = cfg.o_lora as usize;
+    let inh = cfg.index_n_heads as usize;
+    let ihd = cfg.index_head_dim as usize;
+    let ratio = layer.ratio as u64;
+
+    // q path: emit8 -> wq_a -> q_norm -> emit8 -> wq_b -> rope(buf)
+    k::emit8(
+        c,
+        k::base(&sm.x),
+        k::base(&sm.act_x),
+        k::base(&sm.act_x_s),
+        m * dim,
+    );
+    k::fp8_gemm(
+        c,
+        k::base(&sm.act_x),
+        k::base(&sm.act_x_s),
+        layer.wq_a.w.ptr(),
+        layer.wq_a.s.ptr(),
+        k::base(&sm.qr),
+        m,
+        cfg.q_lora as usize,
+        dim,
+    );
+    k::rmsnorm_m(
+        c,
+        k::base(&sm.qr),
+        k::base(&layer.q_norm_w),
+        k::base(&sm.qr),
+        m,
+        cfg.q_lora as usize,
+        eps,
+    );
+    k::emit8(
+        c,
+        k::base(&sm.qr),
+        k::base(&sm.act_qr),
+        k::base(&sm.act_qr_s),
+        m * cfg.q_lora as usize,
+    );
+    k::fp8_gemm(
+        c,
+        k::base(&sm.act_qr),
+        k::base(&sm.act_qr_s),
+        layer.wq_b.w.ptr(),
+        layer.wq_b.s.ptr(),
+        k::base(&sm.q),
+        m,
+        heads * hd,
+        cfg.q_lora as usize,
+    );
+    k::rope_uniform_pos_buf(
+        c,
+        k::base(&sm.q),
+        k::base(&rope_cos[layer.freq]),
+        k::base(&rope_sin[layer.freq]),
+        k::base(&sm.pos_q),
+        m * heads,
+        hd,
+        rd,
+        false,
+    );
+
+    // window KV projection (batched), ring writes (per position)
+    k::fp8_gemm(
+        c,
+        k::base(&sm.act_x),
+        k::base(&sm.act_x_s),
+        layer.wkv.w.ptr(),
+        layer.wkv.s.ptr(),
+        k::base(&sm.kvrow),
+        m,
+        hd,
+        dim,
+    );
+    for i in 0..m {
+        let pos = pos0 + i as u64;
+        let slot = (pos % win as u64) as usize;
+        let ring = k::row(&caches.kv_all[l], slot * hd, hd);
+        k::rmsnorm(
+            c,
+            k::row(&sm.kvrow, i * hd, hd),
+            k::base(&layer.kv_norm_w),
+            ring,
+            hd,
+            eps,
+        );
+        k::rope(
+            c,
+            ring,
+            k::base(&rope_cos[layer.freq]),
+            k::base(&rope_sin[layer.freq]),
+            1,
+            hd,
+            rd,
+            pos,
+            false,
+        );
+        k::snap8(c, ring, hd);
+    }
+
+    // compressed path + indexer, per position (state machines in order)
+    if layer.ratio > 0 {
+        for i in 0..m {
+            let pos = pos0 + i as u64;
+            let compress_len = ((pos + 1) / ratio) as usize;
+            let mut latent_ready = false;
+            if let Some(src) = layer.kv_src {
+                run.index_k_src = src;
+                let comp = layer.compressor.as_ref().unwrap();
+                if ratio == 1 {
+                    k::f32_gemv(
+                        c,
+                        k::base(&comp.wkv),
+                        k::row(&sm.x, i * dim, dim),
+                        k::base(&s1.latent),
+                        hd,
+                        dim,
+                    );
+                    k::rmsnorm(
+                        c,
+                        k::base(&s1.latent),
+                        k::base(&comp.norm_w),
+                        k::base(&s1.latent),
+                        hd,
+                        eps,
+                    );
+                    latent_ready = true;
+                } else {
+                    let slot_i = (pos % ratio) as usize;
+                    let kv_state = caches.comp_kv[src].as_ref().unwrap();
+                    let score_state = caches.comp_score[src].as_mut().unwrap();
+                    k::f32_gemv(
+                        c,
+                        k::base(&comp.wkv),
+                        k::row(&sm.x, i * dim, dim),
+                        k::row(kv_state, slot_i * hd, hd),
+                        hd,
+                        dim,
+                    );
+                    k::f32_gemv(
+                        c,
+                        k::base(comp.wgate.as_ref().unwrap()),
+                        k::row(&sm.x, i * dim, dim),
+                        k::row(score_state, slot_i * hd, hd),
+                        hd,
+                        dim,
+                    );
+                    if (pos + 1) % ratio == 0 {
+                        k::compressor_finish(
+                            c,
+                            k::base(kv_state),
+                            k::base(score_state),
+                            k::base(&s1.latent),
+                            hd,
+                        );
+                        k::rmsnorm(
+                            c,
+                            k::base(&s1.latent),
+                            k::base(&comp.norm_w),
+                            k::base(&s1.latent),
+                            hd,
+                            eps,
+                        );
+                        latent_ready = true;
+                    }
+                }
+                if latent_ready {
+                    run.compress_len[src] = compress_len;
+                }
+            }
+
+            if layer.idx_src {
+                if layer.owns_k && latent_ready {
+                    let kowner = layer.k_owner.as_ref().unwrap();
+                    let j = compress_len - 1;
+                    k::bf16_gemv(c, k::base(&kowner.wk), k::base(&s1.latent), k::base(&s1.krow), ihd, hd);
+                    let krow_dst = k::row(&caches.index_k[run.index_k_src], j * ihd, ihd);
+                    k::rmsnorm(c, k::base(&s1.krow), k::base(&kowner.k_norm), krow_dst, ihd, eps);
+                    k::rope(
+                        c,
+                        krow_dst,
+                        k::base(&rope_cos[layer.freq]),
+                        k::base(&rope_sin[layer.freq]),
+                        1,
+                        ihd,
+                        rd,
+                        pos + 1 - ratio,
+                        false,
+                    );
+                    k::fp4_snap(c, krow_dst, ihd, 32, false);
+                }
+                // query side for this position
+                k::fp8_gemm(
+                    c,
+                    k::row_u8(&sm.act_qr, i * cfg.q_lora as usize, cfg.q_lora as usize),
+                    k::row_u8(
+                        &sm.act_qr_s,
+                        i * cfg.q_lora as usize / 32,
+                        cfg.q_lora as usize / 32,
+                    ),
+                    layer.indexer.as_ref().unwrap().wq_b.w.ptr(),
+                    layer.indexer.as_ref().unwrap().wq_b.s.ptr(),
+                    k::row(&sm.qidx, i * inh * ihd, inh * ihd),
+                    1,
+                    inh * ihd,
+                    cfg.q_lora as usize,
+                );
+                k::rope_uniform_pos(
+                    c,
+                    k::row(&sm.qidx, i * inh * ihd, inh * ihd),
+                    k::base(&rope_cos[layer.freq]),
+                    k::base(&rope_sin[layer.freq]),
+                    inh,
+                    ihd,
+                    rd,
+                    pos,
+                    false,
+                );
+                k::fp4_snap(c, k::row(&sm.qidx, i * inh * ihd, inh * ihd), inh * ihd, 32, false);
+                k::f32_gemv(
+                    c,
+                    k::base(&layer.indexer.as_ref().unwrap().weights_proj),
+                    k::row(&sm.x, i * dim, dim),
+                    k::row(&sm.widx, i * inh, inh),
+                    inh,
+                    dim,
+                );
+
+                // score + selection for this position
+                let topk_max = cfg.index_topk as usize;
+                let mut list = vec![-1i32; win + topk_max];
+                if compress_len == 0 {
+                    let wi = window_topk_idxs(win, pos);
+                    list[..win].copy_from_slice(&wi);
+                } else {
+                    k::indexer_score(
+                        c,
+                        k::row(&sm.qidx, i * inh * ihd, inh * ihd),
+                        k::base(&caches.index_k[run.index_k_src]),
+                        k::row(&sm.widx, i * inh, inh),
+                        k::base(&s1.score),
+                        inh,
+                        ihd,
+                        compress_len,
+                    );
+                    let mut score = vec![0.0f32; compress_len];
+                    s1.score
+                        .index(0..compress_len)
+                        .copy_to(&mut score)
+                        .map_err(cuda_err)?;
+                    if layer.cand_src {
+                        let cand = select_candidate_blocks(
+                            &score,
+                            cfg.candidate_topk_blocks as usize,
+                            cfg.candidate_block_size as usize,
+                        );
+                        run.candidates = cand.clone();
+                        if i < sm.candidates_m.len() {
+                            sm.candidates_m[i] = cand;
+                        }
+                    } else if layer.uses_cand {
+                        let cand = sm
+                            .candidates_m
+                            .get(i)
+                            .filter(|c| !c.is_empty())
+                            .unwrap_or(&run.candidates);
+                        for (t, v) in score.iter_mut().enumerate() {
+                            if !cand.get(t).copied().unwrap_or(false) {
+                                *v = f32::NEG_INFINITY;
+                            }
+                        }
+                    }
+                    let topk = topk_max.min(compress_len);
+                    let cmp = select_topk(&score, topk, compress_len, win as i32);
+                    let wi = window_topk_idxs(win, pos);
+                    list[..win].copy_from_slice(&wi);
+                    for (j, &v) in cmp.iter().enumerate() {
+                        list[win + j] = v;
+                    }
+                }
+                sm.shared_idxs
+                    .index(i * (win + topk_max)..(i + 1) * (win + topk_max))
+                    .copy_from(&list)
+                    .map_err(cuda_err)?;
+            }
+
+            // latent tail: rope + fp4 snap + fan-out
+            if latent_ready {
+                if let Some(src) = layer.kv_src {
+                    let j = compress_len - 1;
+                    k::rope(
+                        c,
+                        k::base(&s1.latent),
+                        k::base(&rope_cos[layer.freq]),
+                        k::base(&rope_sin[layer.freq]),
+                        1,
+                        hd,
+                        rd,
+                        pos + 1 - ratio,
+                        false,
+                    );
+                    k::fp4_snap(c, k::base(&s1.latent), hd, 16, true);
+                    for &cl in &bands[src] {
+                        let dst = k::row(&caches.kv_all[cl], win * hd + j * hd, hd);
+                        k::copy_f32(c, k::base(&s1.latent), dst, hd);
+                    }
+                }
+            }
+        }
+    }
+
+    // sparse attention: batched over per-position idx lists
+    let topk_max = cfg.index_topk as usize;
+    let (idxs, n_sel) = if layer.ratio > 0 {
+        (k::base(&sm.shared_idxs), win + topk_max)
+    } else {
+        (k::base(&sm.win_idxs), win)
+    };
+    k::sparse_attn_m(
+        c,
+        k::base(&sm.q),
+        k::base(&caches.kv_all[l]),
+        idxs,
+        k::base(&layer.attn_sink),
+        k::base(&sm.o),
+        heads,
+        hd,
+        n_sel,
+        m,
+        (hd as f32).sqrt().recip(),
+    );
+
+    // inverse rope, snap, wo_a per (pos, group), wo_b batched
+    k::rope_uniform_pos_buf(
+        c,
+        k::base(&sm.o),
+        k::base(&rope_cos[layer.freq]),
+        k::base(&rope_sin[layer.freq]),
+        k::base(&sm.pos_q),
+        m * heads,
+        hd,
+        rd,
+        true,
+    );
+    k::snap8(c, k::base(&sm.o), m * heads * hd);
+    let gdim = heads * hd / og;
+    for i in 0..m {
+        for g in 0..og {
+            k::bf16_gemv(
+                c,
+                k::row16(&layer.wo_a, g * ol * gdim, ol * gdim),
+                k::row(&sm.o, i * heads * hd + g * gdim, gdim),
+                k::row(&sm.fl, i * og * ol + g * ol, ol),
+                ol,
+                gdim,
+            );
+        }
+    }
+    k::emit8(
+        c,
+        k::base(&sm.fl),
+        k::base(&sm.act_fl),
+        k::base(&sm.act_fl_s),
+        m * og * ol,
+    );
+    k::fp8_gemm(
+        c,
+        k::base(&sm.act_fl),
+        k::base(&sm.act_fl_s),
+        layer.wo_b.w.ptr(),
+        layer.wo_b.s.ptr(),
+        k::base(&sm.attn_out),
+        m,
+        dim,
+        og * ol,
+    );
+    Ok(())
+}
+
+/// The M-batch MoE sublayer: batched gate + shared expert, sequential
+/// per-position routing + grouped-expert path on row pointers.
+fn moe_step_m(
+    c: &Cuda,
+    cfg: &RefConfig,
+    layer: &GpuLayer,
+    sm: &mut ScratchM,
+    s1: &mut Scratch,
+    m: usize,
+) -> io::Result<()> {
+    let dim = cfg.dim as usize;
+    let inter = cfg.inter_dim as usize;
+    let n_experts = cfg.n_routed as usize;
+    let top_k = cfg.n_activated as usize;
+
+    k::moe_gate_m(
+        c,
+        k::base(&sm.x),
+        k::base(&layer.gate_w),
+        k::base(&layer.gate_bias),
+        k::base(&sm.gate_scores),
+        m,
+        dim,
+        n_experts,
+    );
+    let _ = sm.y_moe.set_zero();
+    k::emit8(
+        c,
+        k::base(&sm.x),
+        k::base(&sm.act_x),
+        k::base(&sm.act_x_s),
+        m * dim,
+    );
+
+    if layer.w1_all.is_some() {
+        // grouped-expert path (real checkpoint, upload mode)
+        let w1 = layer.w1_all.as_ref().unwrap();
+        let w1s = layer.w1s_all.as_ref().unwrap();
+        let w2 = layer.w2_all.as_ref().unwrap();
+        let w2s = layer.w2s_all.as_ref().unwrap();
+        let w3 = layer.w3_all.as_ref().unwrap();
+        let w3s = layer.w3s_all.as_ref().unwrap();
+        for i in 0..m {
+        k::moe_select(
+            c,
+            k::row(&sm.gate_scores, i * n_experts, n_experts),
+            k::base(&layer.gate_bias),
+            k::base(&s1.gate_w_out),
+            k::base(&s1.gate_i_out),
+            n_experts,
+            top_k,
+            cfg.route_scale,
+        );
+        k::moe_local_slots(
+            c,
+            k::base(&s1.gate_i_out),
+            k::base(&s1.local_slots),
+            k::base(&s1.local_experts),
+            k::base(&s1.local_count),
+            top_k,
+            0,
+            n_experts,
+        );
+        k::expert_glu(
+            c,
+            k::row_u8(&sm.act_x, i * dim, dim),
+            k::row_u8(&sm.act_x_s, i * dim / 32, dim / 32),
+            k::base(w1),
+            k::base(w1s),
+            k::base(w3),
+            k::base(w3s),
+            k::base(&s1.gate_w_out),
+            k::base(&s1.local_slots),
+            k::base(&s1.local_experts),
+            k::base(&s1.local_count),
+            k::base(&s1.h_slots),
+            inter,
+            dim,
+            top_k,
+        );
+        k::expert_quant(
+            c,
+            k::base(&s1.h_slots),
+            k::base(&s1.local_slots),
+            k::base(&s1.local_count),
+            k::base(&s1.q_slots),
+            k::base(&s1.qs_slots),
+            inter,
+            top_k,
+        );
+        k::expert_reduce(
+            c,
+            k::base(&s1.q_slots),
+            k::base(&s1.qs_slots),
+            k::base(w2),
+            k::base(w2s),
+            k::base(&s1.gate_i_out),
+            k::base(&s1.local_slots),
+            k::base(&s1.local_count),
+            k::row(&sm.y_moe, i * dim, dim),
+            dim,
+            inter,
+            top_k,
+            0,
+        );
+        }
+    } else {
+        // per-expert path (synthetic gate and small uploads): read the
+        // routing back, run each selected expert in ascending id order
+        for i in 0..m {
+            k::moe_select(
+                c,
+                k::row(&sm.gate_scores, i * n_experts, n_experts),
+                k::base(&layer.gate_bias),
+                k::base(&s1.gate_w_out),
+                k::base(&s1.gate_i_out),
+                n_experts,
+                top_k,
+                cfg.route_scale,
+            );
+            let mut w_host = vec![0.0f32; top_k];
+            let mut i_host = vec![0i32; top_k];
+            {
+                let stream = c.stream.as_inner();
+                s1.gate_stage.dtoh(s1.gate_w_out.as_device_ptr().as_raw() as u64, top_k * 4, stream)?;
+                s1.gate_stage.dtoh_at(s1.gate_i_out.as_device_ptr().as_raw() as u64, top_k * 4, top_k * 4, stream)?;
+                s1.gate_stage.sync(stream)?;
+                let f32s = s1.gate_stage.as_f32();
+                w_host.copy_from_slice(&f32s[..top_k]);
+                let i32s = s1.gate_stage.as_i32_at(top_k * 4);
+                i_host.copy_from_slice(&i32s[..top_k]);
+            }
+            let mut sel: Vec<(usize, f32)> = i_host
+                .iter()
+                .map(|&i| i as usize)
+                .zip(w_host.iter().copied())
+                .collect();
+            sel.sort_by_key(|&(e, _)| e); // ascending expert id (model.py:895)
+            for &(e, w) in &sel {
+                let [w1, w2, w3] = &layer.experts[e];
+                k::fp4_gemm(
+                    c,
+                    k::row_u8(&sm.act_x, i * dim, dim),
+                    k::row_u8(&sm.act_x_s, i * dim / 32, dim / 32),
+                    w1.w.ptr(),
+                    w1.s.ptr(),
+                    k::base(&s1.gate_buf),
+                    1,
+                    inter,
+                    dim,
+                );
+                k::fp4_gemm(
+                    c,
+                    k::row_u8(&sm.act_x, i * dim, dim),
+                    k::row_u8(&sm.act_x_s, i * dim / 32, dim / 32),
+                    w3.w.ptr(),
+                    w3.s.ptr(),
+                    k::base(&s1.up_buf),
+                    1,
+                    inter,
+                    dim,
+                );
+                k::swiglu(c, k::base(&s1.gate_buf), k::base(&s1.up_buf), k::base(&s1.h_e), inter, w);
+                k::emit8(c, k::base(&s1.h_e), k::base(&s1.act_h), k::base(&s1.act_h_s), inter);
+                k::fp4_gemm(
+                    c,
+                    k::base(&s1.act_h),
+                    k::base(&s1.act_h_s),
+                    w2.w.ptr(),
+                    w2.s.ptr(),
+                    k::base(&s1.expert_y),
+                    1,
+                    dim,
+                    inter,
+                );
+                k::acc_f32(c, k::base(&s1.expert_y), k::row(&sm.y_moe, i * dim, dim), dim);
+            }
+        }
+    }
+
+    // shared expert, batched, added last per row
+    let [w1, w2, w3] = &layer.shared_experts;
+    k::fp8_gemm(
+        c,
+        k::base(&sm.act_x),
+        k::base(&sm.act_x_s),
+        w1.w.ptr(),
+        w1.s.ptr(),
+        k::base(&sm.gate_buf),
+        m,
+        inter,
+        dim,
+    );
+    k::fp8_gemm(
+        c,
+        k::base(&sm.act_x),
+        k::base(&sm.act_x_s),
+        w3.w.ptr(),
+        w3.s.ptr(),
+        k::base(&sm.up_buf),
+        m,
+        inter,
+        dim,
+    );
+    k::swiglu(
+        c,
+        k::base(&sm.gate_buf),
+        k::base(&sm.up_buf),
+        k::base(&sm.h_e),
+        m * inter,
+        1.0,
+    );
+    k::emit8(
+        c,
+        k::base(&sm.h_e),
+        k::base(&sm.act_h),
+        k::base(&sm.act_h_s),
+        m * inter,
+    );
+    k::fp8_gemm(
+        c,
+        k::base(&sm.act_h),
+        k::base(&sm.act_h_s),
+        w2.w.ptr(),
+        w2.s.ptr(),
+        k::base(&sm.expert_y),
+        m,
+        dim,
+        inter,
+    );
+    k::acc_f32(c, k::base(&sm.expert_y), k::base(&sm.y_moe), m * dim);
     Ok(())
 }
