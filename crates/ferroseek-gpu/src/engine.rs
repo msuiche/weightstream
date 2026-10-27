@@ -293,6 +293,13 @@ pub struct W8 {
     host: Option<(*const u8, usize)>,
 }
 
+impl W8 {
+    /// Test seam: the owned device buffer (None = streamed/host-backed).
+    pub(crate) fn own_for_test(&self) -> Option<&D<u8>> {
+        self._own.as_ref()
+    }
+}
+
 /// Fault every page of a mapped tensor into this process before a device
 /// copy: cudaMemcpy's GUP path faults file-backed pages synchronously at
 /// ~0.2-4 MB/s on GB10 under memory pressure (measured: a 42 MB wq_b copy
@@ -430,9 +437,9 @@ struct Q8 {
 }
 
 /// Packed fp4 expert weight + per-1x32-K ue8m0 scales.
-struct Q4 {
-    w: W8,
-    s: W8,
+pub struct Q4 {
+    pub w: W8,
+    pub s: W8,
 }
 
 struct GpuCompressor {
@@ -466,7 +473,7 @@ struct GpuEngram {
     w_prod: D<f32>,
 }
 
-struct GpuLayer {
+pub struct GpuLayer {
     layer: u32,
     ratio: u32,
     kv_src: Option<usize>,
@@ -496,7 +503,7 @@ struct GpuLayer {
     wo_b: Q8,
     gate_w: D<u16>,
     gate_bias: D<f32>,
-    experts: Vec<[Q4; 3]>,
+    pub experts: Vec<[Q4; 3]>,
     /// Grouped-expert slabs (upload mode): contiguous [e_len] tables per
     /// weight kind for device-side dispatch (moe_grouped.cu). None in
     /// streaming mode (per-use staging keeps per-expert buffers).
@@ -626,7 +633,7 @@ pub struct CacheSnapshot {
 /// mode is `'static` (every weight is a device copy).
 pub struct GpuModel<'a> {
     pub cfg: RefConfig,
-    layers: Vec<GpuLayer>,
+    pub(crate) layers: Vec<GpuLayer>,
     caches: GpuCaches,
     engram: EngramLayout,
     eng_cache: Vec<i64>,

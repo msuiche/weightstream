@@ -1132,3 +1132,62 @@ fn recompute_routed_adjudicates_yrouted() {
         eprintln!("{tag} yrouted vs recompute: maxdiff {d:.3e}");
     }
 }
+
+#[test]
+fn uploaded_expert_bytes_match_store_all_layers() {
+    // The routed adjudicator pinned the GPU's yrouted divergence to the
+    // device-resident expert bytes at layers 1-3 (L0 bit-exact). Audit
+    // EVERY layer's uploaded w1/w2/w3 (weight + scale) against the store.
+    let cfg = mini_config();
+    let weights = ferroseek_ref::store::SyntheticWeights::generate(&cfg, 42).unwrap();
+    use ferroseek_ref::store::WeightStore;
+    let mut gpu = gpu_model(42);
+    let mut store = weights;
+
+    let mut bad = 0usize;
+    for l in 0..cfg.num_hidden_layers as usize {
+        for e in 0..cfg.n_routed_experts.unwrap_or(8) as usize {
+            for wname in ["w1", "w2", "w3"] {
+                let name = format!("layers.{l}.ffn.experts.{e}.{wname}");
+                let v = store.get(&format!("{name}.weight")).unwrap();
+                let s = store.get(&format!("{name}.scale")).unwrap();
+                let q4 = &gpu.layers[l].experts[e][(match wname {
+                    "w1" => 0,
+                    "w2" => 1,
+                    _ => 2,
+                })];
+                let wd = q4.w.own_for_test().expect("TP1 experts upload");
+                let sd = q4.s.own_for_test().expect("TP1 scales upload");
+                let mut host = vec![0u8; wd.len()];
+                wd.copy_to(&mut host).unwrap();
+                if host != v.bytes {
+                    let first = host
+                        .iter()
+                        .zip(&v.bytes)
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(0);
+                    eprintln!(
+                        "L{l} e{e} {wname}.weight DIFFERS: len {}/{} first@{first} gpu {:02x} store {:02x}",
+                        host.len(),
+                        v.bytes.len(),
+                        host[first],
+                        v.bytes[first],
+                    );
+                    bad += 1;
+                }
+                let mut hosts = vec![0u8; sd.len()];
+                sd.copy_to(&mut hosts).unwrap();
+                if hosts != s.bytes {
+                    eprintln!("L{l} e{e} {wname}.scale DIFFERS");
+                    bad += 1;
+                }
+                if bad > 6 {
+                    eprintln!("...stopping after 6 divergences");
+                    return;
+                }
+            }
+        }
+    }
+    assert_eq!(bad, 0, "{bad} expert tensors differ from the store");
+    eprintln!("all uploaded expert bytes match the store at every layer");
+}
