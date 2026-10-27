@@ -51,7 +51,7 @@ rewriting mature matmul kernels.
 
 | path | what it is |
 |---|---|
-| `crates/ferroseek` | CLI front door (`info`, `weights`, `tokens`, `decode`) |
+| `crates/ferroseek` | CLI front door (`info`, `weights`, `tokens`, `decode`, `serve`) |
 | `crates/ferroseek-core` | config, safetensors/mmap loader, quant primitives, KV sizing |
 | `crates/ferroseek-ref` | CPU reference decode engine (the numerics gate) |
 | `crates/ferroseek-cuda` | CUDA runtime + the 16 gated kernels (sm_121) |

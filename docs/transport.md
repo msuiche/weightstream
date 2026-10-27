@@ -80,15 +80,20 @@ rank-ordered concatenation). Real 4-rank decode of the 1017 checkpoint:
 bit-identical. On the drained box (ferroseek as the sole tenant):
 94 ms/token lockstep = 10.6 tok/s single-stream (2026-10-26; was
 1.2 s/token under the vLLM co-tenant with per-use expert staging).
-4. partially done (2026-10-26): multi-request decode over one model load
-ships — `GpuModel::reset` re-zeroes per-request caches, `Phase::Next`
-distributes requests on the control channel (the head owns the request
-list; workers wait for Next/Bye), and `ferroseek decode
---prompts-file` runs the CLI prompt plus one request per line, all
-ranks in lockstep at the steady per-token rate (verified: 3 requests,
-identical completions on every rank, one load). An OpenAI-compatible
-HTTP endpoint on top of this loop (continuous requests, streaming
-tokens) is the remaining piece of milestone 4.
+4. done (2026-10-26). Two layers, both over one model load:
+   - `ferroseek decode --prompts-file`: batch requests from a file
+     (CLI prompt first, one request per line), every rank in lockstep
+     (verified: 3 requests, identical completions on all four ranks).
+   - `ferroseek serve`: the OpenAI-compatible endpoint on the head rank
+     (std-only HTTP; POST /v1/completions and /v1/chat/completions,
+     greedy, `stream:true` gives SSE token events). The head's decode
+     owner broadcasts each request with `Phase::Next`; workers loop on
+     the control channel. One request at a time — the ring's lockstep
+     SPMD contract serializes by design; verified live: non-streaming
+     (' Paris.', ' Jupiter. It is the fifth planet from the Sun...') and
+     SSE (' Tokyo', ',', ' which', ...) over one load. Batching several
+     requests per lockstep step and prefix-cache reuse are the next
+     serving milestones; sampling parameters (temperature/top_p) after.
 
 ## The registration ceiling (measured 2026-10-26)
 
