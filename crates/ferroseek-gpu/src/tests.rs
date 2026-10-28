@@ -1531,3 +1531,55 @@ fn decode_prefill_m_matches_sequential_and_reuses_prefix() {
     assert_eq!(bat.next_position(), full.len() as u64);
     eprintln!("prefill prefix reuse: bit-exact ({d2:.3e}), resumed at {}", ids.len());
 }
+
+#[test]
+fn decode_m_streaming_matches_sequential() {
+    // decode_m through the STREAMING path (registered shard mappings,
+    // per-expert staging): same synthetic checkpoint on disk, one model
+    // sequential, one batched — bit-exact expectation (same kernels,
+    // same bytes; fp8_gemm is bit-identical per output block at any m).
+    use ferroseek_core::loader::Checkpoint;
+
+    let cfg = mini_config();
+    let json = mini_config_json(mini_engram_rows());
+    let weights = SyntheticWeights::generate(&cfg, 42).unwrap();
+    let dir = std::env::temp_dir().join(format!("ferroseek-gpu-stream-m-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    weights.write_checkpoint(&json, &dir).unwrap();
+
+    let mut ckpt1 = Checkpoint::open(&dir).unwrap();
+    let ckpt1: &'static mut Checkpoint = Box::leak(Box::new(ckpt1));
+    let mut seq = GpuModel::from_checkpoint_streaming(ckpt1).unwrap();
+    let mut ckpt2 = Checkpoint::open(&dir).unwrap();
+    let ckpt2: &'static mut Checkpoint = Box::leak(Box::new(ckpt2));
+    let mut bat = GpuModel::from_checkpoint_streaming(ckpt2).unwrap();
+
+    let mut worst = 0.0f32;
+    let bat_logits = bat.decode_m(&TOKENS).unwrap();
+    for (p, &t) in TOKENS.iter().enumerate() {
+        let a = seq.decode(t, p as u64).unwrap();
+        let b = &bat_logits[p];
+        let d = max_abs_diff(&a, b);
+        worst = worst.max(d);
+        assert_eq!(
+            ferroseek_ref::argmax(&a),
+            ferroseek_ref::argmax(b),
+            "streaming step {p}: argmax diverged under decode_m"
+        );
+        eprintln!("stream step {p}: decode_m max diff {d:.3e}");
+    }
+    assert!(
+        worst < GATE_ABS_TOL,
+        "streaming decode_m diverged: {worst:.3e}"
+    );
+    // state equivalence: two continuation steps
+    for (j, &t) in [29u32, 31].iter().enumerate() {
+        let p = TOKENS.len() + j;
+        let a = seq.decode(t, p as u64).unwrap();
+        let b = bat.decode(t, p as u64).unwrap();
+        let d = max_abs_diff(&a, &b);
+        assert!(d < GATE_ABS_TOL, "streaming post-pass state diverged: {d:.3e}");
+    }
+    eprintln!("streaming decode_m: bit-exact within {worst:.3e}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
