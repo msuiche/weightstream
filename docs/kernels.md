@@ -64,8 +64,11 @@ first hc_post.
 Gate (`decode_m_matches_sequential_decode`): 8-position batch vs
 sequential — bit-exact (0.0) on every position AND on two further
 sequential continuation steps; wall 8.0 ms vs 13.9 ms (1.7x) on the
-4-layer synthetic. v1 bounds (explicit errors): upload mode, world==1,
-no ring wrap inside a batch (chunk at the window boundary); TP4 and
-streaming modes keep the m=1 path. New kernels gated bit-exact vs
-sequential launches: sparse_attn_m, rope_uniform_pos_buf, moe_gate_m,
-rmsnorm_m (same kernel, grid.x = rows).
+4-layer synthetic. `decode_prefill` routes through decode_m chunks
+(chunk = min(remaining, room to the ring boundary)); streaming mode is
+supported (per-expert staging mirrors the m=1 path);
+FERROSEEK_SEQ_PREFILL forces the sequential loop for A/B. v1 bounds
+(explicit fallback, not error): TP4 keeps the m=1 path; a batch must
+not wrap the attention ring. New kernels gated bit-exact vs sequential
+launches: sparse_attn_m, rope_uniform_pos_buf, moe_gate_m, rmsnorm_m
+(same kernel, grid.x = rows).

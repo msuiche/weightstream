@@ -1460,13 +1460,18 @@ impl GpuModel<'static> {
         };
         // chunked M-batch prefill (decode_m): ring-safe chunks, falling
         // back to the sequential loop where decode_m is unsupported
-        // (streaming mode, TP)
+        // (streaming mode, TP). FERROSEEK_SEQ_PREFILL forces sequential.
         let mut n = start as usize;
         while n < ids.len() {
             let win = self.cfg.window_size as usize;
             let room = win - (self.pos as usize % win);
             let chunk = (ids.len() - n).min(room);
-            match self.decode_m(&ids[n..n + chunk]) {
+            let r = if std::env::var_os("FERROSEEK_SEQ_PREFILL").is_some() {
+                Err(io::Error::new(io::ErrorKind::Unsupported, "forced sequential"))
+            } else {
+                self.decode_m(&ids[n..n + chunk])
+            };
+            match r {
                 Ok(rows) => {
                     logits = rows.into_iter().last().unwrap_or_default();
                     n += chunk;
@@ -3584,12 +3589,7 @@ impl<'a> GpuModel<'a> {
                 "decode_m: TP (world > 1) not yet supported",
             ));
         }
-        if self.arena.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "decode_m: streaming mode not yet supported",
-            ));
-        }
+
         let win = self.cfg.window_size as usize;
         let pos0 = self.pos;
         if pos0 + m as u64 > self.max_seq {
@@ -3670,9 +3670,11 @@ impl<'a> GpuModel<'a> {
             bands,
             run,
             engram,
+            arena,
             ..
         } = self;
         let sm = scratch_m.as_mut().unwrap();
+        let arena_opt: Option<&crate::stream::HostArena> = arena.as_ref();
 
         let dim = cfg.dim as usize;
         let hc = cfg.hc_mult as usize;
@@ -3925,7 +3927,7 @@ impl<'a> GpuModel<'a> {
                 eps,
             );
 
-            moe_step_m(c, cfg, layer, sm, s1, m)?;
+            moe_step_m(c, cfg, layer, sm, s1, arena_opt, m)?;
 
             {
                 let h_next = 1 - h_cur;
@@ -4387,6 +4389,7 @@ fn moe_step_m(
     layer: &GpuLayer,
     sm: &mut ScratchM,
     s1: &mut Scratch,
+    arena: Option<&crate::stream::HostArena>,
     m: usize,
 ) -> io::Result<()> {
     let dim = cfg.dim as usize;
@@ -4519,12 +4522,14 @@ fn moe_step_m(
             sel.sort_by_key(|&(e, _)| e); // ascending expert id (model.py:895)
             for &(e, w) in &sel {
                 let [w1, w2, w3] = &layer.experts[e];
+                let (w1d, w1sd) = (w1.w.stage(c, arena)?, w1.s.stage(c, arena)?);
+                let (w3d, w3sd) = (w3.w.stage(c, arena)?, w3.s.stage(c, arena)?);
                 k::fp4_gemm(
                     c,
                     k::row_u8(&sm.act_x, i * dim, dim),
                     k::row_u8(&sm.act_x_s, i * dim / 32, dim / 32),
-                    w1.w.ptr(),
-                    w1.s.ptr(),
+                    w1.w.ptr_or(&w1d),
+                    w1.s.ptr_or(&w1sd),
                     k::base(&s1.gate_buf),
                     1,
                     inter,
@@ -4534,8 +4539,8 @@ fn moe_step_m(
                     c,
                     k::row_u8(&sm.act_x, i * dim, dim),
                     k::row_u8(&sm.act_x_s, i * dim / 32, dim / 32),
-                    w3.w.ptr(),
-                    w3.s.ptr(),
+                    w3.w.ptr_or(&w3d),
+                    w3.s.ptr_or(&w3sd),
                     k::base(&s1.up_buf),
                     1,
                     inter,
@@ -4543,17 +4548,20 @@ fn moe_step_m(
                 );
                 k::swiglu(c, k::base(&s1.gate_buf), k::base(&s1.up_buf), k::base(&s1.h_e), inter, w);
                 k::emit8(c, k::base(&s1.h_e), k::base(&s1.act_h), k::base(&s1.act_h_s), inter);
+                drop((w1d, w1sd, w3d, w3sd));
+                let (w2d, w2sd) = (w2.w.stage(c, arena)?, w2.s.stage(c, arena)?);
                 k::fp4_gemm(
                     c,
                     k::base(&s1.act_h),
                     k::base(&s1.act_h_s),
-                    w2.w.ptr(),
-                    w2.s.ptr(),
+                    w2.w.ptr_or(&w2d),
+                    w2.s.ptr_or(&w2sd),
                     k::base(&s1.expert_y),
                     1,
                     dim,
                     inter,
                 );
+                drop((w2d, w2sd));
                 k::acc_f32(c, k::base(&s1.expert_y), k::row(&sm.y_moe, i * dim, dim), dim);
             }
         }
