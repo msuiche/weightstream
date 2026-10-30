@@ -60,3 +60,18 @@ cache holds the hot experts once the engine's access pattern settles.
   expert page addresses become known; a background thread can
   `madvise(MADV_WILLNEED)`/read those 17.7 MB-per-expert ranges one
   layer ahead of the GEMMs (TODO(gpu-prefetch)).
+- Registration budget pathology (measured 2026-10-30, spark-4687,
+  driver 580.178.04, world=1, the real 475 GB checkpoint): with the
+  96 GB default budget the RM falls into unhandled-interrupt storms
+  (`irq 429` in dmesg) within the first decode layers — expert GEMMs
+  stall for minutes at 96% util with no progress, and killing the
+  stalled process surfaces Xid 31 MMU faults as a teardown artifact
+  (use-after-unmap, not the primary failure). Same behavior at e834f0c
+  and 2c381c7 — not the decode_m changes; the 2026-10-26 TP4 run used
+  the same default cleanly, so the threshold is driver/RM-state
+  dependent, not a fixed ceiling. `FERROSEEK_STREAM_BUDGET_GB=24` runs
+  the full single-node decode clean: load 18 s, prefill 8.3 s,
+  1.5-2.3 s/token, ` Paris. The Eiffel`. Treat 96 GB as suspect until
+  the ceiling is bisected. GPU clocks were locked to 2418 MHz
+  (`nvidia-smi -lgc`) for these runs — the 305 MHz idle clock
+  multiplies any stalled-step diagnosis by another order of magnitude.
