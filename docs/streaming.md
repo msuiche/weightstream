@@ -73,5 +73,8 @@ cache holds the hot experts once the engine's access pattern settles.
   the full single-node decode clean: load 18 s, prefill 8.3 s,
   1.5-2.3 s/token, ` Paris. The Eiffel`. Treat 96 GB as suspect until
   the ceiling is bisected. GPU clocks were locked to 2418 MHz
-  (`nvidia-smi -lgc`) for these runs — the 305 MHz idle clock
-  multiplies any stalled-step diagnosis by another order of magnitude.
+  (`nvidia-smi -lgc`) for these runs as a diagnostic only — the boxes
+  run capped clocks by design (thermal), so real decode at the default
+  clocks is slower than the 1.5-2.3 s/token measured here, and the
+  305 MHz idle clock multiplies any stalled-step diagnosis by another
+  order of magnitude.
