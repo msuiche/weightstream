@@ -19,7 +19,25 @@ measured on the same hardware; sources are cited per claim. Repo state:
   unavailable until reset. SSH = 192.168.1.x, RoCE = 192.168.100.x.
 
 ## Measured numbers (same hardware, same model)
+## The GLP-27 production baseline (2026-10-31, measured)
 
+The dsv41f lane with GLP-27 fold-site steering armed (α=3.5), TP4 ring,
+DSpark speculative decoding, thermal cap on. Measured by
+`bin/spark bench` on the four-node ring, zero foreign requests:
+
+| metric | GLP-27 lane | ferroseek (best measured) |
+|---|---|---|
+| decode t/s, single stream (C1) | **58.64** (tpot p50 16.57 ms) | ~0.5 single-node stream |
+| decode t/s, aggregate (C16) | **215.94** (tpot p50 73.86 ms) | — |
+| cold prefill | **5.3k t/s** (32K / 131K) | ~0.6 t/s (8.3 s / 5 tokens) |
+
+This is the apples-to-apples bar for ferroseek's upload-TP4 work: same
+hardware, same checkpoint, same DSpark spec-decode, steering armed. The
+2026-10-17 reference below is the UNSTEERED stock 1022 lane (a different
+graph); the GLP-27 numbers include the fold materialization + companion
+writer overhead.
+
+## Measured numbers (same hardware, same model)
 | | spark-ds41f TP4 ring (2026-10-17) | ferroseek (best measured) |
 |---|---|---|
 | decode step | 36.7–39.1 ms | — |
