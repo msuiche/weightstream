@@ -2,7 +2,7 @@
 
 Handoff for the agent picking up performance work. Everything here is
 measured on the same hardware; sources are cited per claim. Repo state:
-`main` @ `bdd142a` (2026-10-30).
+`main` @ `b5e6f61` (2026-10-31).
 
 ## Hardware and model
 
@@ -14,9 +14,9 @@ measured on the same hardware; sources are cited per claim. Repo state:
   `~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1…/`
   (48/48 shards, 510.297 GB resolved — verified 2026-10-30; measure
   with `du -L`, the blobs are a shared pool).
-- Ring: `spark-4687` (head), `spark-5bc3`, `spark-7425` up; `spark-7275`
-  GPU wedged (`nvidia-smi`: no devices) as of 2026-10-30 — 4-rank TP4
-  unavailable until reset. SSH = 192.168.1.x, RoCE = 192.168.100.x.
+- Ring: `spark-4687` (head), `spark-5bc3`, `spark-7425`, `spark-7275`;
+  all four GPUs healthy and TP4 validated on 2026-10-31. SSH = 192.168.1.x,
+  RoCE = 192.168.100.x.
 
 ## Measured numbers (same hardware, same model)
 ## The GLP-27 production baseline (2026-10-31, measured)
@@ -25,17 +25,28 @@ The dsv41f lane with GLP-27 fold-site steering armed (α=3.5), TP4 ring,
 DSpark speculative decoding, thermal cap on. Measured by
 `bin/spark bench` on the four-node ring, zero foreign requests:
 
-| metric | GLP-27 lane | ferroseek (best measured) |
+| metric | GLP-27 lane | ferroseek upload TP4 (2026-10-31) |
 |---|---|---|
-| decode t/s, single stream (C1) | **58.64** (tpot p50 16.57 ms) | ~0.5 single-node stream |
-| decode t/s, aggregate (C16) | **215.94** (tpot p50 73.86 ms) | — |
-| cold prefill | **5.3k t/s** (32K / 131K) | ~0.6 t/s (8.3 s / 5 tokens) |
+| decode t/s, single stream (C1) | **58.64** (tpot p50 16.57 ms) | **10.24** (tpot p50 97.20 ms) |
+| decode t/s, aggregate (C16) | **215.94** (tpot p50 73.86 ms) | — (single-request lockstep) |
+| cold prefill | **5.3k t/s** (32K / 131K) | not measured at those sizes |
 
 This is the apples-to-apples bar for ferroseek's upload-TP4 work: same
 hardware, same checkpoint, same DSpark spec-decode, steering armed. The
 2026-10-17 reference below is the UNSTEERED stock 1022 lane (a different
 graph); the GLP-27 numbers include the fold materialization + companion
 writer overhead.
+
+Upload validation used `72323e6` plus the worker-barrier fix `b5e6f61`,
+the real 1017 checkpoint, upload mode, and a drained ring. All four ranks
+completed `The capital of France is` → ` Paris.` with 620 collectives.
+The C1 measurement used one model load, a 64-token warm-up request, then
+64 greedy tokens for `The capital of Italy is`; mean 97.635 ms/token,
+p50 97.196 ms, range 84.524–112.863 ms. GLP-27 remains **5.73×** the
+ferroseek C1 throughput. C16 is not an apples-to-apples measurement:
+ferroseek serving serializes requests. No 32K/131K prefill comparison
+was run. Raw logs: `spark-*:/tmp/tp4-upload-rank{0..3}.log` (validation)
+and `spark-*:/tmp/tp4-bench-rank{0..3}.log` (benchmark).
 
 ## Measured numbers (same hardware, same model)
 | | spark-ds41f TP4 ring (2026-10-17) | ferroseek (best measured) |
@@ -92,29 +103,14 @@ Multiplicative, ordered by impact:
 
 ## Current blockers (priority order)
 
-1. **P0 — upload-mode correctness divergence** (commit 6e8ebdc era):
-   step-1 quant flip → step-2 amplification. Prior session's verdict:
-   TP1 experts are device-resident at build, so suspect is the device
-   bytes of L1–L3 expert uploads — offset/aliasing in the upload path
-   at layers ≥ 1. Known adjacent fault class (`docs/transport.md`
-   ~line 179): tensor pointers into registered shards align at 8 bytes
-   while uint4 vectorized loads demand 16 — upload mode (256-aligned)
-   never faulted there. Next recorded step: dump the uploaded expert
-   buffers for layers 1–3 and diff against the store
-   (`FERROSEEK_DUMP_GPU=<dir>` gives per-layer/per-expert dumps; the
-   dump site for staged experts already exists in `moe_step`).
-   Upload TP4 is ferroseek's designated production path (`docs/
-   transport.md`: "~119 GB/rank … upload mode … 226 GB/s vs 163 GB/s
-   registered-page reads") — until this lands there is no
-   apples-to-apples against the original's 36.7–39.1 ms step.
-2. **P1 — grouped-MoE for streamed experts.** Removes the
+1. **P0 — grouped-MoE for streamed experts.** Removes the
    host-dispatch loop; gate already lives on-device. Also unlocks
    `decode_m` (M-batch prefill) in streaming/TP — it currently declines
    and falls back to sequential per-token decode.
-3. **P2 — CUDA graphs for the decode step.**
-4. **P2 — batching** (multi-request per lockstep step) and
+2. **P1 — CUDA graphs for the decode step.**
+3. **P1 — batching** (multi-request per lockstep step) and
    prefix-cache reuse on the serving path.
-5. **P3 — bisect the registration-budget ceiling** (24 GB clean,
+4. **P2 — bisect the registration-budget ceiling** (24 GB clean,
    96 GB wedges) to retune the `FERROSEEK_STREAM_BUDGET_GB` default.
 
 ## Already verified — do not redo
@@ -124,14 +120,15 @@ Multiplicative, ordered by impact:
 - Real-checkpoint streaming decode (above) — known-answer green.
 - Ring transport: 10.5 µs p50 4 KB all-reduce, zero loss in 100k soak
   (`docs/transport.md`).
-- TP4 sharded decode bit-exact on all 4 ranks, 2026-10-26 (`e834f0c`).
+- TP4 upload decode on all 4 ranks, 2026-10-31 (`b5e6f61`): real
+  checkpoint ` Paris.`, warm C1 benchmark recorded above.
 - GPU kernels each gated vs the CPU reference; the CPU reference is
   gated against the production vLLM TP4 stack.
 
 ## Repro commands
 
 (spark-4687, `~/ferroseek`; binary `target/release/ferroseek` rebuilt
-2026-10-30 with cuda; toolchain `~/.cargo/bin/cargo`,
+2026-10-31 with cuda; toolchain `~/.cargo/bin/cargo`,
 `/usr/local/cuda/bin/nvcc`)
 
 ```bash
@@ -144,9 +141,9 @@ FERROSEEK_STREAM_BUDGET_GB=24 ./target/release/ferroseek decode "$S" \
   "The capital of France is" 6 --engine gpu --stream
 # expect: " Paris. The Eiffel"
 
-# TP4 (needs spark-7275 back): per rank
+# TP4 upload validation: per rank
 ./target/release/ferroseek decode "$S" "The capital of France is" 6 \
-  --engine gpu --stream --tp4 --rank N --ring nodes-ring4.local.json
+  --engine gpu --tp4 --rank N --ring nodes-ring4.local.json
 ```
 
 Env knobs: `FERROSEEK_STREAM_BUDGET_GB` (registration budget, default
@@ -164,4 +161,4 @@ at exit), `FERROSEEK_DUMP_GPU=<dir>` (per-layer/op tensor dumps),
   prefault / `device_ptr`, `PinnedBuf` staging.
 - `docs/streaming.md` — bandwidth table (226/163/37 GB/s), budget
   pathology note. `docs/transport.md` — milestones, upload-vs-stream
-  rationale, open regressions (6e8ebdc upload divergence).
+  rationale, upload validation and worker-barrier timeout fix.

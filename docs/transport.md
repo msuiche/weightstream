@@ -80,6 +80,11 @@ rank-ordered concatenation). Real 4-rank decode of the 1017 checkpoint:
 bit-identical. On the drained box (ferroseek as the sole tenant):
 94 ms/token lockstep = 10.6 tok/s single-stream (2026-10-26; was
 1.2 s/token under the vLLM co-tenant with per-use expert staging).
+2026-10-31: worker control reads now use the head's 600 s barrier budget
+(`b5e6f61`) instead of the 300 s connect timeout; upload load skew had
+aborted rank 3 before the first collective. With that fix, a fresh
+real-checkpoint upload run completed on all four ranks (` Paris.`, 620
+collectives, 92.7–93.0 ms/token).
 4. done (2026-10-26). Two layers, both over one model load:
    - `ferroseek decode --prompts-file`: batch requests from a file
      (CLI prompt first, one request per line), every rank in lockstep
