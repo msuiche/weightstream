@@ -262,7 +262,11 @@ impl Worker {
     }
 
     /// Block until the head sends the next Go. `None` = Bye (clean exit).
+    /// Model uploads can take >300 s; match the head's 600 s barrier budget
+    /// rather than inheriting the shorter connect timeout.
     pub fn wait_go(&mut self) -> CtrlResult<Option<(Phase, serde_json::Value)>> {
+        self.stream
+            .set_read_timeout(Some(Duration::from_secs(600)))?;
         loop {
             match recv(&mut self.reader)? {
                 Msg::Go { phase, cmd } => return Ok(Some((phase, cmd))),
@@ -355,5 +359,29 @@ mod tests {
             h.join().unwrap();
         }
         t.join().unwrap();
+    }
+
+    #[test]
+    fn wait_go_outlives_connect_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            assert!(matches!(recv(&mut reader).unwrap(), Msg::Hello { rank: 1 }));
+            std::thread::sleep(Duration::from_millis(150));
+            send(
+                &mut stream,
+                &Msg::Go {
+                    phase: Phase::Start,
+                    cmd: serde_json::json!({}),
+                },
+            )
+            .unwrap();
+        });
+        let mut worker = Worker::connect("127.0.0.1", port, 1, Duration::from_millis(50)).unwrap();
+        let (phase, _) = worker.wait_go().unwrap().unwrap();
+        assert_eq!(phase, Phase::Start);
+        server.join().unwrap();
     }
 }
