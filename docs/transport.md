@@ -116,6 +116,12 @@ collectives, 92.7–93.0 ms/token).
      against a no-cache control run (LRU bound 8, ~650 MB device memory;
      every rank's cache evolves identically, so lockstep holds).
 
+    TP4 M-batch prefill also shipped: `decode_m` uses TP-local shapes and
+    per-position collectives, with the final top-k state preserved for
+    sequential continuation. A 132-token prefill across the window
+    boundary measured 9.625 s vs 12.964 s sequential (25.8% faster) and
+    produced `The capital of Japan` on all four ranks.
+
 ## The registration ceiling (measured 2026-10-26)
 
 `cuMemHostRegister(DEVICEMAP)` — the streaming mode's whole design —

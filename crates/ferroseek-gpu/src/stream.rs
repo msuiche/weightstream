@@ -295,7 +295,10 @@ impl PinnedBuf {
         stream: CUstream,
     ) -> io::Result<()> {
         if off + bytes > self.len {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "pinned range"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("pinned range: off={off} bytes={bytes} len={}", self.len),
+            ));
         }
         let r = unsafe { cuMemcpyDtoHAsync_v2(self.ptr.add(off) as *mut _, src, bytes, stream) };
         if !cu_ok(r) {
@@ -327,7 +330,10 @@ impl PinnedBuf {
     /// Async host->device from `[ptr+off, ptr+off+bytes)` on `stream`.
     pub fn htod_at(&self, dst: u64, bytes: usize, off: usize, stream: CUstream) -> io::Result<()> {
         if off + bytes > self.len {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "pinned range"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("pinned range: off={off} bytes={bytes} len={}", self.len),
+            ));
         }
         let r = unsafe { cuMemcpyHtoDAsync_v2(dst, self.ptr.add(off) as *const _, bytes, stream) };
         if !cu_ok(r) {

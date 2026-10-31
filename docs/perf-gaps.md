@@ -48,6 +48,12 @@ ferroseek serving serializes requests. No 32K/131K prefill comparison
 was run. Raw logs: `spark-*:/tmp/tp4-upload-rank{0..3}.log` (validation)
 and `spark-*:/tmp/tp4-bench-rank{0..3}.log` (benchmark).
 
+TP4 M-batch prefill measured separately on the same checkpoint: a
+132-token window-crossing prompt took 9.625 s versus 12.964 s with
+`FERROSEEK_SEQ_PREFILL=1`, a 25.8% reduction. All four ranks produced
+`The capital of Japan`. Logs: `spark-*:/tmp/tp4-shortwin-rank{0..3}.log`
+(M-batch) and `spark-*:/tmp/tp4-shortseq-rank{0..3}.log` (sequential).
+
 ## Measured numbers (same hardware, same model)
 | | spark-ds41f TP4 ring (2026-10-17) | ferroseek (best measured) |
 |---|---|---|

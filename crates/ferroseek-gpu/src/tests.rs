@@ -1532,6 +1532,28 @@ fn decode_prefill_m_matches_sequential_and_reuses_prefix() {
     eprintln!("prefill prefix reuse: bit-exact ({d2:.3e}), resumed at {}", ids.len());
 }
 
+
+#[test]
+fn decode_prefill_window_boundary_matches_sequential() {
+    let ids: Vec<u32> = TOKENS.iter().cloned().cycle().take(136).collect();
+    let mut seq = gpu_model(42);
+    let mut want = Vec::new();
+    for (p, &t) in ids.iter().enumerate() {
+        want = seq.decode(t, p as u64).unwrap();
+    }
+    let mut bat = gpu_model(42);
+    let got = bat.decode_prefill(&ids).unwrap();
+    let d = max_abs_diff(&want, &got);
+    assert!(d < GATE_ABS_TOL, "window-crossing prefill diverged: {d:.3e}");
+    assert_eq!(bat.next_position(), ids.len() as u64);
+    for (j, &t) in [29u32, 31].iter().enumerate() {
+        let p = ids.len() + j;
+        let a = seq.decode(t, p as u64).unwrap();
+        let b = bat.decode(t, p as u64).unwrap();
+        let d = max_abs_diff(&a, &b);
+        assert!(d < GATE_ABS_TOL, "window-crossing continuation diverged: {d:.3e}");
+    }
+}
 #[test]
 fn decode_m_streaming_matches_sequential() {
     // decode_m through the STREAMING path (registered shard mappings,

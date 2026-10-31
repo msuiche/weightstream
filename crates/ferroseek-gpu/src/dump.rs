@@ -19,10 +19,13 @@ pub(crate) fn pos() -> u64 {
     POS.load(Ordering::Relaxed)
 }
 
+pub(crate) fn enabled() -> bool {
+    DIR.get_or_init(|| std::env::var_os("FERROSEEK_DUMP_GPU").map(std::path::PathBuf::from))
+        .is_some()
+}
+
 fn write(name: String, bytes: Vec<u8>) {
-    let dir =
-        DIR.get_or_init(|| std::env::var_os("FERROSEEK_DUMP_GPU").map(std::path::PathBuf::from));
-    if let Some(d) = dir {
+    if let Some(d) = DIR.get_or_init(|| std::env::var_os("FERROSEEK_DUMP_GPU").map(std::path::PathBuf::from)) {
         let _ = std::fs::write(d.join(name), bytes);
     }
 }

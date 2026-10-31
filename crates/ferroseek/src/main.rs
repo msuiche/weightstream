@@ -497,6 +497,10 @@ fn cmd_decode(args: &[String]) -> ExitCode {
         }
         Err(e) => eprintln!("warning: engram token map not built ({e}); identity fallback"),
     }
+    #[cfg(feature = "cuda")]
+    unsafe {
+        let _ = cust::sys::cuProfilerStart();
+    }
 
     // Per-position gate stats: logprob of the token actually consumed,
     // its rank, and the top-1 id at that position (fp32 log-softmax).
@@ -554,19 +558,30 @@ fn cmd_decode(args: &[String]) -> ExitCode {
         let t0 = std::time::Instant::now();
         let mut logits = Vec::new();
         let mut pos = 0u64;
-        for (i, &t) in ids.iter().enumerate() {
-            match model.decode(t, pos) {
+        if logits_out.is_none() && logits_raw.is_none() {
+            match model.decode_prefill(&ids) {
                 Ok(l) => {
                     logits = l;
-                    dump_raw(&logits, pos, &logits_raw);
+                    pos = ids.len() as u64;
                 }
                 Err(e) => {
-                    eprintln!("decode@{pos}: {e}");
+                    eprintln!("prefill: {e}");
                     return None;
                 }
             }
-            pos += 1;
-            if logits_out.is_some() {
+        } else {
+            for (i, &t) in ids.iter().enumerate() {
+                match model.decode(t, pos) {
+                    Ok(l) => {
+                        logits = l;
+                        dump_raw(&logits, pos, &logits_raw);
+                    }
+                    Err(e) => {
+                        eprintln!("decode@{pos}: {e}");
+                        return None;
+                    }
+                }
+                pos += 1;
                 if let Some(&consumed) = ids.get(i + 1) {
                     record(&logits, pos, consumed, &mut records);
                 }
@@ -582,7 +597,9 @@ fn cmd_decode(args: &[String]) -> ExitCode {
                 None => ferroseek_ref::sample::argmax(&logits),
             };
             generated.push(next);
-            record(&logits, pos, next, &mut records);
+            if logits_out.is_some() {
+                record(&logits, pos, next, &mut records);
+            }
             let t1 = std::time::Instant::now();
             let hit_eos = force_ids.is_empty() && Some(next) == tk.eos_token_id;
             if hit_eos {
@@ -717,6 +734,10 @@ fn cmd_decode(args: &[String]) -> ExitCode {
                 }
             }
         }
+    }
+    #[cfg(feature = "cuda")]
+    unsafe {
+        let _ = cust::sys::cuProfilerStop();
     }
 
     let cs = model.coll_stats();

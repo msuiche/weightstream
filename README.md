@@ -31,12 +31,14 @@ What works today:
   --rank N --ring nodes-ring4.local.json`: per-rank slices (16 heads,
   96 experts, vocab shard) with all-reduces at the spec's three reduction
   points plus the logits all-gather
+- **TP4 M-batch prefill** — TP-local `decode_m` batches across the ring;
+  132-token A/B prefill 9.625 s vs 12.964 s sequential (25.8% faster)
 - **Serving** — `ferroseek serve --tp4 --ring ...`: OpenAI-compatible
   endpoint on the head rank, SSE streaming, `temperature`/`top_p`/`seed`
   broadcast with `Phase::Next` so all ranks draw identically
 
-Remaining: speculative decode, prefill, multi-request batching and
-prefix-cache reuse on the serving path. See
+Remaining: speculative decode and multi-request batching on the serving
+path. See
 [`docs/architecture.md`](docs/architecture.md),
 [`docs/model-spec.md`](docs/model-spec.md), [`docs/streaming.md`](docs/streaming.md),
 [`docs/transport.md`](docs/transport.md).

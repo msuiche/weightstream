@@ -1583,12 +1583,11 @@ impl GpuModel<'static> {
         let hashes = if self.engram.layer_ids.is_empty() {
             Vec::new()
         } else {
-            let token_map = self.token_map.clone();
             hash_ids(
                 &self.cfg,
                 &self.engram,
                 &mut self.eng_cache,
-                token_map.as_deref(),
+                self.token_map.as_deref(),
                 token,
                 position,
             )
@@ -1779,10 +1778,12 @@ impl GpuModel<'static> {
                             ncols * ehd,
                             format!("d_pos{}_eflat{}.f32", crate::dump::pos(), layer.layer),
                         );
-                        crate::dump::f32s(
-                            format!("d_pos{}_hashids{}.f32", crate::dump::pos(), layer.layer),
-                            &ids.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
-                        );
+                        if crate::dump::enabled() {
+                            crate::dump::f32s(
+                                format!("d_pos{}_hashids{}.f32", crate::dump::pos(), layer.layer),
+                                &ids.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+                            );
+                        }
                     }
                     _ => {
                         k::gather_fp8(
@@ -2041,7 +2042,7 @@ impl GpuModel<'static> {
             vocab_l,
             dim,
         );
-        if let Some(comm) = comm_opt.as_deref_mut() {
+        let out = if let Some(comm) = comm_opt.as_deref_mut() {
             let stream = c.stream.as_inner();
             s.coll_stage.dtoh(
                 s.logits.as_device_ptr().as_raw() as u64,
@@ -2050,10 +2051,15 @@ impl GpuModel<'static> {
             )?;
             s.coll_stage.sync(stream)?;
             let full = comm.allgather(&s.coll_stage.as_f32()[..vocab_l])?;
+            // Keep device logits current for argmax_current, but return the
+            // host vector we already own instead of a second full D2H copy.
             s.logits.copy_from(&full).map_err(cuda_err)?;
-        }
-        let mut out = vec![0.0f32; cfg.vocab as usize];
-        s.logits.copy_to(&mut out).map_err(cuda_err)?;
+            full
+        } else {
+            let mut out = vec![0.0f32; cfg.vocab as usize];
+            s.logits.copy_to(&mut out).map_err(cuda_err)?;
+            out
+        };
         prof.steps += 1;
         prof.add_us(4, t_head);
         Ok(out)
@@ -2534,7 +2540,8 @@ impl<'a> GpuModel<'a> {
             argmax_i: DeviceBuffer::zeroed(1).map_err(cuda_err)?,
             argmax_v: DeviceBuffer::zeroed(1).map_err(cuda_err)?,
             coll_stage: crate::stream::PinnedBuf::new(
-                cfg.vocab as usize / sh.world_size as usize * 4 + 4,
+                score_cap.max(cfg.vocab as usize / sh.world_size as usize).max(cfg.dim as usize) * 4
+                    + 4,
             )?,
             gate_stage: crate::stream::PinnedBuf::new(1024)?,
             small_stage: crate::stream::PinnedBuf::new(64 << 10)?,
@@ -3444,8 +3451,8 @@ fn moe_step(
 // Sequential per position: ring writes, the CSA compressor state machine,
 // indexer key append + selection, engram hashing — the position-dependent
 // state, evolved in order so the post-pass state equals m sequential
-// decode() calls. v1 bounds (explicit errors): upload-mode (w1_all),
-// world == 1, and the batch must not wrap the attention ring.
+// decode() calls. v1 bounds (explicit errors): upload-mode (TP1 or TP4),
+// and the batch must not wrap the attention ring.
 
 /// M-row scratch, grown on demand.
 struct ScratchM {
@@ -3543,10 +3550,10 @@ impl ScratchM {
             pre_attn: alloc(m * hc)?,
             pre_ffn: alloc(m * hc)?,
             post: alloc(m * hc)?,
-            comb: alloc(m * hc)?,
+            comb: alloc(m * hc * hc)?,
             zeros_h: alloc(m * hc * dim)?,
             ones_hc: alloc(m * hc)?,
-            comb_zero: alloc(m * hc)?,
+            comb_zero: alloc(m * hc * hc)?,
             act_x: alloc_u(m * dim)?,
             act_x_s: alloc_u(m * dim / 32)?,
             act_qr: alloc_u(m * ql)?,
@@ -3576,17 +3583,18 @@ impl<'a> GpuModel<'a> {
     /// sparse_attn, gate); position-dependent state (ring writes, CSA
     /// compressor, indexer, engram hashes) evolves sequentially per
     /// position, so the post-pass model state equals m sequential
-    /// `decode` calls. v1 bounds: upload mode, world == 1, and the batch
+    /// `decode` calls. v1 bounds: upload mode (TP1 or TP4), and the batch
     /// must not wrap the attention ring (chunk at the window boundary).
     pub fn decode_m(&mut self, tokens: &[u32]) -> io::Result<Vec<Vec<f32>>> {
         let m = tokens.len();
         if m == 0 {
             return Ok(Vec::new());
         }
-        if self.sharding.world_size != 1 {
+        let world = self.sharding.world_size as usize;
+        if world > 1 && self.arena.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "decode_m: TP (world > 1) not yet supported",
+                "decode_m: TP4 streaming is not supported",
             ));
         }
 
@@ -3671,14 +3679,18 @@ impl<'a> GpuModel<'a> {
             run,
             engram,
             arena,
+            sharding,
+            comm,
             ..
         } = self;
         let sm = scratch_m.as_mut().unwrap();
         let arena_opt: Option<&crate::stream::HostArena> = arena.as_ref();
+        let sh = *sharding;
+        let mut comm_opt: Option<&mut (dyn Collectives + 'static)> = comm.as_deref_mut();
 
         let dim = cfg.dim as usize;
         let hc = cfg.hc_mult as usize;
-        let heads = cfg.n_heads as usize;
+        let heads = cfg.n_heads as usize / sh.world_size as usize;
         let eps = cfg.norm_eps;
 
         // h init: embedding rows -> hc copies (one-hot pre per row)
@@ -3876,7 +3888,8 @@ impl<'a> GpuModel<'a> {
             );
 
             attention_step_m(
-                c, cfg, layer, sm, s1, caches, run, bands, rope_cos, rope_sin, pos0, m,
+                c, cfg, layer, sm, s1, caches, run, bands, rope_cos, rope_sin, pos0, m, sh,
+                comm_opt.as_deref_mut(),
             )?;
 
             {
@@ -3927,7 +3940,7 @@ impl<'a> GpuModel<'a> {
                 eps,
             );
 
-            moe_step_m(c, cfg, layer, sm, s1, arena_opt, m)?;
+            moe_step_m(c, cfg, layer, sm, s1, arena_opt, m, sh, comm_opt.as_deref_mut())?;
 
             {
                 let h_next = 1 - h_cur;
@@ -3945,7 +3958,8 @@ impl<'a> GpuModel<'a> {
             }
         }
 
-        // tail: collapse, final norm, head per row
+        // tail: collapse, final norm, local vocab head + TP all-gather per row
+        let vocab_l = cfg.vocab as usize / world;
         k::hc_pre(
             c,
             k::base(&sm.h[h_cur]),
@@ -3961,9 +3975,23 @@ impl<'a> GpuModel<'a> {
                 k::base(head),
                 k::row(&sm.x, i * dim, dim),
                 k::row(&sm.logits, i * cfg.vocab as usize, cfg.vocab as usize),
-                cfg.vocab as usize,
+                vocab_l,
                 dim,
             );
+            if let Some(comm) = comm_opt.as_deref_mut() {
+                let stream = c.stream.as_inner();
+                s1.coll_stage.dtoh(
+                    k::row(&sm.logits, i * cfg.vocab as usize, vocab_l).as_raw() as u64,
+                    vocab_l * 4,
+                    stream,
+                )?;
+                s1.coll_stage.sync(stream)?;
+                let full = comm.allgather(&s1.coll_stage.as_f32()[..vocab_l])?;
+                sm.logits
+                    .index(i * cfg.vocab as usize..(i + 1) * cfg.vocab as usize)
+                    .copy_from(&full)
+                    .map_err(cuda_err)?;
+            }
         }
         let mut out = vec![0.0f32; m * cfg.vocab as usize];
         sm.logits
@@ -3977,7 +4005,7 @@ impl<'a> GpuModel<'a> {
 
 /// The M-batch attention sublayer: batched q/kv projections and rope,
 /// sequential per-position cache writes + CSA compressor + indexer,
-/// one sparse_attn_m over per-position causal idx lists.
+/// one sparse_attn per position, in causal order.
 #[allow(clippy::too_many_arguments)]
 fn attention_step_m(
     c: &Cuda,
@@ -3992,17 +4020,20 @@ fn attention_step_m(
     rope_sin: &[D<f32>; 2],
     pos0: u64,
     m: usize,
+    sh: Sharding,
+    mut comm: Option<&mut (dyn Collectives + 'static)>,
 ) -> io::Result<()> {
     let l = layer.layer as usize;
     let dim = cfg.dim as usize;
     let hd = cfg.head_dim as usize;
     let rd = cfg.rope_dim as usize;
-    let heads = cfg.n_heads as usize;
+    let world = sh.world_size as usize;
+    let heads = cfg.n_heads as usize / world;
     let win = cfg.window_size as usize;
     let eps = cfg.norm_eps;
-    let og = cfg.o_groups as usize;
+    let og = cfg.o_groups as usize / world;
     let ol = cfg.o_lora as usize;
-    let inh = cfg.index_n_heads as usize;
+    let inh = cfg.index_n_heads as usize / world;
     let ihd = cfg.index_head_dim as usize;
     let ratio = layer.ratio as u64;
 
@@ -4100,11 +4131,7 @@ fn attention_step_m(
             false,
         );
         k::snap8(c, ring, hd);
-    }
-
-    // compressed path + indexer, per position (state machines in order)
-    if layer.ratio > 0 {
-        for i in 0..m {
+        if layer.ratio > 0 {
             let pos = pos0 + i as u64;
             let compress_len = ((pos + 1) / ratio) as usize;
             let mut latent_ready = false;
@@ -4236,6 +4263,13 @@ fn attention_step_m(
                 if compress_len == 0 {
                     let wi = window_topk_idxs(win, pos);
                     list[..win].copy_from_slice(&wi);
+                    if i + 1 == m {
+                        run.shared_n_sel = win;
+                        s1.shared_idxs
+                            .index(0..win)
+                            .copy_from(&list[..win])
+                            .map_err(cuda_err)?;
+                    }
                 } else {
                     k::indexer_score(
                         c,
@@ -4252,6 +4286,9 @@ fn attention_step_m(
                         .index(0..compress_len)
                         .copy_to(&mut score)
                         .map_err(cuda_err)?;
+                    if let Some(comm) = comm.as_deref_mut() {
+                        score = comm.allreduce(&score)?;
+                    }
                     if layer.cand_src {
                         let cand = select_candidate_blocks(
                             &score,
@@ -4280,6 +4317,14 @@ fn attention_step_m(
                     list[..win].copy_from_slice(&wi);
                     for (j, &v) in cmp.iter().enumerate() {
                         list[win + j] = v;
+                    }
+                    if i + 1 == m {
+                        let n_sel = win + cmp.len();
+                        run.shared_n_sel = n_sel;
+                        s1.shared_idxs
+                            .index(0..n_sel)
+                            .copy_from(&list[..n_sel])
+                            .map_err(cuda_err)?;
                     }
                 }
                 sm.shared_idxs
@@ -4311,28 +4356,31 @@ fn attention_step_m(
                 }
             }
         }
+        let topk_max = cfg.index_topk as usize;
+        let (idxs, n_sel) = if layer.ratio > 0 {
+            (
+                sm.shared_idxs
+                    .index(i * (win + topk_max)..(i + 1) * (win + topk_max))
+                    .as_device_ptr(),
+                win + topk_max,
+            )
+        } else {
+            (sm.win_idxs.index(i * win..(i + 1) * win).as_device_ptr(), win)
+        };
+        k::sparse_attn(
+            c,
+            k::row(&sm.q, i * heads * hd, heads * hd),
+            k::base(&caches.kv_all[l]),
+            idxs,
+            k::base(&layer.attn_sink),
+            k::row(&sm.o, i * heads * hd, heads * hd),
+            heads,
+            hd,
+            n_sel,
+            (hd as f32).sqrt().recip(),
+        );
     }
 
-    // sparse attention: batched over per-position idx lists
-    let topk_max = cfg.index_topk as usize;
-    let (idxs, n_sel) = if layer.ratio > 0 {
-        (k::base(&sm.shared_idxs), win + topk_max)
-    } else {
-        (k::base(&sm.win_idxs), win)
-    };
-    k::sparse_attn_m(
-        c,
-        k::base(&sm.q),
-        k::base(&caches.kv_all[l]),
-        idxs,
-        k::base(&layer.attn_sink),
-        k::base(&sm.o),
-        heads,
-        hd,
-        n_sel,
-        m,
-        (hd as f32).sqrt().recip(),
-    );
 
     // inverse rope, snap, wo_a per (pos, group), wo_b batched
     k::rope_uniform_pos_buf(
@@ -4378,6 +4426,20 @@ fn attention_step_m(
         dim,
         og * ol,
     );
+    if let Some(comm) = comm.as_deref_mut() {
+        for i in 0..m {
+            let mut partial = vec![0.0f32; dim];
+            sm.attn_out
+                .index(i * dim..(i + 1) * dim)
+                .copy_to(&mut partial)
+                .map_err(cuda_err)?;
+            let reduced = comm.allreduce(&partial)?;
+            sm.attn_out
+                .index(i * dim..(i + 1) * dim)
+                .copy_from(&reduced)
+                .map_err(cuda_err)?;
+        }
+    }
     Ok(())
 }
 
@@ -4391,11 +4453,16 @@ fn moe_step_m(
     s1: &mut Scratch,
     arena: Option<&crate::stream::HostArena>,
     m: usize,
+    sh: Sharding,
+    mut comm: Option<&mut (dyn Collectives + 'static)>,
 ) -> io::Result<()> {
     let dim = cfg.dim as usize;
     let inter = cfg.inter_dim as usize;
     let n_experts = cfg.n_routed as usize;
     let top_k = cfg.n_activated as usize;
+    let world = sh.world_size as usize;
+    let e_start = sh.rank as usize * n_experts / world;
+    let e_len = n_experts / world;
 
     k::moe_gate_m(
         c,
@@ -4416,6 +4483,12 @@ fn moe_step_m(
         m * dim,
     );
 
+    if world > 1 && layer.w1_all.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "decode_m: TP4 requires grouped expert slabs",
+        ));
+    }
     if layer.w1_all.is_some() {
         // grouped-expert path (real checkpoint, upload mode)
         let w1 = layer.w1_all.as_ref().unwrap();
@@ -4442,8 +4515,8 @@ fn moe_step_m(
             k::base(&s1.local_experts),
             k::base(&s1.local_count),
             top_k,
-            0,
-            n_experts,
+            e_start,
+            e_len,
         );
         k::expert_glu(
             c,
@@ -4485,7 +4558,7 @@ fn moe_step_m(
             dim,
             inter,
             top_k,
-            0,
+            e_start,
         );
         }
     } else {
@@ -4567,6 +4640,21 @@ fn moe_step_m(
         }
     }
 
+    if let Some(comm) = comm.as_deref_mut() {
+        for i in 0..m {
+            let mut partial = vec![0.0f32; dim];
+            sm.y_moe
+                .index(i * dim..(i + 1) * dim)
+                .copy_to(&mut partial)
+                .map_err(cuda_err)?;
+            let reduced = comm.allreduce(&partial)?;
+            sm.y_moe
+                .index(i * dim..(i + 1) * dim)
+                .copy_from(&reduced)
+                .map_err(cuda_err)?;
+        }
+    }
+
     // shared expert, batched, added last per row
     let [w1, w2, w3] = &layer.shared_experts;
     k::fp8_gemm(
@@ -4618,5 +4706,6 @@ fn moe_step_m(
         inter,
     );
     k::acc_f32(c, k::base(&sm.expert_y), k::base(&sm.y_moe), m * dim);
+
     Ok(())
 }
