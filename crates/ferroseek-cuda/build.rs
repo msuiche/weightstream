@@ -66,12 +66,14 @@ fn main() {
             // (the synthetic gate's step-1/step-2 flip, root-caused by
             // per-layer capture + dump diffing).
             let mut cmd = Command::new(&nvcc);
-            cmd.args(["-ptx", "-arch=compute_121", "-O3"]);
+            cmd.args(["-ptx", "-O3"]);
             if stem == "moe" {
                 cmd.arg("-fmad=false");
             }
             if path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) == Some("tilelang") {
-                cmd.arg("-I").arg("vendor");
+                cmd.arg("-arch=compute_121a").arg("-I").arg("vendor");
+            } else {
+                cmd.arg("-arch=compute_121");
             }
             cmd.arg("-o").arg(&ptx).arg(&path);
             let status = cmd.status().expect("nvcc run");

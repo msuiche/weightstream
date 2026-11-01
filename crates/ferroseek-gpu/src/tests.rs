@@ -669,6 +669,64 @@ fn fp8_gemm_tile_matches_cpu_and_m1() {
 }
 
 #[test]
+fn tilelang_fp8_gemm_matches_scalar() {
+    let guard = Cuda::global();
+    let c = guard.as_ref().unwrap();
+    let (m, n, k) = (1usize, 8192usize, 1280usize);
+    let kb = k / 32;
+    let a: Vec<u8> = rand_vec(m * k, 991)
+        .iter()
+        .map(|&v| ferroseek_core::quant::f32_to_e4m3(v))
+        .collect();
+    let b: Vec<u8> = rand_vec(n * k, 992)
+        .iter()
+        .map(|&v| ferroseek_core::quant::f32_to_e4m3(v))
+        .collect();
+    let sa = vec![127u8; m * kb];
+    let sb = vec![127u8; (n / 32) * kb];
+    let d_a = DeviceBuffer::from_slice(&a).unwrap();
+    let d_sa = DeviceBuffer::from_slice(&sa).unwrap();
+    let d_b = DeviceBuffer::from_slice(&b).unwrap();
+    let d_sb = DeviceBuffer::from_slice(&sb).unwrap();
+    let mut scalar = DeviceBuffer::from_slice(&vec![0f32; n]).unwrap();
+    crate::launch::fp8_gemm(
+        c,
+        d_a.as_device_ptr(),
+        d_sa.as_device_ptr(),
+        d_b.as_device_ptr(),
+        d_sb.as_device_ptr(),
+        scalar.as_device_ptr(),
+        m,
+        n,
+        k,
+    );
+    let packed = crate::engine::pack_weight_scales(&sb, n, k);
+    let d_packed = DeviceBuffer::from_slice(&packed).unwrap();
+    let d_sa_packed = DeviceBuffer::from_slice(&vec![0u8; 2 * kb]).unwrap();
+    d_sa_packed.index(0..kb).copy_from(&sa).unwrap();
+    let packed_a = crate::launch::U32::from_raw(d_sa_packed.as_device_ptr().as_raw() + kb as u64);
+    crate::launch::pack_scales(c, d_sa_packed.as_device_ptr(), packed_a, k);
+    let mut tiled = DeviceBuffer::from_slice(&vec![0f32; n]).unwrap();
+    crate::launch::fp8_gemm_tl(
+        c,
+        crate::launch::TlGemm::Qb,
+        d_a.as_device_ptr(),
+        packed_a,
+        d_b.as_device_ptr(),
+        d_packed.as_device_ptr(),
+        tiled.as_device_ptr(),
+        m,
+    );
+    c.stream.synchronize().unwrap();
+    let mut want = vec![0f32; n];
+    let mut got = vec![0f32; n];
+    scalar.copy_to(&mut want).unwrap();
+    tiled.copy_to(&mut got).unwrap();
+    let d = max_abs_diff(&got, &want);
+    assert!(d < 1e-3, "TileLang vs scalar max diff {d:.3e}");
+}
+
+#[test]
 fn fp4_gemm_tile_matches_cpu_and_m1() {
     // M-batch tiled fp4 expert GEMM: CPU mirror (unpack fp4 per the
     // engine's table) + per-row cross-check against the M=1 fp4_gemm at
@@ -1492,7 +1550,6 @@ fn decode_m_matches_sequential_decode() {
 }
 
 
-#[test]
 fn decode_prefill_m_matches_sequential_and_reuses_prefix() {
     // The chunked-prefill wiring: a fresh decode_prefill must land
     // bit-exact with sequential decode per token, and a second call

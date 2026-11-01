@@ -727,7 +727,7 @@ fn up_zero_f32(_c: &Cuda, n: usize) -> io::Result<D<f32>> {
     DeviceBuffer::zeroed(n.max(1)).map_err(cuda_err)
 }
 
-fn pack_weight_scales(bytes: &[u8], n: usize, k: usize) -> Vec<u32> {
+pub(crate) fn pack_weight_scales(bytes: &[u8], n: usize, k: usize) -> Vec<u32> {
     let kb = k / 32;
     let words = k / 128;
     let mut out = vec![0u32; n * words];
