@@ -63,11 +63,11 @@ extern "C" __global__ void sparse_attn(
         float mnew = fmaxf(m, logit);
         float corr = expf(m - mnew);
         float w = expf(logit - mnew);
-        s = s * corr + w;
+        s = __fmaf_rn(s, corr, w);
         if (idx >= 0) {
             int k = 0;
             for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) {
-                acc[k] = acc[k] * corr + w * v[k];
+                acc[k] = __fmaf_rn(acc[k], corr, w * v[k]);
             }
         } else {
             int k = 0;
@@ -142,11 +142,11 @@ extern "C" __global__ void sparse_attn_m(
         float mnew = fmaxf(m, logit);
         float corr = expf(m - mnew);
         float w = expf(logit - mnew);
-        s = s * corr + w;
+        s = __fmaf_rn(s, corr, w);
         if (idx >= 0) {
             int k = 0;
             for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) {
-                acc[k] = acc[k] * corr + w * v[k];
+                acc[k] = __fmaf_rn(acc[k], corr, w * v[k]);
             }
         } else {
             int k = 0;
@@ -162,4 +162,107 @@ extern "C" __global__ void sparse_attn_m(
     for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) {
         oh[d] = acc[k] / s;
     }
+}
+
+// dsv41f split-KV decode: 128-entry segments compute independent online
+// states, then merge folds them in the original order. Partial output is
+// unnormalized; stats are (m, s) per (segment, head).
+extern "C" __global__ void sparse_attn_split(
+    const float* __restrict__ q,
+    const float* __restrict__ kv,
+    const int* __restrict__ idxs,
+    float* __restrict__ partial,
+    float* __restrict__ stats,
+    int n_heads, int dim, int n_sel, float scale)
+{
+    int h = blockIdx.x;
+    int seg = blockIdx.y;
+    if (h >= n_heads) return;
+    int first = seg * 128;
+    int last = min(first + 128, n_sel);
+    const float* qh = q + (size_t)h * dim;
+    float* oh = partial + ((size_t)seg * n_heads + h) * dim;
+    __shared__ float s_dot;
+    float m = -1e30f;
+    float s = 0.0f;
+    float acc[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) acc[i] = 0.0f;
+    float qv[4];
+    {
+        int k = 0;
+        for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) qv[k] = qh[d];
+    }
+    for (int i = first; i < last; i++) {
+        int idx = idxs[i];
+        float partial_dot = 0.0f;
+        float v[4];
+        if (idx >= 0) {
+            const float* row = kv + (size_t)idx * dim;
+            int k = 0;
+            for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) {
+                v[k] = row[d];
+                partial_dot += qv[k] * v[k];
+            }
+        }
+        if (threadIdx.x == 0) s_dot = 0.0f;
+        __syncthreads();
+        block_reduce_sum(partial_dot, &s_dot);
+        __syncthreads();
+        float logit = (idx >= 0) ? s_dot * scale : __int_as_float(0xff800000);
+        float mnew = fmaxf(m, logit);
+        float corr = expf(m - mnew);
+        float w = expf(logit - mnew);
+        s = __fmaf_rn(s, corr, w);
+        if (idx >= 0) {
+            int k = 0;
+            for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) {
+                acc[k] = __fmaf_rn(acc[k], corr, w * v[k]);
+            }
+        } else {
+            int k = 0;
+            for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) acc[k] *= corr;
+        }
+        m = mnew;
+    }
+    int k = 0;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) oh[d] = acc[k];
+    if (threadIdx.x == 0) {
+        stats[((size_t)seg * n_heads + h) * 2] = m;
+        stats[((size_t)seg * n_heads + h) * 2 + 1] = s;
+    }
+}
+
+extern "C" __global__ void sparse_attn_merge(
+    const float* __restrict__ partial,
+    const float* __restrict__ stats,
+    const float* __restrict__ sink,
+    float* __restrict__ out,
+    int n_heads, int dim, int segments)
+{
+    int h = blockIdx.x;
+    if (h >= n_heads) return;
+    float m = -1e30f;
+    float s = 0.0f;
+    float acc[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) acc[i] = 0.0f;
+    for (int seg = 0; seg < segments; seg++) {
+        float sm = stats[((size_t)seg * n_heads + h) * 2];
+        float ss = stats[((size_t)seg * n_heads + h) * 2 + 1];
+        float mnew = fmaxf(m, sm);
+        float corr = expf(m - mnew);
+        float corr_seg = expf(sm - mnew);
+        const float* part = partial + ((size_t)seg * n_heads + h) * dim;
+        int k = 0;
+        for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) {
+            acc[k] = __fmaf_rn(acc[k], corr, corr_seg * part[d]);
+        }
+        s = __fmaf_rn(s, corr, ss * corr_seg);
+        m = mnew;
+    }
+    s += expf(sink[h] - m);
+    float* oh = out + (size_t)h * dim;
+    int k = 0;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) oh[d] = acc[k] / s;
 }

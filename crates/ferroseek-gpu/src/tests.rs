@@ -1824,6 +1824,74 @@ fn sparse_attn_m_bitexact_vs_sequential() {
 }
 
 #[test]
+fn sparse_attn_split_matches_single_pass() {
+    let guard = Cuda::global();
+    let c = guard.as_ref().unwrap();
+    let (n_heads, dim, n_sel, n_rows) = (8usize, 512usize, 300usize, 400usize);
+    let scale = 0.0625f32;
+    let kv: Vec<f32> = rand_vec(n_rows * dim, 7)
+        .iter()
+        .map(|v| (v % 2.0 - 1.0) * 0.5)
+        .collect();
+    let q: Vec<f32> = rand_vec(n_heads * dim, 11)
+        .iter()
+        .map(|v| (v % 2.0 - 1.0) * 0.5)
+        .collect();
+    let sink: Vec<f32> = rand_vec(n_heads, 13).iter().map(|v| v * 0.25).collect();
+    let idxs: Vec<i32> = (0..n_sel)
+        .map(|i| {
+            if i % 11 == 10 {
+                -1
+            } else {
+                (i * 7 % n_rows) as i32
+            }
+        })
+        .collect();
+    let d_kv = DeviceBuffer::from_slice(&kv).unwrap();
+    let d_q = DeviceBuffer::from_slice(&q).unwrap();
+    let d_idxs = DeviceBuffer::from_slice(&idxs).unwrap();
+    let d_sink = DeviceBuffer::from_slice(&sink).unwrap();
+    let d_expected = DeviceBuffer::from_slice(&vec![0.0f32; n_heads * dim]).unwrap();
+    let d_got = DeviceBuffer::from_slice(&vec![0.0f32; n_heads * dim]).unwrap();
+    let segments = n_sel.div_ceil(128);
+    let d_partial = DeviceBuffer::from_slice(&vec![0.0f32; segments * n_heads * dim]).unwrap();
+    let d_stats = DeviceBuffer::from_slice(&vec![0.0f32; segments * n_heads * 2]).unwrap();
+    crate::launch::sparse_attn(
+        c,
+        d_q.as_device_ptr(),
+        d_kv.as_device_ptr(),
+        d_idxs.as_device_ptr(),
+        d_sink.as_device_ptr(),
+        d_expected.as_device_ptr(),
+        n_heads,
+        dim,
+        n_sel,
+        scale,
+    );
+    crate::launch::sparse_attn_split(
+        c,
+        d_q.as_device_ptr(),
+        d_kv.as_device_ptr(),
+        d_idxs.as_device_ptr(),
+        d_sink.as_device_ptr(),
+        d_partial.as_device_ptr(),
+        d_stats.as_device_ptr(),
+        d_got.as_device_ptr(),
+        n_heads,
+        dim,
+        n_sel,
+        scale,
+    );
+    let mut expected = vec![0.0f32; n_heads * dim];
+    let mut got = vec![0.0f32; n_heads * dim];
+    c.stream.synchronize().unwrap();
+    d_expected.copy_to(&mut expected).unwrap();
+    d_got.copy_to(&mut got).unwrap();
+    let d = max_abs_diff(&got, &expected);
+    assert!(d < 1e-5, "split sparse attention max diff {d:.3e}");
+}
+
+#[test]
 fn rope_uniform_pos_buf_bitexact_vs_scalar() {
     // Per-row rope positions must be bit-identical to per-position scalar
     // launches: same rotation arithmetic, position read from a buffer.

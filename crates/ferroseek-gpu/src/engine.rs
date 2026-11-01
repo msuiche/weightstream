@@ -550,6 +550,8 @@ struct Scratch {
     o: D<f32>,
     fl: D<f32>,
     attn_out: D<f32>,
+    attn_part: D<f32>,
+    attn_stats: D<f32>,
     y_moe: D<f32>,
     gate_buf: D<f32>,
     up_buf: D<f32>,
@@ -2720,6 +2722,14 @@ impl<'a> GpuModel<'a> {
             o: up_zero_f32(c, cfg.n_heads as usize * hd)?,
             fl: up_zero_f32(c, cfg.o_groups as usize * cfg.o_lora as usize)?,
             attn_out: up_zero_f32(c, dim)?,
+            attn_part: up_zero_f32(
+                c,
+                ((win + cfg.index_topk as usize).div_ceil(128)) * cfg.n_heads as usize * hd,
+            )?,
+            attn_stats: up_zero_f32(
+                c,
+                ((win + cfg.index_topk as usize).div_ceil(128)) * cfg.n_heads as usize * 2,
+            )?,
             y_moe: up_zero_f32(c, dim)?,
             gate_buf: up_zero_f32(c, cfg.inter_dim as usize)?,
             up_buf: up_zero_f32(c, cfg.inter_dim as usize)?,
@@ -3263,18 +3273,35 @@ fn attention_step(
         caches.kv_all[l].len(),
         format!("d_pos{pos}_kvall{l}.f32"),
     );
-    k::sparse_attn(
-        c,
-        k::base(&s.q),
-        k::base(&caches.kv_all[l]),
-        idxs,
-        k::base(&layer.attn_sink),
-        k::base(&s.o),
-        heads,
-        hd,
-        n_sel,
-        (hd as f32).sqrt().recip(),
-    );
+    if n_sel >= 256 {
+        k::sparse_attn_split(
+            c,
+            k::base(&s.q),
+            k::base(&caches.kv_all[l]),
+            idxs,
+            k::base(&layer.attn_sink),
+            k::base(&s.attn_part),
+            k::base(&s.attn_stats),
+            k::base(&s.o),
+            heads,
+            hd,
+            n_sel,
+            (hd as f32).sqrt().recip(),
+        );
+    } else {
+        k::sparse_attn(
+            c,
+            k::base(&s.q),
+            k::base(&caches.kv_all[l]),
+            idxs,
+            k::base(&layer.attn_sink),
+            k::base(&s.o),
+            heads,
+            hd,
+            n_sel,
+            (hd as f32).sqrt().recip(),
+        );
+    }
     dump_dev(c, &s.o, heads * hd, format!("d_pos{pos}_attnraw{l}.f32"));
 
     // inverse rope on the output tail (the cache stays in the query-rotated

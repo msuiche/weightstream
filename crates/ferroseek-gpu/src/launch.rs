@@ -747,6 +747,37 @@ pub fn sparse_attn(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn sparse_attn_split(
+    c: &Cuda,
+    q: F32,
+    kv: F32,
+    idxs: I32,
+    sink: F32,
+    partial: F32,
+    stats: F32,
+    out: F32,
+    n_heads: usize,
+    dim: usize,
+    n_sel: usize,
+    scale: f32,
+) {
+    let segments = n_sel.div_ceil(128);
+    let split = c.attn.get_function("sparse_attn_split").unwrap();
+    let merge = c.attn.get_function("sparse_attn_merge").unwrap();
+    let stream = &c.stream;
+    unsafe {
+        launch!(split<<<(n_heads as u32, segments as u32), 128, 0, stream>>>(
+            q, kv, idxs, partial, stats, n_heads as i32, dim as i32, n_sel as i32, scale
+        ))
+        .unwrap();
+        launch!(merge<<<n_heads as u32, 128, 0, stream>>>(
+            partial, stats, sink, out, n_heads as i32, dim as i32, segments as i32
+        ))
+        .unwrap();
+    }
+}
+
 /// `sparse_attn_m` (attn.cu): M-batch sparse attention — grid (n_heads, m),
 /// bit-identical to m sequential sparse_attn calls per (head, position).
 #[allow(clippy::too_many_arguments)]
