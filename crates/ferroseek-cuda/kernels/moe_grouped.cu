@@ -222,3 +222,50 @@ extern "C" __global__ void expert_reduce(
     }
     if (threadIdx.x == 0) y[n] = acc;
 }
+
+extern "C" __global__ void moe_dispatch_ids(
+    const int* __restrict__ gate_idx,
+    long* __restrict__ dispatch_idx,
+    int top_k, int e_start, int e_len)
+{
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= top_k) return;
+    int e = gate_idx[s];
+    dispatch_idx[s] = (e >= e_start && e < e_start + e_len) ? e - e_start : -1;
+}
+
+// Route-weighted SwiGLU over the grouped layout, with the same arithmetic as
+// expert_glu. `gate` and `up` are [layout_rows, inter].
+extern "C" __global__ void moe_swiglu_route(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    const float* __restrict__ layout_weights,
+    float* __restrict__ out,
+    int inter)
+{
+    int row = blockIdx.y;
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= inter) return;
+    float g = fminf(gate[(size_t)row * inter + n], 10.0f);
+    float u = fminf(fmaxf(up[(size_t)row * inter + n], -10.0f), 10.0f);
+    float silu = g * (1.0f / (1.0f + expf(-g)));
+    out[(size_t)row * inter + n] = silu * u * layout_weights[row];
+}
+
+// FP32 slot-order combine of the grouped down projection.
+extern "C" __global__ void moe_combine_f32(
+    const float* __restrict__ y,
+    const int* __restrict__ route_pos,
+    float* __restrict__ out,
+    int dim, int top_k)
+{
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y;
+    if (n >= dim) return;
+    float acc = 0.0f;
+    for (int s = 0; s < top_k; s++) {
+        int pos = route_pos[row * top_k + s];
+        if (pos >= 0) acc += y[(size_t)pos * dim + n];
+    }
+    out[(size_t)row * dim + n] = acc;
+}

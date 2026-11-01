@@ -31,6 +31,9 @@ const TL_SHARED_W13_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/shared_w
 const TL_SHARED_W2_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/shared_w2.ptx"));
 const TL_ENGRAM_WKV_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/engram_wkv.ptx"));
 const TL_DRAFTER_MAIN_PROJ_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/drafter_main_proj.ptx"));
+const TL_MOE_GATE_UP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_gate_up.ptx"));
+const TL_MOE_DOWN_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_down.ptx"));
+const TL_MOE_DISPATCH_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_dispatch.ptx"));
 
 pub struct Cuda {
     pub context: Context,
@@ -63,6 +66,9 @@ pub struct Cuda {
     pub tl_shared_w2: Module,
     pub tl_engram_wkv: Module,
     pub tl_drafter_main_proj: Module,
+    pub tl_moe_gate_up: Module,
+    pub tl_moe_down: Module,
+    pub tl_moe_dispatch: Module,
 }
 
 static CUDA: Mutex<Option<Cuda>> = Mutex::new(None);
@@ -114,6 +120,9 @@ impl Cuda {
             let tl_shared_w2 = Module::from_ptx(TL_SHARED_W2_PTX, &[]).expect("tilelang shared_w2 module");
             let tl_engram_wkv = Module::from_ptx(TL_ENGRAM_WKV_PTX, &[]).expect("tilelang engram_wkv module");
             let tl_drafter_main_proj = Module::from_ptx(TL_DRAFTER_MAIN_PROJ_PTX, &[]).expect("tilelang main_proj module");
+            let tl_moe_gate_up = Module::from_ptx(TL_MOE_GATE_UP_PTX, &[]).expect("tilelang moe_gate_up module");
+            let tl_moe_down = Module::from_ptx(TL_MOE_DOWN_PTX, &[]).expect("tilelang moe_down module");
+            let tl_moe_dispatch = Module::from_ptx(TL_MOE_DISPATCH_PTX, &[]).expect("tilelang moe_dispatch module");
             *guard = Some(Cuda {
                 context,
                 device,
@@ -145,6 +154,9 @@ impl Cuda {
                 tl_shared_w2,
                 tl_engram_wkv,
                 tl_drafter_main_proj,
+                tl_moe_gate_up,
+                tl_moe_down,
+                tl_moe_dispatch,
             });
         }
         // tests run on many threads; the lock holder always becomes current

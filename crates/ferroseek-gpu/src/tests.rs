@@ -351,7 +351,9 @@ fn gpu_engine_matches_cpu_reference() {
         } else if flipped_at.is_some() {
             "post-flip amplification"
         } else {
-            panic!("step {p}: GPU diverges from CPU reference: {d:.3e} (above the flip bound {FLIP_ABS_TOL:.0e}) with no prior legal flip — systematic divergence")
+            panic!(
+                "step {p}: GPU diverges from CPU reference: {d:.3e} (above the flip bound {FLIP_ABS_TOL:.0e}) with no prior legal flip — systematic divergence"
+            )
         };
         let agree = ferroseek_ref::argmax(&cpu_logits) == ferroseek_ref::argmax(&gpu_logits);
         if flipped_at.is_some() && p > flipped_at.unwrap() {
@@ -377,7 +379,9 @@ fn gpu_engine_matches_cpu_reference() {
             ferroseek_ref::argmax(&gpu_logits),
         );
     }
-    eprintln!("GATE: max abs diff over 8 steps = {max_abs:.3e}; {clean_steps}/8 steps at the ≤{GATE_ABS_TOL:.0e} noise floor; flip at {flipped_at:?}");
+    eprintln!(
+        "GATE: max abs diff over 8 steps = {max_abs:.3e}; {clean_steps}/8 steps at the ≤{GATE_ABS_TOL:.0e} noise floor; flip at {flipped_at:?}"
+    );
     match flipped_at {
         // A legal flip reclassifies the gate: the baseline is established by
         // the pre-flip clean steps, the flip's legality by the argmax
@@ -724,6 +728,504 @@ fn tilelang_fp8_gemm_matches_scalar() {
     tiled.copy_to(&mut got).unwrap();
     let d = max_abs_diff(&got, &want);
     assert!(d < 1e-3, "TileLang vs scalar max diff {d:.3e}");
+}
+
+#[test]
+fn tilelang_grouped_moe_matches_closed_form() {
+    let guard = Cuda::global();
+    let c = guard.as_ref().unwrap();
+    let (experts, n, k, top_k) = (96usize, 2304usize, 5120usize, 6usize);
+    let tiles = 97usize;
+    let kb = k / 32;
+    let gate_idx = DeviceBuffer::from_slice(&[0i32, 1, -1, -1, -1, -1]).unwrap();
+    let dispatch_idx = DeviceBuffer::<i64>::zeroed(top_k).unwrap();
+    crate::launch::moe_dispatch_ids(
+        c,
+        gate_idx.as_device_ptr(),
+        dispatch_idx.as_device_ptr(),
+        top_k,
+        0,
+        experts,
+    );
+    let order = DeviceBuffer::<i32>::zeroed(tiles * 32).unwrap();
+    let layout_weights = DeviceBuffer::from_slice(&vec![0.0f32; tiles * 32]).unwrap();
+    let route_pos = DeviceBuffer::<i32>::zeroed(top_k).unwrap();
+    let tile_expert = DeviceBuffer::<i32>::zeroed(tiles).unwrap();
+    let expert_count = DeviceBuffer::<i32>::zeroed(experts).unwrap();
+    let expert_offset = DeviceBuffer::<i32>::zeroed(experts).unwrap();
+    let expert_psum = DeviceBuffer::<i32>::zeroed(experts).unwrap();
+    let num_tiles = DeviceBuffer::<i32>::zeroed(1).unwrap();
+    let route_w = DeviceBuffer::from_slice(&[1.0f32, 1.0, 0.0, 0.0, 0.0, 0.0]).unwrap();
+    crate::launch::moe_dispatch_tl(
+        c,
+        dispatch_idx.as_device_ptr(),
+        route_w.as_device_ptr(),
+        order.as_device_ptr(),
+        layout_weights.as_device_ptr(),
+        route_pos.as_device_ptr(),
+        tile_expert.as_device_ptr(),
+        expert_count.as_device_ptr(),
+        expert_offset.as_device_ptr(),
+        expert_psum.as_device_ptr(),
+        num_tiles.as_device_ptr(),
+        1,
+        tiles,
+    );
+    let a = vec![ferroseek_core::quant::f32_to_e4m3(0.01); k];
+    let d_a = DeviceBuffer::from_slice(&a).unwrap();
+    let d_sa = DeviceBuffer::from_slice(&vec![127u8; 2 * kb]).unwrap();
+    let packed_a = crate::launch::U32::from_raw(d_sa.as_device_ptr().as_raw() + kb as u64);
+    crate::launch::pack_scales(c, d_sa.as_device_ptr(), packed_a, k);
+    let mut weights = vec![0u8; experts * n * k / 2];
+    weights[..2 * n * k / 2].fill(0x11);
+    let weights = crate::engine::tile_major_expert(&weights, experts, n, k);
+    let d_w = DeviceBuffer::from_slice(&weights).unwrap();
+    let sb = vec![127u8; (experts * n / 32) * kb];
+    let packed = crate::engine::pack_weight_scales(&sb, experts * n, k);
+    let d_sfb = DeviceBuffer::from_slice(&packed).unwrap();
+    let mut out = DeviceBuffer::from_slice(&vec![0.0f32; tiles * 32 * n]).unwrap();
+    crate::launch::moe_grouped_tl(
+        c,
+        crate::launch::TlMoe::GateUp,
+        d_a.as_device_ptr(),
+        packed_a,
+        d_w.as_device_ptr(),
+        d_sfb.as_device_ptr(),
+        order.as_device_ptr(),
+        tile_expert.as_device_ptr(),
+        out.as_device_ptr(),
+        tiles,
+        1,
+    );
+    c.stream.synchronize().unwrap();
+    let mut got = vec![0.0f32; n];
+    out.index(0..n).copy_to(&mut got).unwrap();
+    let mut rp = vec![0i32; top_k];
+    route_pos.copy_to(&mut rp).unwrap();
+    let mut ord = vec![0i32; 16];
+    order.index(0..16).copy_to(&mut ord).unwrap();
+    let mut te = vec![0i32; 8];
+    tile_expert.index(0..8).copy_to(&mut te).unwrap();
+    eprintln!("route_pos={rp:?} order={ord:?} tile_expert={te:?}");
+    for (i, &v) in got.iter().take(8).enumerate() {
+        assert!((v - 25.0).abs() < 1e-3, "out[{i}]={v}, expected 25.0");
+    }
+
+    crate::launch::moe_swiglu_route(
+        c,
+        out.as_device_ptr(),
+        out.as_device_ptr(),
+        layout_weights.as_device_ptr(),
+        out.as_device_ptr(),
+        n,
+        tiles * 32,
+    );
+    let route_q = DeviceBuffer::<u8>::zeroed(tiles * 32 * n).unwrap();
+    let route_q_s = DeviceBuffer::<u8>::zeroed(tiles * 32 * n / 16).unwrap();
+    crate::launch::emit8(
+        c,
+        out.as_device_ptr(),
+        route_q.as_device_ptr(),
+        route_q_s.as_device_ptr(),
+        tiles * 32 * n,
+    );
+    let mut h0 = vec![0.0f32; 1];
+    out.index(0..1).copy_to(&mut h0).unwrap();
+    eprintln!("swiglu[0]={}", h0[0]);
+    let mut q0 = vec![0u8; 1];
+    route_q.index(0..1).copy_to(&mut q0).unwrap();
+    let mut qs0 = vec![0u8; 1];
+    route_q_s.index(0..1).copy_to(&mut qs0).unwrap();
+    eprintln!(
+        "route_q={} scale={}",
+        ferroseek_core::quant::e4m3_to_f32(q0[0]),
+        qs0[0]
+    );
+    let packed_route = crate::launch::U32::from_raw(
+        route_q_s.as_device_ptr().as_raw() + (tiles * 32 * n / 32) as u64,
+    );
+    crate::launch::pack_scales(c, route_q_s.as_device_ptr(), packed_route, tiles * 32 * n);
+    let down_k = n;
+    let down_n = 5120usize;
+    let mut down_w = vec![0u8; experts * down_n * down_k / 2];
+    down_w[..2 * down_n * down_k / 2].fill(0x11);
+    let down_w_orig = down_w.clone();
+    let d_orig = DeviceBuffer::from_slice(&down_w_orig).unwrap();
+    let down_w = crate::engine::tile_major_expert(&down_w, experts, down_n, down_k);
+    let d_down = DeviceBuffer::from_slice(&down_w).unwrap();
+    let down_sb = vec![127u8; (experts * down_n / 32) * (down_k / 32)];
+    let packed_down = crate::engine::pack_weight_scales(&down_sb, experts * down_n, down_k);
+    let d_down_s = DeviceBuffer::from_slice(&packed_down).unwrap();
+    let mut down_out = DeviceBuffer::from_slice(&vec![0.0f32; tiles * 32 * down_n]).unwrap();
+    crate::launch::moe_grouped_tl(
+        c,
+        crate::launch::TlMoe::Down,
+        route_q.as_device_ptr(),
+        packed_route,
+        d_down.as_device_ptr(),
+        d_down_s.as_device_ptr(),
+        order.as_device_ptr(),
+        tile_expert.as_device_ptr(),
+        down_out.as_device_ptr(),
+        tiles,
+        1,
+    );
+    let d_sb_orig = DeviceBuffer::from_slice(&down_sb).unwrap();
+    let mut scalar = DeviceBuffer::from_slice(&vec![0.0f32; down_n]).unwrap();
+    crate::launch::fp4_gemm(
+        c,
+        route_q.as_device_ptr(),
+        route_q_s.as_device_ptr(),
+        d_orig.as_device_ptr(),
+        d_sb_orig.as_device_ptr(),
+        scalar.as_device_ptr(),
+        1,
+        down_n,
+        down_k,
+    );
+    c.stream.synchronize().unwrap();
+    let mut scalar_out = vec![0.0f32; down_n];
+    scalar.copy_to(&mut scalar_out).unwrap();
+    eprintln!("scalar down={}", scalar_out[0]);
+    let mut d0 = vec![0.0f32; 1];
+    down_out.index(0..1).copy_to(&mut d0).unwrap();
+    eprintln!("down[0]={}", d0[0]);
+    let mut combined = DeviceBuffer::from_slice(&vec![0.0f32; down_n]).unwrap();
+    crate::launch::moe_combine_f32(
+        c,
+        down_out.as_device_ptr(),
+        route_pos.as_device_ptr(),
+        combined.as_device_ptr(),
+        down_n,
+        top_k,
+        1,
+    );
+    c.stream.synchronize().unwrap();
+    let mut final_out = vec![0.0f32; down_n];
+    combined.copy_to(&mut final_out).unwrap();
+    let h = 10.0f32 * (1.0f32 / (1.0f32 + (-10.0f32).exp())) * 10.0f32;
+    let h = ferroseek_core::quant::e4m3_to_f32(ferroseek_core::quant::f32_to_e4m3(h / 0.25)) * 0.25;
+    let expected = 2.0 * h * 0.5 * n as f32;
+    assert!(
+        (final_out[0] - expected).abs() < 0.1,
+        "final={} expected={expected}",
+        final_out[0]
+    );
+}
+
+#[test]
+fn tilelang_real_grouped_pipeline_matches_scalar() {
+    let guard = Cuda::global();
+    let c = guard.as_ref().unwrap();
+    let path = "/home/msuiche/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170";
+    let mut ckpt = ferroseek_core::Checkpoint::open(std::path::Path::new(path)).unwrap();
+    let mut store = ferroseek_ref::store::CkptStore::new(&mut ckpt);
+    use ferroseek_ref::store::WeightStore;
+    let (experts, e0, e1, e_start) = (32usize, 3usize, 17usize, 96usize);
+    let (w0, s0) = store
+        .get2(
+            &format!("layers.0.ffn.experts.{e0}.w2.weight"),
+            &format!("layers.0.ffn.experts.{e0}.w2.scale"),
+        )
+        .unwrap();
+    let w0b = w0.bytes.to_vec();
+    let s0b = s0.bytes.to_vec();
+    let (w1, s1) = store
+        .get2(
+            &format!("layers.0.ffn.experts.{e1}.w2.weight"),
+            &format!("layers.0.ffn.experts.{e1}.w2.scale"),
+        )
+        .unwrap();
+    let (n, k, top_k, tiles) = (5120usize, 2304usize, 6usize, 64usize);
+    let gate_idx = DeviceBuffer::from_slice(&[
+        (e_start + e0) as i32,
+        (e_start + e1) as i32,
+        (e_start + e0) as i32,
+        (e_start + e1) as i32,
+        (e_start + e0) as i32,
+        (e_start + e1) as i32,
+    ])
+    .unwrap();
+    let dispatch_idx = DeviceBuffer::<i64>::zeroed(top_k).unwrap();
+    crate::launch::moe_dispatch_ids(
+        c,
+        gate_idx.as_device_ptr(),
+        dispatch_idx.as_device_ptr(),
+        top_k,
+        e_start,
+        experts,
+    );
+    let order = DeviceBuffer::<i32>::zeroed(tiles * 32).unwrap();
+    let layout_weights = DeviceBuffer::from_slice(&vec![0.0f32; tiles * 32]).unwrap();
+    let route_pos = DeviceBuffer::<i32>::zeroed(top_k).unwrap();
+    let tile_expert = DeviceBuffer::<i32>::zeroed(tiles).unwrap();
+    let expert_count = DeviceBuffer::<i32>::zeroed(experts).unwrap();
+    let expert_offset = DeviceBuffer::<i32>::zeroed(experts).unwrap();
+    let expert_psum = DeviceBuffer::<i32>::zeroed(experts).unwrap();
+    let num_tiles = DeviceBuffer::<i32>::zeroed(1).unwrap();
+    let route_w = DeviceBuffer::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6]).unwrap();
+    crate::launch::moe_dispatch_tl(
+        c,
+        dispatch_idx.as_device_ptr(),
+        route_w.as_device_ptr(),
+        order.as_device_ptr(),
+        layout_weights.as_device_ptr(),
+        route_pos.as_device_ptr(),
+        tile_expert.as_device_ptr(),
+        expert_count.as_device_ptr(),
+        expert_offset.as_device_ptr(),
+        expert_psum.as_device_ptr(),
+        num_tiles.as_device_ptr(),
+        1,
+        tiles,
+    );
+    let mut raw = vec![0u8; experts * w0b.len()];
+    raw[e0 * w0b.len()..(e0 + 1) * w0b.len()].copy_from_slice(&w0b);
+    raw[e1 * w0b.len()..(e1 + 1) * w0b.len()].copy_from_slice(&w1.bytes);
+    let weights = crate::engine::tile_major_expert(&raw, experts, n, k);
+    let mut scales = vec![0u8; experts * s0b.len()];
+    scales[e0 * s0b.len()..(e0 + 1) * s0b.len()].copy_from_slice(&s0b);
+    scales[e1 * s0b.len()..(e1 + 1) * s0b.len()].copy_from_slice(&s1.bytes);
+    let d_w = DeviceBuffer::from_slice(&weights).unwrap();
+    let d_sfb =
+        DeviceBuffer::from_slice(&crate::engine::pack_expert_scales(&scales, experts * n, k))
+            .unwrap();
+    let d_orig0 = DeviceBuffer::from_slice(&w0b).unwrap();
+    let d_orig1 = DeviceBuffer::from_slice(&w1.bytes).unwrap();
+    let d_sorig0 = DeviceBuffer::from_slice(&s0b).unwrap();
+    let d_sorig1 = DeviceBuffer::from_slice(&s1.bytes).unwrap();
+
+    // Full routed pipeline on the same two real experts: gate/up, weighted
+    // SwiGLU, FP8 requant, down, and grouped-position combine.
+    let (g0, gs0) = store
+        .get2(
+            &format!("layers.0.ffn.experts.{e0}.w1.weight"),
+            &format!("layers.0.ffn.experts.{e0}.w1.scale"),
+        )
+        .unwrap();
+    let g0b = g0.bytes.to_vec();
+    let gs0b = gs0.bytes.to_vec();
+    let (g1, gs1) = store
+        .get2(
+            &format!("layers.0.ffn.experts.{e1}.w1.weight"),
+            &format!("layers.0.ffn.experts.{e1}.w1.scale"),
+        )
+        .unwrap();
+    let g1b = g1.bytes.to_vec();
+    let gs1b = gs1.bytes.to_vec();
+    let (u0, us0) = store
+        .get2(
+            &format!("layers.0.ffn.experts.{e0}.w3.weight"),
+            &format!("layers.0.ffn.experts.{e0}.w3.scale"),
+        )
+        .unwrap();
+    let u0b = u0.bytes.to_vec();
+    let us0b = us0.bytes.to_vec();
+    let (u1, us1) = store
+        .get2(
+            &format!("layers.0.ffn.experts.{e1}.w3.weight"),
+            &format!("layers.0.ffn.experts.{e1}.w3.scale"),
+        )
+        .unwrap();
+    let inter = 2304usize;
+    let dim = 5120usize;
+    let rows = tiles * 32;
+    let mut graw = vec![0u8; experts * g0b.len()];
+    graw[e0 * g0b.len()..(e0 + 1) * g0b.len()].copy_from_slice(&g0b);
+    graw[e1 * g0b.len()..(e1 + 1) * g0b.len()].copy_from_slice(&g1b);
+    let mut uraw = vec![0u8; experts * u0b.len()];
+    uraw[e0 * u0b.len()..(e0 + 1) * u0b.len()].copy_from_slice(&u0b);
+    uraw[e1 * u0b.len()..(e1 + 1) * u0b.len()].copy_from_slice(&u1.bytes);
+    let mut gscales = vec![0u8; experts * gs0b.len()];
+    gscales[e0 * gs0b.len()..(e0 + 1) * gs0b.len()].copy_from_slice(&gs0b);
+    gscales[e1 * gs0b.len()..(e1 + 1) * gs0b.len()].copy_from_slice(&gs1b);
+    let mut uscales = vec![0u8; experts * us0b.len()];
+    uscales[e0 * us0b.len()..(e0 + 1) * us0b.len()].copy_from_slice(&us0b);
+    uscales[e1 * us0b.len()..(e1 + 1) * us0b.len()].copy_from_slice(&us1.bytes);
+    let d_g = DeviceBuffer::from_slice(&crate::engine::tile_major_expert(
+        &graw, experts, inter, dim,
+    ))
+    .unwrap();
+    let d_u = DeviceBuffer::from_slice(&crate::engine::tile_major_expert(
+        &uraw, experts, inter, dim,
+    ))
+    .unwrap();
+    let d_gs = DeviceBuffer::from_slice(&crate::engine::pack_expert_scales(
+        &gscales,
+        experts * inter,
+        dim,
+    ))
+    .unwrap();
+    let d_us = DeviceBuffer::from_slice(&crate::engine::pack_expert_scales(
+        &uscales,
+        experts * inter,
+        dim,
+    ))
+    .unwrap();
+    let x = rand_vec(dim, 178)
+        .iter()
+        .map(|&v| ferroseek_core::quant::f32_to_e4m3(v))
+        .collect::<Vec<_>>();
+    let d_x = DeviceBuffer::from_slice(&x).unwrap();
+    let d_xs = DeviceBuffer::from_slice(&vec![127u8; 2 * dim / 32]).unwrap();
+    let packed_x = crate::launch::U32::from_raw(d_xs.as_device_ptr().as_raw() + (dim / 32) as u64);
+    crate::launch::pack_scales(c, d_xs.as_device_ptr(), packed_x, dim);
+    let route_gate = DeviceBuffer::from_slice(&vec![0.0f32; rows * inter]).unwrap();
+    let route_up = DeviceBuffer::from_slice(&vec![0.0f32; rows * inter]).unwrap();
+    for (w, ws, out) in [(&d_g, &d_gs, &route_gate), (&d_u, &d_us, &route_up)] {
+        crate::launch::moe_grouped_tl(
+            c,
+            crate::launch::TlMoe::GateUp,
+            d_x.as_device_ptr(),
+            packed_x,
+            w.as_device_ptr(),
+            ws.as_device_ptr(),
+            order.as_device_ptr(),
+            tile_expert.as_device_ptr(),
+            out.as_device_ptr(),
+            tiles,
+            1,
+        );
+    }
+    crate::launch::moe_swiglu_route(
+        c,
+        route_gate.as_device_ptr(),
+        route_up.as_device_ptr(),
+        layout_weights.as_device_ptr(),
+        route_gate.as_device_ptr(),
+        inter,
+        rows,
+    );
+    let route_q = DeviceBuffer::<u8>::zeroed(rows * inter).unwrap();
+    let route_qs = DeviceBuffer::<u8>::zeroed(rows * inter / 16).unwrap();
+    crate::launch::emit8(
+        c,
+        route_gate.as_device_ptr(),
+        route_q.as_device_ptr(),
+        route_qs.as_device_ptr(),
+        rows * inter,
+    );
+    let packed_route = crate::launch::U32::from_raw(
+        route_qs.as_device_ptr().as_raw() + (rows * inter / 32) as u64,
+    );
+    crate::launch::pack_scales(c, route_qs.as_device_ptr(), packed_route, rows * inter);
+    let route_down = DeviceBuffer::from_slice(&vec![0.0f32; rows * dim]).unwrap();
+    crate::launch::moe_grouped_tl(
+        c,
+        crate::launch::TlMoe::Down,
+        route_q.as_device_ptr(),
+        packed_route,
+        d_w.as_device_ptr(),
+        d_sfb.as_device_ptr(),
+        order.as_device_ptr(),
+        tile_expert.as_device_ptr(),
+        route_down.as_device_ptr(),
+        tiles,
+        1,
+    );
+    let combined = DeviceBuffer::from_slice(&vec![0.0f32; dim]).unwrap();
+    crate::launch::moe_combine_f32(
+        c,
+        route_down.as_device_ptr(),
+        route_pos.as_device_ptr(),
+        combined.as_device_ptr(),
+        dim,
+        top_k,
+        1,
+    );
+
+    let d_g0 = DeviceBuffer::from_slice(&g0b).unwrap();
+    let d_g1 = DeviceBuffer::from_slice(&g1b).unwrap();
+    let d_gs0 = DeviceBuffer::from_slice(&gs0b).unwrap();
+    let d_gs1 = DeviceBuffer::from_slice(&gs1b).unwrap();
+    let d_u0 = DeviceBuffer::from_slice(&u0b).unwrap();
+    let d_u1 = DeviceBuffer::from_slice(&u1.bytes).unwrap();
+    let d_us0 = DeviceBuffer::from_slice(&us0b).unwrap();
+    let d_us1 = DeviceBuffer::from_slice(&us1.bytes).unwrap();
+    let mut ref_y = Vec::new();
+    for (e, (g, gs, u, us, w2, w2s, rw)) in [
+        (&d_g0, &d_gs0, &d_u0, &d_us0, &d_orig0, &d_sorig0, 0.1f32),
+        (&d_g1, &d_gs1, &d_u1, &d_us1, &d_orig1, &d_sorig1, 0.2f32),
+        (&d_g0, &d_gs0, &d_u0, &d_us0, &d_orig0, &d_sorig0, 0.3f32),
+        (&d_g1, &d_gs1, &d_u1, &d_us1, &d_orig1, &d_sorig1, 0.4f32),
+        (&d_g0, &d_gs0, &d_u0, &d_us0, &d_orig0, &d_sorig0, 0.5f32),
+        (&d_g1, &d_gs1, &d_u1, &d_us1, &d_orig1, &d_sorig1, 0.6f32),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let gate = DeviceBuffer::from_slice(&vec![0.0f32; inter]).unwrap();
+        let up = DeviceBuffer::from_slice(&vec![0.0f32; inter]).unwrap();
+        crate::launch::fp4_gemm(
+            c,
+            d_x.as_device_ptr(),
+            d_xs.as_device_ptr(),
+            g.as_device_ptr(),
+            gs.as_device_ptr(),
+            gate.as_device_ptr(),
+            1,
+            inter,
+            dim,
+        );
+        crate::launch::fp4_gemm(
+            c,
+            d_x.as_device_ptr(),
+            d_xs.as_device_ptr(),
+            u.as_device_ptr(),
+            us.as_device_ptr(),
+            up.as_device_ptr(),
+            1,
+            inter,
+            dim,
+        );
+        crate::launch::swiglu(
+            c,
+            gate.as_device_ptr(),
+            up.as_device_ptr(),
+            gate.as_device_ptr(),
+            inter,
+            rw,
+        );
+        let q = DeviceBuffer::<u8>::zeroed(inter).unwrap();
+        let qs = DeviceBuffer::<u8>::zeroed(inter / 16).unwrap();
+        crate::launch::emit8(
+            c,
+            gate.as_device_ptr(),
+            q.as_device_ptr(),
+            qs.as_device_ptr(),
+            inter,
+        );
+        let y = DeviceBuffer::from_slice(&vec![0.0f32; dim]).unwrap();
+        crate::launch::fp4_gemm(
+            c,
+            q.as_device_ptr(),
+            qs.as_device_ptr(),
+            w2.as_device_ptr(),
+            w2s.as_device_ptr(),
+            y.as_device_ptr(),
+            1,
+            dim,
+            inter,
+        );
+        let mut yh = vec![0.0f32; dim];
+        c.stream.synchronize().unwrap();
+        y.copy_to(&mut yh).unwrap();
+        if e == 0 {
+            ref_y = yh;
+        } else {
+            for (a, b) in ref_y.iter_mut().zip(yh) {
+                *a += b;
+            }
+        }
+    }
+    let mut got = vec![0.0f32; dim];
+    c.stream.synchronize().unwrap();
+    combined.copy_to(&mut got).unwrap();
+    let pipeline_d = max_abs_diff(&got, &ref_y);
+    assert!(
+        pipeline_d < 1e-3,
+        "real grouped pipeline vs scalar max diff {pipeline_d:.3e}"
+    );
 }
 
 #[test]
@@ -1549,7 +2051,6 @@ fn decode_m_matches_sequential_decode() {
     );
 }
 
-
 fn decode_prefill_m_matches_sequential_and_reuses_prefix() {
     // The chunked-prefill wiring: a fresh decode_prefill must land
     // bit-exact with sequential decode per token, and a second call
@@ -1586,9 +2087,11 @@ fn decode_prefill_m_matches_sequential_and_reuses_prefix() {
     let d2 = max_abs_diff(&want, &got2);
     assert!(d2 < GATE_ABS_TOL, "prefix-reuse prefill diverged: {d2:.3e}");
     assert_eq!(bat.next_position(), full.len() as u64);
-    eprintln!("prefill prefix reuse: bit-exact ({d2:.3e}), resumed at {}", ids.len());
+    eprintln!(
+        "prefill prefix reuse: bit-exact ({d2:.3e}), resumed at {}",
+        ids.len()
+    );
 }
-
 
 #[test]
 fn decode_prefill_window_boundary_matches_sequential() {
@@ -1601,14 +2104,20 @@ fn decode_prefill_window_boundary_matches_sequential() {
     let mut bat = gpu_model(42);
     let got = bat.decode_prefill(&ids).unwrap();
     let d = max_abs_diff(&want, &got);
-    assert!(d < GATE_ABS_TOL, "window-crossing prefill diverged: {d:.3e}");
+    assert!(
+        d < GATE_ABS_TOL,
+        "window-crossing prefill diverged: {d:.3e}"
+    );
     assert_eq!(bat.next_position(), ids.len() as u64);
     for (j, &t) in [29u32, 31].iter().enumerate() {
         let p = ids.len() + j;
         let a = seq.decode(t, p as u64).unwrap();
         let b = bat.decode(t, p as u64).unwrap();
         let d = max_abs_diff(&a, &b);
-        assert!(d < GATE_ABS_TOL, "window-crossing continuation diverged: {d:.3e}");
+        assert!(
+            d < GATE_ABS_TOL,
+            "window-crossing continuation diverged: {d:.3e}"
+        );
     }
 }
 #[test]
@@ -1657,7 +2166,10 @@ fn decode_m_streaming_matches_sequential() {
         let a = seq.decode(t, p as u64).unwrap();
         let b = bat.decode(t, p as u64).unwrap();
         let d = max_abs_diff(&a, &b);
-        assert!(d < GATE_ABS_TOL, "streaming post-pass state diverged: {d:.3e}");
+        assert!(
+            d < GATE_ABS_TOL,
+            "streaming post-pass state diverged: {d:.3e}"
+        );
     }
     eprintln!("streaming decode_m: bit-exact within {worst:.3e}");
     let _ = std::fs::remove_dir_all(&dir);

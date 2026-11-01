@@ -19,6 +19,11 @@ pub fn row(buf: &DeviceBuffer<f32>, a: usize, n: usize) -> F32 {
     buf.index(a..a + n).as_device_ptr()
 }
 
+pub fn row_i32(buf: &DeviceBuffer<i32>, a: usize, n: usize) -> I32 {
+    assert!(a + n <= buf.len());
+    buf.index(a..a + n).as_device_ptr()
+}
+
 pub fn row_u8(buf: &DeviceBuffer<u8>, a: usize, n: usize) -> U8 {
     assert!(a + n <= buf.len());
     buf.index(a..a + n).as_device_ptr()
@@ -286,9 +291,7 @@ pub fn pack_scales(c: &Cuda, src: U8, dst: U32, n: usize) {
     let f = c.actquant.get_function("pack_scale_words").unwrap();
     let stream = &c.stream;
     let words = n / 128;
-    unsafe {
-        launch!(f<<<gx(words, 256), 256, 0, stream>>>(src, dst, n as i32)).unwrap()
-    }
+    unsafe { launch!(f<<<gx(words, 256), 256, 0, stream>>>(src, dst, n as i32)).unwrap() }
 }
 
 #[derive(Clone, Copy)]
@@ -307,16 +310,7 @@ pub enum TlGemm {
 /// Production TileLang block-scaled tensor-core decode GEMM (M <= 16).
 /// `sa` points at the packed-word half of an activation scale buffer;
 /// `sb` is the weight's upload-time packed scale table.
-pub fn fp8_gemm_tl(
-    c: &Cuda,
-    kind: TlGemm,
-    a: U8,
-    sa: U32,
-    b: U8,
-    sb: U32,
-    out: F32,
-    m: usize,
-) {
+pub fn fp8_gemm_tl(c: &Cuda, kind: TlGemm, a: U8, sa: U32, b: U8, sb: U32, out: F32, m: usize) {
     let (module, grid_x, shared): (_, u32, u32) = match kind {
         TlGemm::Qa => (&c.tl_q_a, 20, 31_680),
         TlGemm::Qb => (&c.tl_q_b, 64, 57_024),
@@ -341,6 +335,189 @@ pub fn fp8_gemm_tl(
             a, b, out, sa, sb, m as i32, m as i32
         ))
         .unwrap()
+    }
+}
+
+#[repr(C, align(128))]
+#[derive(Clone, Copy)]
+pub struct TensorMap([u64; 16]);
+unsafe impl cust::memory::DeviceCopy for TensorMap {}
+
+extern "C" {
+    fn cuTensorMapEncodeTiled(
+        map: *mut TensorMap,
+        data_type: u32,
+        rank: u32,
+        address: *mut std::ffi::c_void,
+        global_dim: *const u64,
+        global_strides: *const u64,
+        box_dim: *const u32,
+        element_strides: *const u32,
+        interleave: u32,
+        swizzle: u32,
+        l2_promotion: u32,
+        oob_fill: u32,
+    ) -> i32;
+}
+
+fn tensor_map_fp4(weights: U8, tiles: usize) -> TensorMap {
+    let mut map = TensorMap([0; 16]);
+    let dims = [128u64, 128, tiles as u64];
+    let strides = [1u64, 64, 8192];
+    let box_dims = [128u32, 128, 1];
+    let element_strides = [1u32, 1, 1];
+    unsafe {
+        let status = cuTensorMapEncodeTiled(
+            &mut map,
+            14, // CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B
+            3,
+            weights.as_raw() as *mut std::ffi::c_void,
+            dims.as_ptr(),
+            strides.as_ptr().add(1),
+            box_dims.as_ptr(),
+            element_strides.as_ptr(),
+            0,
+            3, // CU_TENSOR_MAP_SWIZZLE_128B
+            2, // CU_TENSOR_MAP_L2_PROMOTION_L2_128B
+            0,
+        );
+        assert_eq!(status, 0);
+    }
+    map
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn moe_dispatch_tl(
+    c: &Cuda,
+    topk_idx: I64,
+    topk_weights: F32,
+    order: I32,
+    layout_weights: F32,
+    route_pos: I32,
+    tile_expert: I32,
+    expert_count: I32,
+    expert_offset: I32,
+    expert_psum: I32,
+    num_tiles: I32,
+    rows: usize,
+    tiles: usize,
+) {
+    let f = c
+        .tl_moe_dispatch
+        .get_function("moe_dispatch_kernel")
+        .unwrap();
+    let stream = &c.stream;
+    unsafe {
+        launch!(f<<<1, 512, 6528, stream>>>(
+            expert_count,
+            expert_offset,
+            layout_weights,
+            num_tiles,
+            order,
+            expert_psum,
+            route_pos,
+            tile_expert,
+            topk_idx,
+            topk_weights,
+            rows as i32,
+            tiles as i32
+        ))
+        .unwrap()
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum TlMoe {
+    GateUp,
+    Down,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_tl(
+    c: &Cuda,
+    kind: TlMoe,
+    a: U8,
+    sfa: U32,
+    weights: U8,
+    sfb: U32,
+    order: I32,
+    tile_expert: I32,
+    out: F32,
+    tiles: usize,
+    tokens: usize,
+) {
+    let (module, n_tiles, tiles_count) = match kind {
+        TlMoe::GateUp => (&c.tl_moe_gate_up, 18, 69120),
+        TlMoe::Down => (&c.tl_moe_down, 40, 69120),
+    };
+    // Gate/up reads token rows; down reads the grouped SwiGLU layout.
+    let input_rows = match kind {
+        TlMoe::GateUp => tokens,
+        TlMoe::Down => tiles * 32,
+    };
+    let map = tensor_map_fp4(weights, tiles_count);
+    let f = module
+        .get_function("moe_grouped_fp8_fp4_gemm_kernel")
+        .unwrap();
+    unsafe {
+        let status = cust::sys::cuFuncSetAttribute(
+            f.to_raw(),
+            cust::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            64000,
+        );
+        assert_eq!(status, cust::sys::CUresult::CUDA_SUCCESS);
+        let stream = &c.stream;
+        launch!(f<<<(n_tiles, tiles as u32), 128, 64000, stream>>>(
+            a, map, out, order, sfa, sfb, tile_expert, tiles as i32, input_rows as i32
+        ))
+        .unwrap()
+    }
+}
+
+pub fn moe_dispatch_ids(
+    c: &Cuda,
+    gate_idx: I32,
+    dispatch_idx: I64,
+    top_k: usize,
+    e_start: usize,
+    e_len: usize,
+) {
+    let f = c.moe_grouped.get_function("moe_dispatch_ids").unwrap();
+    let stream = &c.stream;
+    unsafe {
+        launch!(f<<<1, 32, 0, stream>>>(gate_idx, dispatch_idx, top_k as i32, e_start as i32, e_len as i32)).unwrap()
+    }
+}
+
+pub fn moe_swiglu_route(
+    c: &Cuda,
+    gate: F32,
+    up: F32,
+    weights: F32,
+    out: F32,
+    inter: usize,
+    rows: usize,
+) {
+    let f = c.moe_grouped.get_function("moe_swiglu_route").unwrap();
+    let stream = &c.stream;
+    unsafe {
+        launch!(f<<<((inter / 256) as u32, rows as u32), 256, 0, stream>>>(gate, up, weights, out, inter as i32)).unwrap()
+    }
+}
+
+pub fn moe_combine_f32(
+    c: &Cuda,
+    y: F32,
+    route_pos: I32,
+    out: F32,
+    dim: usize,
+    top_k: usize,
+    rows: usize,
+) {
+    let f = c.moe_grouped.get_function("moe_combine_f32").unwrap();
+    let stream = &c.stream;
+    unsafe {
+        launch!(f<<<(gx(dim, 256), rows as u32), 256, 0, stream>>>(y, route_pos, out, dim as i32, top_k as i32)).unwrap()
     }
 }
 

@@ -36,14 +36,14 @@
 use crate::launch as k;
 use cust::memory::{DeviceBuffer, DevicePointer};
 use cust::prelude::*;
-use ferroseek_core::loader::Checkpoint;
 use ferroseek_core::ModelConfig;
+use ferroseek_core::loader::Checkpoint;
 use ferroseek_cuda::gpu::Cuda;
 use ferroseek_ref::attn::{select_candidate_blocks, select_topk, window_topk_idxs};
 use ferroseek_ref::config::RefConfig;
-use ferroseek_ref::engram::{hash_ids, EngramLayout};
+use ferroseek_ref::engram::{EngramLayout, hash_ids};
 use ferroseek_ref::model::{validate_dims, validate_layout};
-use ferroseek_ref::store::{bytes_to_f32, CkptStore, DType, SyntheticWeights, WeightStore};
+use ferroseek_ref::store::{CkptStore, DType, SyntheticWeights, WeightStore, bytes_to_f32};
 use rayon::prelude::*;
 use std::io;
 use std::time::Instant;
@@ -514,6 +514,12 @@ pub struct GpuLayer {
     w2s_all: Option<D<u8>>,
     w3_all: Option<D<u8>>,
     w3s_all: Option<D<u8>>,
+    w1_tl: Option<D<u8>>,
+    w1s_tl: Option<D<u32>>,
+    w2_tl: Option<D<u8>>,
+    w2s_tl: Option<D<u32>>,
+    w3_tl: Option<D<u8>>,
+    w3s_tl: Option<D<u32>>,
     shared_experts: [Q8; 3],
     compressor: Option<GpuCompressor>,
     indexer: Option<GpuIndexer>,
@@ -534,7 +540,7 @@ struct GpuDrafter {
     norm: D<f32>,
 }
 
- /// Per-step scratch, allocated once at build.
+/// Per-step scratch, allocated once at build.
 struct Scratch {
     h: [D<f32>; 2],
     x: D<f32>,
@@ -593,6 +599,19 @@ struct Scratch {
     logits: D<f32>,
     argmax_i: D<i32>,
     argmax_v: D<f32>,
+    dispatch_idx: D<i64>,
+    order: D<i32>,
+    layout_weights: D<f32>,
+    route_pos: D<i32>,
+    tile_expert: D<i32>,
+    expert_count: D<i32>,
+    expert_offset: D<i32>,
+    expert_psum: D<i32>,
+    num_tiles: D<i32>,
+    route_h: D<f32>,
+    route_q: D<u8>,
+    route_q_s: D<u8>,
+    route_y: D<f32>,
     /// Pinned host staging (docs: pageable copies drain the queue at ~1 ms
     /// a piece on GB10; ~240 per step made a 300 ms token). Sizes:
     /// coll = max(dim, vocab/world) f32 for collective staging,
@@ -735,6 +754,37 @@ pub(crate) fn pack_weight_scales(bytes: &[u8], n: usize, k: usize) -> Vec<u32> {
         for w in 0..words {
             for j in 0..4 {
                 out[row * words + w] |= (bytes[(row / 32) * kb + w * 4 + j] as u32) << (8 * j);
+            }
+        }
+    }
+    out
+}
+pub(crate) fn pack_expert_scales(bytes: &[u8], n: usize, k: usize) -> Vec<u32> {
+    let kb = k / 32;
+    let words = k / 128;
+    let mut out = vec![0u32; n * words];
+    for row in 0..n {
+        for w in 0..words {
+            for j in 0..4 {
+                out[row * words + w] |= (bytes[row * kb + w * 4 + j] as u32) << (8 * j);
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn tile_major_expert(bytes: &[u8], experts: usize, n: usize, k: usize) -> Vec<u8> {
+    assert_eq!(k % 128, 0);
+    let k_tiles = k / 128;
+    let mut out = vec![0u8; bytes.len()];
+    for e in 0..experts {
+        for nb in 0..n / 128 {
+            for kb in 0..k_tiles {
+                let dst = ((e * (n / 128) + nb) * k_tiles + kb) * 128 * 64;
+                for row in 0..128 {
+                    let src = (e * n + nb * 128 + row) * (k / 2) + kb * 64;
+                    out[dst + row * 64..dst + row * 64 + 64].copy_from_slice(&bytes[src..src + 64]);
+                }
             }
         }
     }
@@ -932,7 +982,10 @@ fn upload_layer(
     sh: &Sharding,
 ) -> io::Result<GpuLayer> {
     let (p, n_routed) = if l >= cfg.n_layers as usize {
-        (format!("mtp.{}", l - cfg.n_layers as usize), cfg.dspark_n_routed as usize)
+        (
+            format!("mtp.{}", l - cfg.n_layers as usize),
+            cfg.dspark_n_routed as usize,
+        )
     } else {
         (format!("layers.{l}"), cfg.n_routed as usize)
     };
@@ -940,7 +993,11 @@ fn upload_layer(
     let hd = cfg.head_dim as usize;
     let inh = cfg.index_n_heads as usize;
     let ihd = cfg.index_head_dim as usize;
-    let ratio = if l >= cfg.n_layers as usize { 0 } else { cfg.compress_ratios[l] };
+    let ratio = if l >= cfg.n_layers as usize {
+        0
+    } else {
+        cfg.compress_ratios[l]
+    };
     // TP4 locals (spec §3): 16 heads, 2 o-groups, 8 index heads, 96 experts
     let world = sh.world_size as usize;
     let rank = sh.rank as usize;
@@ -1072,6 +1129,12 @@ fn upload_layer(
     let mut w2s_all: Option<D<u8>> = None;
     let mut w3_all: Option<D<u8>> = None;
     let mut w3s_all: Option<D<u8>> = None;
+    let mut w1_tl: Option<D<u8>> = None;
+    let mut w1s_tl: Option<D<u32>> = None;
+    let mut w2_tl: Option<D<u8>> = None;
+    let mut w2s_tl: Option<D<u32>> = None;
+    let mut w3_tl: Option<D<u8>> = None;
+    let mut w3s_tl: Option<D<u32>> = None;
     if arena.is_none() && e_len > 0 && sh.world_size == 4 {
         let inter = cfg.inter_dim as usize;
         let dim = cfg.dim as usize;
@@ -1092,19 +1155,28 @@ fn upload_layer(
             b3.extend(one_w(store, &format!("{p}.ffn.experts.{e}.w3.weight"))?);
             b3s.extend(one_w(store, &format!("{p}.ffn.experts.{e}.w3.scale"))?);
         }
-        w1_all = Some(up_u8(c, &b1)?);
-        w1s_all = Some(up_u8(c, &b1s)?);
-        w2_all = Some(up_u8(c, &b2)?);
-        w2s_all = Some(up_u8(c, &b2s)?);
-        w3_all = Some(up_u8(c, &b3)?);
-        w3s_all = Some(up_u8(c, &b3s)?);
+        w1_tl = Some(up_u8(c, &tile_major_expert(&b1, e_len, inter, dim))?);
+        w1s_tl = Some(
+            DeviceBuffer::from_slice(&pack_expert_scales(&b1s, e_len * inter, dim))
+                .map_err(cuda_err)?,
+        );
+        w2_tl = Some(up_u8(c, &tile_major_expert(&b2, e_len, dim, inter))?);
+        w2s_tl = Some(
+            DeviceBuffer::from_slice(&pack_expert_scales(&b2s, e_len * dim, inter))
+                .map_err(cuda_err)?,
+        );
+        w3_tl = Some(up_u8(c, &tile_major_expert(&b3, e_len, inter, dim))?);
+        w3s_tl = Some(
+            DeviceBuffer::from_slice(&pack_expert_scales(&b3s, e_len * inter, dim))
+                .map_err(cuda_err)?,
+        );
         eprintln!(
             "build: layer {l} experts fused into grouped slabs ({} x 3, {:.1} GB)",
             e_len,
             (b1.len() + b2.len() + b3.len()) as f64 / (1u64 << 30) as f64
         );
     }
-    if w1_all.is_none() {
+    if w1_all.is_none() && w1_tl.is_none() {
         for e in e_start..e_start + e_len {
             let w1 = load_q4(
                 store,
@@ -1270,6 +1342,12 @@ fn upload_layer(
         w2s_all,
         w3_all,
         w3s_all,
+        w1_tl,
+        w1s_tl,
+        w2_tl,
+        w2s_tl,
+        w3_tl,
+        w3s_tl,
         shared_experts,
         compressor,
         indexer,
@@ -1531,8 +1609,12 @@ impl<'a> GpuModel<'a> {
             let win = self.cfg.window_size as usize;
             let room = win - (self.pos as usize % win);
             let chunk = (ids.len() - n).min(room);
-            let r = if self.drafter.is_some() || std::env::var_os("FERROSEEK_SEQ_PREFILL").is_some() {
-                Err(io::Error::new(io::ErrorKind::Unsupported, "forced sequential"))
+            let r = if self.drafter.is_some() || std::env::var_os("FERROSEEK_SEQ_PREFILL").is_some()
+            {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "forced sequential",
+                ))
             } else {
                 self.decode_m(&ids[n..n + chunk])
             };
@@ -1875,7 +1957,16 @@ impl<'a> GpuModel<'a> {
                     k::base(&s.act_e_s),
                     ncols * ehd,
                 );
-                gemm_q8(c, &e.wkv, k::base(&s.act_e), k::base(&s.act_e_s), k::base(&s.ekv), 1, dim * (hc + 1), ncols * ehd);
+                gemm_q8(
+                    c,
+                    &e.wkv,
+                    k::base(&s.act_e),
+                    k::base(&s.act_e_s),
+                    k::base(&s.ekv),
+                    1,
+                    dim * (hc + 1),
+                    ncols * ehd,
+                );
                 let inv = (dim as f32).sqrt().recip();
                 for j in 0..hc {
                     k::engram_merge(
@@ -2493,7 +2584,13 @@ impl<'a> GpuModel<'a> {
                     WShard::All,
                 )?,
                 main_norm: up_f32(c, &view_f32(store, "mtp.0.main_norm.weight")?)?,
-                markov_embed: up_f32(c, &view_f32(store, &format!("mtp.{}.markov_head.embed.weight", n_mtp - 1))?)?,
+                markov_embed: up_f32(
+                    c,
+                    &view_f32(
+                        store,
+                        &format!("mtp.{}.markov_head.embed.weight", n_mtp - 1),
+                    )?,
+                )?,
                 markov_head: {
                     let v = store.get(&format!("mtp.{}.markov_head.head.weight", n_mtp - 1))?;
                     let row_bytes = 256 * dtype_size(v.dtype);
@@ -2504,12 +2601,17 @@ impl<'a> GpuModel<'a> {
                     }
                     let host: Vec<f32> = v.bytes[r0 * row_bytes..(r0 + vl) * row_bytes]
                         .chunks_exact(2)
-                        .map(|b| ferroseek_core::quant::bf16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+                        .map(|b| {
+                            ferroseek_core::quant::bf16_to_f32(u16::from_le_bytes([b[0], b[1]]))
+                        })
                         .collect();
                     drop(v);
                     up_f32(c, &host)?
                 },
-                norm: up_f32(c, &view_f32(store, &format!("mtp.{}.norm.weight", n_mtp - 1))?)?,
+                norm: up_f32(
+                    c,
+                    &view_f32(store, &format!("mtp.{}.norm.weight", n_mtp - 1))?,
+                )?,
             })
         } else {
             None
@@ -2606,6 +2708,8 @@ impl<'a> GpuModel<'a> {
         let (act_fl, act_fl_s) = act(cfg.o_groups as usize * cfg.o_lora as usize)?;
         let (act_h, act_h_s) = act(cfg.inter_dim as usize)?;
         let (act_e, act_e_s) = act(eflat_len.max(32))?;
+        let dispatch_tiles =
+            16 * cfg.n_activated as usize + cfg.n_routed as usize / sh.world_size as usize;
         let scratch = Scratch {
             h: [up_zero_f32(c, hc * dim)?, up_zero_f32(c, hc * dim)?],
             x: up_zero_f32(c, dim)?,
@@ -2636,6 +2740,24 @@ impl<'a> GpuModel<'a> {
             eflat: up_zero_f32(c, eflat_len.max(1))?,
             ekv: up_zero_f32(c, dim * (hc + 1))?,
             hash_ids: DeviceBuffer::zeroed(engram.n_hash_cols.max(1)).map_err(cuda_err)?,
+            dispatch_idx: DeviceBuffer::zeroed(16 * cfg.n_activated as usize).map_err(cuda_err)?,
+            order: DeviceBuffer::zeroed(dispatch_tiles * 32).map_err(cuda_err)?,
+            layout_weights: up_zero_f32(c, dispatch_tiles * 32)?,
+            route_pos: DeviceBuffer::zeroed(16 * cfg.n_activated as usize).map_err(cuda_err)?,
+            tile_expert: DeviceBuffer::zeroed(dispatch_tiles).map_err(cuda_err)?,
+            expert_count: DeviceBuffer::zeroed(cfg.n_routed as usize / sh.world_size as usize)
+                .map_err(cuda_err)?,
+            expert_offset: DeviceBuffer::zeroed(cfg.n_routed as usize / sh.world_size as usize)
+                .map_err(cuda_err)?,
+            expert_psum: DeviceBuffer::zeroed(cfg.n_routed as usize / sh.world_size as usize)
+                .map_err(cuda_err)?,
+            num_tiles: DeviceBuffer::zeroed(1).map_err(cuda_err)?,
+            route_h: up_zero_f32(c, dispatch_tiles * 32 * cfg.inter_dim as usize)?,
+            route_q: DeviceBuffer::zeroed(dispatch_tiles * 32 * cfg.inter_dim as usize)
+                .map_err(cuda_err)?,
+            route_q_s: DeviceBuffer::zeroed(dispatch_tiles * 32 * cfg.inter_dim as usize / 16)
+                .map_err(cuda_err)?,
+            route_y: up_zero_f32(c, dispatch_tiles * 32 * dim)?,
             act_x,
             act_x_s,
             act_qr,
@@ -2646,10 +2768,10 @@ impl<'a> GpuModel<'a> {
             act_h_s,
             act_e,
             act_e_s,
-            gate_w_out: up_zero_f32(c, cfg.n_activated as usize)?,
+            gate_w_out: up_zero_f32(c, 16 * cfg.n_activated as usize)?,
             gate_scores: up_zero_f32(c, cfg.n_routed as usize)?,
             hc_dots: up_zero_f32(c, cfg.mix_hc() as usize)?,
-            gate_i_out: DeviceBuffer::zeroed(cfg.n_activated as usize).map_err(cuda_err)?,
+            gate_i_out: DeviceBuffer::zeroed(16 * cfg.n_activated as usize).map_err(cuda_err)?,
             win_idxs: DeviceBuffer::zeroed(win).map_err(cuda_err)?,
             shared_idxs: DeviceBuffer::zeroed(win + cfg.index_topk as usize).map_err(cuda_err)?,
             pre_attn: up_zero_f32(c, hc)?,
@@ -2664,7 +2786,10 @@ impl<'a> GpuModel<'a> {
             argmax_i: DeviceBuffer::zeroed(1).map_err(cuda_err)?,
             argmax_v: DeviceBuffer::zeroed(1).map_err(cuda_err)?,
             coll_stage: crate::stream::PinnedBuf::new(
-                score_cap.max(cfg.vocab as usize / sh.world_size as usize).max(cfg.dim as usize) * 4
+                score_cap
+                    .max(cfg.vocab as usize / sh.world_size as usize)
+                    .max(cfg.dim as usize)
+                    * 4
                     + 4,
             )?,
             gate_stage: crate::stream::PinnedBuf::new(1024)?,
@@ -2714,16 +2839,7 @@ impl<'a> GpuModel<'a> {
         })
     }
 }
-fn gemm_q8(
-    c: &Cuda,
-    q: &Q8,
-    a: k::U8,
-    sa: k::U8,
-    out: k::F32,
-    m: usize,
-    n: usize,
-    k: usize,
-) {
+fn gemm_q8(c: &Cuda, q: &Q8, a: k::U8, sa: k::U8, out: k::F32, m: usize, n: usize, k: usize) {
     let kind = match (n, k) {
         (1280, 5120) => Some(k::TlGemm::Qa),
         (8192, 1280) => Some(k::TlGemm::Qb),
@@ -2745,7 +2861,6 @@ fn gemm_q8(
     }
     k::fp8_gemm(c, a, sa, q.w.ptr(), q.s.ptr(), out, m, n, k);
 }
-
 
 // ---------------------------------------------------------------------------
 // decode sublayers
@@ -2801,7 +2916,16 @@ fn attention_step(
     );
     dump_u8(c, &s.act_x, dim, format!("d_pos{pos}_actx{l}.u8"));
     dump_u8(c, &s.act_x_s, dim / 32, format!("d_pos{pos}_actxs{l}.u8"));
-    gemm_q8(c, &layer.wq_a, k::base(&s.act_x), k::base(&s.act_x_s), k::base(&s.qr), 1, cfg.q_lora as usize, dim);
+    gemm_q8(
+        c,
+        &layer.wq_a,
+        k::base(&s.act_x),
+        k::base(&s.act_x_s),
+        k::base(&s.qr),
+        1,
+        cfg.q_lora as usize,
+        dim,
+    );
     k::rmsnorm(
         c,
         k::base(&s.qr),
@@ -2835,7 +2959,16 @@ fn attention_step(
         cfg.q_lora as usize / 32,
         format!("d_pos{pos}_actqrs{l}.u8"),
     );
-    gemm_q8(c, &layer.wq_b, k::base(&s.act_qr), k::base(&s.act_qr_s), k::base(&s.q), 1, heads * hd, cfg.q_lora as usize);
+    gemm_q8(
+        c,
+        &layer.wq_b,
+        k::base(&s.act_qr),
+        k::base(&s.act_qr_s),
+        k::base(&s.q),
+        1,
+        heads * hd,
+        cfg.q_lora as usize,
+    );
     k::rope_uniform_pos(
         c,
         k::base(&s.q),
@@ -2850,7 +2983,16 @@ fn attention_step(
     dump_dev(c, &s.q, heads * hd, format!("d_pos{pos}_q{l}.f32"));
 
     // window KV: one shared latent, rope tail, fp8 snap, ring write
-    gemm_q8(c, &layer.wkv, k::base(&s.act_x), k::base(&s.act_x_s), k::base(&s.kvrow), 1, hd, dim);
+    gemm_q8(
+        c,
+        &layer.wkv,
+        k::base(&s.act_x),
+        k::base(&s.act_x_s),
+        k::base(&s.kvrow),
+        1,
+        hd,
+        dim,
+    );
     let slot = (pos % win as u64) as usize;
     let ring = k::row(&caches.kv_all[l], slot * hd, hd);
     k::rmsnorm(
@@ -2988,7 +3130,16 @@ fn attention_step(
                 k::fp4_snap(c, krow_dst, ihd, 32, false);
             }
             // query side: wq_b(qr) at pos, fp4(32, e8m0) snap
-            gemm_q8(c, &layer.indexer.as_ref().unwrap().wq_b, k::base(&s.act_qr), k::base(&s.act_qr_s), k::base(&s.qidx), 1, inh * ihd, cfg.q_lora as usize);
+            gemm_q8(
+                c,
+                &layer.indexer.as_ref().unwrap().wq_b,
+                k::base(&s.act_qr),
+                k::base(&s.act_qr_s),
+                k::base(&s.qidx),
+                1,
+                inh * ihd,
+                cfg.q_lora as usize,
+            );
             k::rope_uniform_pos(
                 c,
                 k::base(&s.qidx),
@@ -3167,7 +3318,16 @@ fn attention_step(
         (og * ol) / 32,
         format!("d_pos{pos}_actflS{l}.u8"),
     );
-    gemm_q8(c, &layer.wo_b, k::base(&s.act_fl), k::base(&s.act_fl_s), k::base(&s.attn_out), 1, dim, og * ol);
+    gemm_q8(
+        c,
+        &layer.wo_b,
+        k::base(&s.act_fl),
+        k::base(&s.act_fl_s),
+        k::base(&s.attn_out),
+        1,
+        dim,
+        og * ol,
+    );
     // wo_b is row-parallel: fp32 partial-sum all-reduce (spec §3)
     if let Some(comm) = comm.as_deref_mut() {
         let stream = c.stream.as_inner();
@@ -3236,7 +3396,7 @@ fn moe_step(
         dim,
         format!("d_pos{}_gateX{l}.f32", crate::dump::pos()),
     );
-    if layer.w1_all.is_some() {
+    if layer.w1_all.is_some() || layer.w1_tl.is_some() {
         // parallel gate (moe.cu): one block per expert; the one-block form
         // did 384 serial 5120-dots (1.1 ms/call, 20% of GPU time in nsys)
         k::moe_gate(
@@ -3296,7 +3456,102 @@ fn moe_step(
     );
     prof.add_us(2, t_gate);
 
-    if layer.w1_all.is_some() {
+    if layer.w1_tl.is_some() {
+        let tiles = (top_k + 31) / 32 + e_len;
+        let packed_a = k::U32::from_raw(s.act_x_s.as_device_ptr().as_raw() + (dim / 32) as u64);
+        k::pack_scales(c, k::base(&s.act_x_s), packed_a, dim);
+        k::moe_dispatch_ids(
+            c,
+            k::base(&s.gate_i_out),
+            k::base(&s.dispatch_idx),
+            top_k,
+            e_start,
+            e_len,
+        );
+        k::moe_dispatch_tl(
+            c,
+            k::base(&s.dispatch_idx),
+            k::base(&s.gate_w_out),
+            k::base(&s.order),
+            k::base(&s.layout_weights),
+            k::base(&s.route_pos),
+            k::base(&s.tile_expert),
+            k::base(&s.expert_count),
+            k::base(&s.expert_offset),
+            k::base(&s.expert_psum),
+            k::base(&s.num_tiles),
+            1,
+            tiles,
+        );
+        k::moe_grouped_tl(
+            c,
+            k::TlMoe::GateUp,
+            k::base(&s.act_x),
+            packed_a,
+            k::base(layer.w1_tl.as_ref().unwrap()),
+            k::base(layer.w1s_tl.as_ref().unwrap()),
+            k::base(&s.order),
+            k::base(&s.tile_expert),
+            k::base(&s.route_h),
+            tiles,
+            1,
+        );
+        k::moe_grouped_tl(
+            c,
+            k::TlMoe::GateUp,
+            k::base(&s.act_x),
+            packed_a,
+            k::base(layer.w3_tl.as_ref().unwrap()),
+            k::base(layer.w3s_tl.as_ref().unwrap()),
+            k::base(&s.order),
+            k::base(&s.tile_expert),
+            k::base(&s.route_y),
+            tiles,
+            1,
+        );
+        k::moe_swiglu_route(
+            c,
+            k::base(&s.route_h),
+            k::base(&s.route_y),
+            k::base(&s.layout_weights),
+            k::base(&s.route_h),
+            inter,
+            tiles * 32,
+        );
+        k::emit8(
+            c,
+            k::base(&s.route_h),
+            k::base(&s.route_q),
+            k::base(&s.route_q_s),
+            tiles * 32 * inter,
+        );
+        let packed_route = k::U32::from_raw(
+            s.route_q_s.as_device_ptr().as_raw() + (tiles * 32 * inter / 32) as u64,
+        );
+        k::pack_scales(c, k::base(&s.route_q_s), packed_route, tiles * 32 * inter);
+        k::moe_grouped_tl(
+            c,
+            k::TlMoe::Down,
+            k::base(&s.route_q),
+            packed_route,
+            k::base(layer.w2_tl.as_ref().unwrap()),
+            k::base(layer.w2s_tl.as_ref().unwrap()),
+            k::base(&s.order),
+            k::base(&s.tile_expert),
+            k::base(&s.route_y),
+            tiles,
+            1,
+        );
+        k::moe_combine_f32(
+            c,
+            k::base(&s.route_y),
+            k::base(&s.route_pos),
+            k::base(&s.y_moe),
+            dim,
+            top_k,
+            1,
+        );
+    } else if layer.w1_all.is_some() {
         // Fused grouped-expert path (moe_grouped.cu): the gate's top-6 is
         // consumed on the device — no D2H readback, no host expert loop
         // (those cost ~107 ms + ~43 ms of a 300 ms token at 40 layers).
@@ -3488,8 +3743,26 @@ fn moe_step(
     );
     // shared expert on every token, added last (model.py:905)
     let [w1, w2, w3] = &layer.shared_experts;
-    gemm_q8(c, w1, k::base(&s.act_x), k::base(&s.act_x_s), k::base(&s.gate_buf), 1, inter, dim);
-    gemm_q8(c, w3, k::base(&s.act_x), k::base(&s.act_x_s), k::base(&s.up_buf), 1, inter, dim);
+    gemm_q8(
+        c,
+        w1,
+        k::base(&s.act_x),
+        k::base(&s.act_x_s),
+        k::base(&s.gate_buf),
+        1,
+        inter,
+        dim,
+    );
+    gemm_q8(
+        c,
+        w3,
+        k::base(&s.act_x),
+        k::base(&s.act_x_s),
+        k::base(&s.up_buf),
+        1,
+        inter,
+        dim,
+    );
     k::swiglu(
         c,
         k::base(&s.gate_buf),
@@ -3505,7 +3778,16 @@ fn moe_step(
         k::base(&s.act_h_s),
         inter,
     );
-    gemm_q8(c, w2, k::base(&s.act_h), k::base(&s.act_h_s), k::base(&s.expert_y), 1, dim, inter);
+    gemm_q8(
+        c,
+        w2,
+        k::base(&s.act_h),
+        k::base(&s.act_h_s),
+        k::base(&s.expert_y),
+        1,
+        dim,
+        inter,
+    );
     k::acc_f32(c, k::base(&s.expert_y), k::base(&s.y_moe), dim);
     dump_dev(
         c,
@@ -3718,7 +4000,10 @@ impl<'a> GpuModel<'a> {
         let win = cfg.window_size as usize;
         let pos0 = self.pos;
         if pos0 + m as u64 > self.max_seq {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "batch beyond max_seq_len"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "batch beyond max_seq_len",
+            ));
         }
         if (pos0 as usize % win) + m > win {
             return Err(io::Error::new(
@@ -3727,7 +4012,10 @@ impl<'a> GpuModel<'a> {
             ));
         }
         if tokens.iter().any(|&t| t >= cfg.vocab) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "token id out of vocab"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "token id out of vocab",
+            ));
         }
 
         // embedding rows (host bf16 dequant like decode(), or device gather)
@@ -3811,7 +4099,10 @@ impl<'a> GpuModel<'a> {
 
         // h init: embedding rows -> hc copies (one-hot pre per row)
         if let Some(rows) = &emb_host {
-            sm.emb_row.index(0..m * dim).copy_from(rows).map_err(cuda_err)?;
+            sm.emb_row
+                .index(0..m * dim)
+                .copy_from(rows)
+                .map_err(cuda_err)?;
         } else {
             for (i, &t) in tokens.iter().enumerate() {
                 let idx = [t as i64];
@@ -3902,16 +4193,16 @@ impl<'a> GpuModel<'a> {
                             let rows: Vec<usize> =
                                 ids.iter().take(ncols).map(|&id| id as usize).collect();
                             let mut flat = vec![0.0f32; rows.len() * ehd];
-                            flat.par_chunks_mut(ehd)
-                                .zip(rows.par_iter())
-                                .for_each(|(chunk, &r)| {
+                            flat.par_chunks_mut(ehd).zip(rows.par_iter()).for_each(
+                                |(chunk, &r)| {
                                     if r * ehd + ehd > wt.len() {
                                         chunk.fill(f32::NAN);
                                         return;
                                     }
                                     let row = ferroseek_ref::store::fp8_row_scaled(wt, st, r, ehd);
                                     chunk.copy_from_slice(&row);
-                                });
+                                },
+                            );
                             if flat.iter().any(|v| v.is_nan()) {
                                 return Err(io::Error::new(
                                     io::ErrorKind::InvalidInput,
@@ -3944,7 +4235,16 @@ impl<'a> GpuModel<'a> {
                     k::base(&sm.act_e_s),
                     m * ncols * ehd,
                 );
-                gemm_q8(c, &e.wkv, k::base(&sm.act_e), k::base(&sm.act_e_s), k::base(&sm.ekv), m, dim * (hc + 1), ncols * ehd);
+                gemm_q8(
+                    c,
+                    &e.wkv,
+                    k::base(&sm.act_e),
+                    k::base(&sm.act_e_s),
+                    k::base(&sm.ekv),
+                    m,
+                    dim * (hc + 1),
+                    ncols * ehd,
+                );
                 let inv = (dim as f32).sqrt().recip();
                 for i in 0..m {
                     for j in 0..hc {
@@ -3997,7 +4297,20 @@ impl<'a> GpuModel<'a> {
             );
 
             attention_step_m(
-                c, cfg, layer, sm, s1, caches, run, bands, rope_cos, rope_sin, pos0, m, kv_x, sh,
+                c,
+                cfg,
+                layer,
+                sm,
+                s1,
+                caches,
+                run,
+                bands,
+                rope_cos,
+                rope_sin,
+                pos0,
+                m,
+                kv_x,
+                sh,
                 comm_opt.as_deref_mut(),
             )?;
 
@@ -4049,7 +4362,17 @@ impl<'a> GpuModel<'a> {
                 eps,
             );
 
-            moe_step_m(c, cfg, layer, sm, s1, arena_opt, m, sh, comm_opt.as_deref_mut())?;
+            moe_step_m(
+                c,
+                cfg,
+                layer,
+                sm,
+                s1,
+                arena_opt,
+                m,
+                sh,
+                comm_opt.as_deref_mut(),
+            )?;
 
             {
                 let h_next = 1 - h_cur;
@@ -4078,7 +4401,15 @@ impl<'a> GpuModel<'a> {
             m,
             dim,
         );
-        k::rmsnorm_m(c, k::base(&sm.x), k::base(final_norm), k::base(&sm.x), m, dim, eps);
+        k::rmsnorm_m(
+            c,
+            k::base(&sm.x),
+            k::base(final_norm),
+            k::base(&sm.x),
+            m,
+            dim,
+            eps,
+        );
         for i in 0..m {
             k::f32_gemv(
                 c,
@@ -4096,7 +4427,6 @@ impl<'a> GpuModel<'a> {
                     stream,
                 )?;
                 s1.coll_stage.sync(stream)?;
-
 
                 let full = comm.allgather(&s1.coll_stage.as_f32()[..vocab_l])?;
                 sm.logits
@@ -4136,9 +4466,24 @@ impl<'a> GpuModel<'a> {
         }
         let act = DeviceBuffer::<u8>::zeroed(3 * dim).map_err(cuda_err)?;
         let act_s = DeviceBuffer::<u8>::zeroed(3 * dim / 16).map_err(cuda_err)?;
-        k::emit8(c, k::base(&main_hidden), k::base(&act), k::base(&act_s), 3 * dim);
+        k::emit8(
+            c,
+            k::base(&main_hidden),
+            k::base(&act),
+            k::base(&act_s),
+            3 * dim,
+        );
         let main_x = up_zero_f32(c, dim)?;
-        gemm_q8(c, &drafter.main_proj, k::base(&act), k::base(&act_s), k::base(&main_x), 1, dim, 3 * dim);
+        gemm_q8(
+            c,
+            &drafter.main_proj,
+            k::base(&act),
+            k::base(&act_s),
+            k::base(&main_x),
+            1,
+            dim,
+            3 * dim,
+        );
         k::rmsnorm(
             c,
             k::base(&main_x),
@@ -4165,13 +4510,29 @@ impl<'a> GpuModel<'a> {
             let kv = up_zero_f32(c, hd)?;
             k::emit8(c, k::base(&main_x), k::base(&act), k::base(&act_s), dim);
             for layer in &drafter.layers {
-                gemm_q8(c, &layer.wkv, k::base(&act), k::base(&act_s), k::base(&kv), 1, hd, dim);
+                gemm_q8(
+                    c,
+                    &layer.wkv,
+                    k::base(&act),
+                    k::base(&act_s),
+                    k::base(&kv),
+                    1,
+                    hd,
+                    dim,
+                );
                 let ring = k::row(
                     &drafter.caches.kv_all[layer.layer as usize],
                     (position as usize % win) * hd,
                     hd,
                 );
-                k::rmsnorm(c, k::base(&kv), k::base(&layer.kv_norm_w), ring, hd, self.cfg.norm_eps);
+                k::rmsnorm(
+                    c,
+                    k::base(&kv),
+                    k::base(&layer.kv_norm_w),
+                    ring,
+                    hd,
+                    self.cfg.norm_eps,
+                );
                 k::rope(
                     c,
                     ring,
@@ -4232,8 +4593,22 @@ impl<'a> GpuModel<'a> {
             let mut ids = Vec::with_capacity(rows.len());
             for mut row in rows {
                 let idx = DeviceBuffer::from_slice(&[previous as i64]).map_err(cuda_err)?;
-                k::gather_f32(c, k::base(&drafter.markov_embed), k::base(&idx), k::base(&emb), 1, 256);
-                k::f32_gemv(c, k::base(&drafter.markov_head), k::base(&emb), k::base(&markov), vocab_l, 256);
+                k::gather_f32(
+                    c,
+                    k::base(&drafter.markov_embed),
+                    k::base(&idx),
+                    k::base(&emb),
+                    1,
+                    256,
+                );
+                k::f32_gemv(
+                    c,
+                    k::base(&drafter.markov_head),
+                    k::base(&emb),
+                    k::base(&markov),
+                    vocab_l,
+                    256,
+                );
                 let mut local = vec![0.0f32; vocab_l];
                 markov.copy_to(&mut local).map_err(cuda_err)?;
                 let full = match self.comm.as_deref_mut() {
@@ -4260,8 +4635,11 @@ impl<'a> GpuModel<'a> {
         self.main_hiddens.clear();
     }
 
-
-    pub fn speculate(&mut self, position: u64, anchor: u32) -> io::Result<(Vec<u32>, u64, Vec<f32>)> {
+    pub fn speculate(
+        &mut self,
+        position: u64,
+        anchor: u32,
+    ) -> io::Result<(Vec<u32>, u64, Vec<f32>)> {
         let mut logits = self.decode(anchor, position)?;
         let mut accepted = vec![anchor];
         for draft in self.drafter_step(anchor, position)? {
@@ -4319,7 +4697,16 @@ fn attention_step_m(
         k::base(&sm.act_x_s),
         m * dim,
     );
-    gemm_q8(c, &layer.wq_a, k::base(&sm.act_x), k::base(&sm.act_x_s), k::base(&sm.qr), m, cfg.q_lora as usize, dim);
+    gemm_q8(
+        c,
+        &layer.wq_a,
+        k::base(&sm.act_x),
+        k::base(&sm.act_x_s),
+        k::base(&sm.qr),
+        m,
+        cfg.q_lora as usize,
+        dim,
+    );
     k::rmsnorm_m(
         c,
         k::base(&sm.qr),
@@ -4336,7 +4723,16 @@ fn attention_step_m(
         k::base(&sm.act_qr_s),
         m * cfg.q_lora as usize,
     );
-    gemm_q8(c, &layer.wq_b, k::base(&sm.act_qr), k::base(&sm.act_qr_s), k::base(&sm.q), m, heads * hd, cfg.q_lora as usize);
+    gemm_q8(
+        c,
+        &layer.wq_b,
+        k::base(&sm.act_qr),
+        k::base(&sm.act_qr_s),
+        k::base(&sm.q),
+        m,
+        heads * hd,
+        cfg.q_lora as usize,
+    );
     k::rope_uniform_pos_buf(
         c,
         k::base(&sm.q),
@@ -4351,15 +4747,40 @@ fn attention_step_m(
 
     if layer.layer >= cfg.n_layers {
         if m != 5 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "DSpark expects five draft rows"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DSpark expects five draft rows",
+            ));
         }
         // Target-token KV at p. The ring contains only target tokens; the
         // current slot was already seeded by decode(), so this is the same
         // value rewritten through the shared DSpark forward path.
-        k::emit8(c, k::base(kv_x), k::base(&sm.act_x), k::base(&sm.act_x_s), dim);
-        gemm_q8(c, &layer.wkv, k::base(&sm.act_x), k::base(&sm.act_x_s), k::base(&sm.kvrow), 1, hd, dim);
+        k::emit8(
+            c,
+            k::base(kv_x),
+            k::base(&sm.act_x),
+            k::base(&sm.act_x_s),
+            dim,
+        );
+        gemm_q8(
+            c,
+            &layer.wkv,
+            k::base(&sm.act_x),
+            k::base(&sm.act_x_s),
+            k::base(&sm.kvrow),
+            1,
+            hd,
+            dim,
+        );
         let ring = k::row(&caches.kv_all[l], (pos0 as usize % win) * hd, hd);
-        k::rmsnorm(c, k::base(&sm.kvrow), k::base(&layer.kv_norm_w), ring, hd, eps);
+        k::rmsnorm(
+            c,
+            k::base(&sm.kvrow),
+            k::base(&layer.kv_norm_w),
+            ring,
+            hd,
+            eps,
+        );
         k::rope(
             c,
             ring,
@@ -4375,8 +4796,23 @@ fn attention_step_m(
 
         // Draft KVs are transient rows after the window. Every draft query
         // attends every draft row (non-causal block attention).
-        k::emit8(c, k::base(&sm.x), k::base(&sm.act_x), k::base(&sm.act_x_s), m * dim);
-        gemm_q8(c, &layer.wkv, k::base(&sm.act_x), k::base(&sm.act_x_s), k::base(&sm.kvrow), m, hd, dim);
+        k::emit8(
+            c,
+            k::base(&sm.x),
+            k::base(&sm.act_x),
+            k::base(&sm.act_x_s),
+            m * dim,
+        );
+        gemm_q8(
+            c,
+            &layer.wkv,
+            k::base(&sm.act_x),
+            k::base(&sm.act_x_s),
+            k::base(&sm.kvrow),
+            m,
+            hd,
+            dim,
+        );
         for i in 0..m {
             let draft = k::row(&caches.kv_all[l], (win + i) * hd, hd);
             k::rmsnorm(
@@ -4414,7 +4850,9 @@ fn attention_step_m(
                 c,
                 k::row(&sm.q, i * heads * hd, heads * hd),
                 k::base(&caches.kv_all[l]),
-                sm.shared_idxs.index(i * stride..i * stride + list.len()).as_device_ptr(),
+                sm.shared_idxs
+                    .index(i * stride..i * stride + list.len())
+                    .as_device_ptr(),
                 k::base(&layer.attn_sink),
                 k::row(&sm.o, i * heads * hd, heads * hd),
                 heads,
@@ -4424,91 +4862,63 @@ fn attention_step_m(
             );
         }
     } else {
-    // window KV projection (batched), ring writes (per position)
-    k::emit8(
-        c,
-        k::base(kv_x),
-        k::base(&sm.act_x),
-        k::base(&sm.act_x_s),
-        m * dim,
-    );
-    gemm_q8(c, &layer.wkv, k::base(&sm.act_x), k::base(&sm.act_x_s), k::base(&sm.kvrow), m, hd, dim);
-    for i in 0..m {
-        let pos = pos0 + i as u64;
-        let slot = (pos % win as u64) as usize;
-        let ring = k::row(&caches.kv_all[l], slot * hd, hd);
-        k::rmsnorm(
+        // window KV projection (batched), ring writes (per position)
+        k::emit8(
             c,
-            k::row(&sm.kvrow, i * hd, hd),
-            k::base(&layer.kv_norm_w),
-            ring,
-            hd,
-            eps,
+            k::base(kv_x),
+            k::base(&sm.act_x),
+            k::base(&sm.act_x_s),
+            m * dim,
         );
-        k::rope(
+        gemm_q8(
             c,
-            ring,
-            k::base(&rope_cos[layer.freq]),
-            k::base(&rope_sin[layer.freq]),
-            1,
+            &layer.wkv,
+            k::base(&sm.act_x),
+            k::base(&sm.act_x_s),
+            k::base(&sm.kvrow),
+            m,
             hd,
-            rd,
-            pos,
-            false,
+            dim,
         );
-        k::snap8(c, ring, hd);
-        if layer.ratio > 0 {
+        for i in 0..m {
             let pos = pos0 + i as u64;
-            let compress_len = ((pos + 1) / ratio) as usize;
-            let mut latent_ready = false;
-            if let Some(src) = layer.kv_src {
-                run.index_k_src = src;
-                let comp = layer.compressor.as_ref().unwrap();
-                if ratio == 1 {
-                    k::f32_gemv(
-                        c,
-                        k::base(&comp.wkv),
-                        k::row(&sm.x, i * dim, dim),
-                        k::base(&s1.latent),
-                        hd,
-                        dim,
-                    );
-                    k::rmsnorm(
-                        c,
-                        k::base(&s1.latent),
-                        k::base(&comp.norm_w),
-                        k::base(&s1.latent),
-                        hd,
-                        eps,
-                    );
-                    latent_ready = true;
-                } else {
-                    let slot_i = (pos % ratio) as usize;
-                    let kv_state = caches.comp_kv[src].as_ref().unwrap();
-                    let score_state = caches.comp_score[src].as_mut().unwrap();
-                    k::f32_gemv(
-                        c,
-                        k::base(&comp.wkv),
-                        k::row(&sm.x, i * dim, dim),
-                        k::row(kv_state, slot_i * hd, hd),
-                        hd,
-                        dim,
-                    );
-                    k::f32_gemv(
-                        c,
-                        k::base(comp.wgate.as_ref().unwrap()),
-                        k::row(&sm.x, i * dim, dim),
-                        k::row(score_state, slot_i * hd, hd),
-                        hd,
-                        dim,
-                    );
-                    if (pos + 1) % ratio == 0 {
-                        k::compressor_finish(
+            let slot = (pos % win as u64) as usize;
+            let ring = k::row(&caches.kv_all[l], slot * hd, hd);
+            k::rmsnorm(
+                c,
+                k::row(&sm.kvrow, i * hd, hd),
+                k::base(&layer.kv_norm_w),
+                ring,
+                hd,
+                eps,
+            );
+            k::rope(
+                c,
+                ring,
+                k::base(&rope_cos[layer.freq]),
+                k::base(&rope_sin[layer.freq]),
+                1,
+                hd,
+                rd,
+                pos,
+                false,
+            );
+            k::snap8(c, ring, hd);
+            if layer.ratio > 0 {
+                let pos = pos0 + i as u64;
+                let compress_len = ((pos + 1) / ratio) as usize;
+                let mut latent_ready = false;
+                if let Some(src) = layer.kv_src {
+                    run.index_k_src = src;
+                    let comp = layer.compressor.as_ref().unwrap();
+                    if ratio == 1 {
+                        k::f32_gemv(
                             c,
-                            k::base(kv_state),
-                            k::base(score_state),
+                            k::base(&comp.wkv),
+                            k::row(&sm.x, i * dim, dim),
                             k::base(&s1.latent),
                             hd,
+                            dim,
                         );
                         k::rmsnorm(
                             c,
@@ -4519,195 +4929,254 @@ fn attention_step_m(
                             eps,
                         );
                         latent_ready = true;
+                    } else {
+                        let slot_i = (pos % ratio) as usize;
+                        let kv_state = caches.comp_kv[src].as_ref().unwrap();
+                        let score_state = caches.comp_score[src].as_mut().unwrap();
+                        k::f32_gemv(
+                            c,
+                            k::base(&comp.wkv),
+                            k::row(&sm.x, i * dim, dim),
+                            k::row(kv_state, slot_i * hd, hd),
+                            hd,
+                            dim,
+                        );
+                        k::f32_gemv(
+                            c,
+                            k::base(comp.wgate.as_ref().unwrap()),
+                            k::row(&sm.x, i * dim, dim),
+                            k::row(score_state, slot_i * hd, hd),
+                            hd,
+                            dim,
+                        );
+                        if (pos + 1) % ratio == 0 {
+                            k::compressor_finish(
+                                c,
+                                k::base(kv_state),
+                                k::base(score_state),
+                                k::base(&s1.latent),
+                                hd,
+                            );
+                            k::rmsnorm(
+                                c,
+                                k::base(&s1.latent),
+                                k::base(&comp.norm_w),
+                                k::base(&s1.latent),
+                                hd,
+                                eps,
+                            );
+                            latent_ready = true;
+                        }
+                    }
+                    if latent_ready {
+                        run.compress_len[src] = compress_len;
                     }
                 }
-                if latent_ready {
-                    run.compress_len[src] = compress_len;
-                }
-            }
 
-            if layer.idx_src {
-                if layer.owns_k && latent_ready {
-                    let kowner = layer.k_owner.as_ref().unwrap();
-                    let j = compress_len - 1;
-                    k::bf16_gemv(c, k::base(&kowner.wk), k::base(&s1.latent), k::base(&s1.krow), ihd, hd);
-                    let krow_dst = k::row(&caches.index_k[run.index_k_src], j * ihd, ihd);
-                    k::rmsnorm(c, k::base(&s1.krow), k::base(&kowner.k_norm), krow_dst, ihd, eps);
-                    k::rope(
+                if layer.idx_src {
+                    if layer.owns_k && latent_ready {
+                        let kowner = layer.k_owner.as_ref().unwrap();
+                        let j = compress_len - 1;
+                        k::bf16_gemv(
+                            c,
+                            k::base(&kowner.wk),
+                            k::base(&s1.latent),
+                            k::base(&s1.krow),
+                            ihd,
+                            hd,
+                        );
+                        let krow_dst = k::row(&caches.index_k[run.index_k_src], j * ihd, ihd);
+                        k::rmsnorm(
+                            c,
+                            k::base(&s1.krow),
+                            k::base(&kowner.k_norm),
+                            krow_dst,
+                            ihd,
+                            eps,
+                        );
+                        k::rope(
+                            c,
+                            krow_dst,
+                            k::base(&rope_cos[layer.freq]),
+                            k::base(&rope_sin[layer.freq]),
+                            1,
+                            ihd,
+                            rd,
+                            pos + 1 - ratio,
+                            false,
+                        );
+                        k::fp4_snap(c, krow_dst, ihd, 32, false);
+                    }
+                    // query side for this position
+                    k::fp8_gemm(
                         c,
-                        krow_dst,
-                        k::base(&rope_cos[layer.freq]),
-                        k::base(&rope_sin[layer.freq]),
+                        k::row_u8(&sm.act_qr, i * cfg.q_lora as usize, cfg.q_lora as usize),
+                        k::row_u8(
+                            &sm.act_qr_s,
+                            i * cfg.q_lora as usize / 32,
+                            cfg.q_lora as usize / 32,
+                        ),
+                        layer.indexer.as_ref().unwrap().wq_b.w.ptr(),
+                        layer.indexer.as_ref().unwrap().wq_b.s.ptr(),
+                        k::row(&sm.qidx, i * inh * ihd, inh * ihd),
                         1,
-                        ihd,
-                        rd,
-                        pos + 1 - ratio,
-                        false,
+                        inh * ihd,
+                        cfg.q_lora as usize,
                     );
-                    k::fp4_snap(c, krow_dst, ihd, 32, false);
-                }
-                // query side for this position
-                k::fp8_gemm(
-                    c,
-                    k::row_u8(&sm.act_qr, i * cfg.q_lora as usize, cfg.q_lora as usize),
-                    k::row_u8(
-                        &sm.act_qr_s,
-                        i * cfg.q_lora as usize / 32,
-                        cfg.q_lora as usize / 32,
-                    ),
-                    layer.indexer.as_ref().unwrap().wq_b.w.ptr(),
-                    layer.indexer.as_ref().unwrap().wq_b.s.ptr(),
-                    k::row(&sm.qidx, i * inh * ihd, inh * ihd),
-                    1,
-                    inh * ihd,
-                    cfg.q_lora as usize,
-                );
-                k::rope_uniform_pos(
-                    c,
-                    k::row(&sm.qidx, i * inh * ihd, inh * ihd),
-                    k::base(&rope_cos[layer.freq]),
-                    k::base(&rope_sin[layer.freq]),
-                    inh,
-                    ihd,
-                    rd,
-                    pos,
-                    false,
-                );
-                k::fp4_snap(c, k::row(&sm.qidx, i * inh * ihd, inh * ihd), inh * ihd, 32, false);
-                k::f32_gemv(
-                    c,
-                    k::base(&layer.indexer.as_ref().unwrap().weights_proj),
-                    k::row(&sm.x, i * dim, dim),
-                    k::row(&sm.widx, i * inh, inh),
-                    inh,
-                    dim,
-                );
-
-                // score + selection for this position
-                let topk_max = cfg.index_topk as usize;
-                let mut list = vec![-1i32; win + topk_max];
-                if compress_len == 0 {
-                    let wi = window_topk_idxs(win, pos);
-                    list[..win].copy_from_slice(&wi);
-                    if i + 1 == m {
-                        run.shared_n_sel = win;
-                        s1.shared_idxs
-                            .index(0..win)
-                            .copy_from(&list[..win])
-                            .map_err(cuda_err)?;
-                    }
-                } else {
-                    k::indexer_score(
+                    k::rope_uniform_pos(
                         c,
                         k::row(&sm.qidx, i * inh * ihd, inh * ihd),
-                        k::base(&caches.index_k[run.index_k_src]),
-                        k::row(&sm.widx, i * inh, inh),
-                        k::base(&s1.score),
-                        inh,
-                        ihd,
-                        compress_len,
-                    );
-                    let mut score = vec![0.0f32; compress_len];
-                    s1.score
-                        .index(0..compress_len)
-                        .copy_to(&mut score)
-                        .map_err(cuda_err)?;
-                    if let Some(comm) = comm.as_deref_mut() {
-                        score = comm.allreduce(&score)?;
-                    }
-                    if layer.cand_src {
-                        let cand = select_candidate_blocks(
-                            &score,
-                            cfg.candidate_topk_blocks as usize,
-                            cfg.candidate_block_size as usize,
-                        );
-                        run.candidates = cand.clone();
-                        if i < sm.candidates_m.len() {
-                            sm.candidates_m[i] = cand;
-                        }
-                    } else if layer.uses_cand {
-                        let cand = sm
-                            .candidates_m
-                            .get(i)
-                            .filter(|c| !c.is_empty())
-                            .unwrap_or(&run.candidates);
-                        for (t, v) in score.iter_mut().enumerate() {
-                            if !cand.get(t).copied().unwrap_or(false) {
-                                *v = f32::NEG_INFINITY;
-                            }
-                        }
-                    }
-                    let topk = topk_max.min(compress_len);
-                    let cmp = select_topk(&score, topk, compress_len, win as i32);
-                    let wi = window_topk_idxs(win, pos);
-                    list[..win].copy_from_slice(&wi);
-                    for (j, &v) in cmp.iter().enumerate() {
-                        list[win + j] = v;
-                    }
-                    if i + 1 == m {
-                        let n_sel = win + cmp.len();
-                        run.shared_n_sel = n_sel;
-                        s1.shared_idxs
-                            .index(0..n_sel)
-                            .copy_from(&list[..n_sel])
-                            .map_err(cuda_err)?;
-                    }
-                }
-                sm.shared_idxs
-                    .index(i * (win + topk_max)..(i + 1) * (win + topk_max))
-                    .copy_from(&list)
-                    .map_err(cuda_err)?;
-            }
-
-            // latent tail: rope + fp4 snap + fan-out
-            if latent_ready {
-                if let Some(src) = layer.kv_src {
-                    let j = compress_len - 1;
-                    k::rope(
-                        c,
-                        k::base(&s1.latent),
                         k::base(&rope_cos[layer.freq]),
                         k::base(&rope_sin[layer.freq]),
-                        1,
-                        hd,
+                        inh,
+                        ihd,
                         rd,
-                        pos + 1 - ratio,
+                        pos,
                         false,
                     );
-                    k::fp4_snap(c, k::base(&s1.latent), hd, 16, true);
-                    for &cl in &bands[src] {
-                        let dst = k::row(&caches.kv_all[cl], win * hd + j * hd, hd);
-                        k::copy_f32(c, k::base(&s1.latent), dst, hd);
+                    k::fp4_snap(
+                        c,
+                        k::row(&sm.qidx, i * inh * ihd, inh * ihd),
+                        inh * ihd,
+                        32,
+                        false,
+                    );
+                    k::f32_gemv(
+                        c,
+                        k::base(&layer.indexer.as_ref().unwrap().weights_proj),
+                        k::row(&sm.x, i * dim, dim),
+                        k::row(&sm.widx, i * inh, inh),
+                        inh,
+                        dim,
+                    );
+
+                    // score + selection for this position
+                    let topk_max = cfg.index_topk as usize;
+                    let mut list = vec![-1i32; win + topk_max];
+                    if compress_len == 0 {
+                        let wi = window_topk_idxs(win, pos);
+                        list[..win].copy_from_slice(&wi);
+                        if i + 1 == m {
+                            run.shared_n_sel = win;
+                            s1.shared_idxs
+                                .index(0..win)
+                                .copy_from(&list[..win])
+                                .map_err(cuda_err)?;
+                        }
+                    } else {
+                        k::indexer_score(
+                            c,
+                            k::row(&sm.qidx, i * inh * ihd, inh * ihd),
+                            k::base(&caches.index_k[run.index_k_src]),
+                            k::row(&sm.widx, i * inh, inh),
+                            k::base(&s1.score),
+                            inh,
+                            ihd,
+                            compress_len,
+                        );
+                        let mut score = vec![0.0f32; compress_len];
+                        s1.score
+                            .index(0..compress_len)
+                            .copy_to(&mut score)
+                            .map_err(cuda_err)?;
+                        if let Some(comm) = comm.as_deref_mut() {
+                            score = comm.allreduce(&score)?;
+                        }
+                        if layer.cand_src {
+                            let cand = select_candidate_blocks(
+                                &score,
+                                cfg.candidate_topk_blocks as usize,
+                                cfg.candidate_block_size as usize,
+                            );
+                            run.candidates = cand.clone();
+                            if i < sm.candidates_m.len() {
+                                sm.candidates_m[i] = cand;
+                            }
+                        } else if layer.uses_cand {
+                            let cand = sm
+                                .candidates_m
+                                .get(i)
+                                .filter(|c| !c.is_empty())
+                                .unwrap_or(&run.candidates);
+                            for (t, v) in score.iter_mut().enumerate() {
+                                if !cand.get(t).copied().unwrap_or(false) {
+                                    *v = f32::NEG_INFINITY;
+                                }
+                            }
+                        }
+                        let topk = topk_max.min(compress_len);
+                        let cmp = select_topk(&score, topk, compress_len, win as i32);
+                        let wi = window_topk_idxs(win, pos);
+                        list[..win].copy_from_slice(&wi);
+                        for (j, &v) in cmp.iter().enumerate() {
+                            list[win + j] = v;
+                        }
+                        if i + 1 == m {
+                            let n_sel = win + cmp.len();
+                            run.shared_n_sel = n_sel;
+                            s1.shared_idxs
+                                .index(0..n_sel)
+                                .copy_from(&list[..n_sel])
+                                .map_err(cuda_err)?;
+                        }
+                    }
+                    sm.shared_idxs
+                        .index(i * (win + topk_max)..(i + 1) * (win + topk_max))
+                        .copy_from(&list)
+                        .map_err(cuda_err)?;
+                }
+
+                // latent tail: rope + fp4 snap + fan-out
+                if latent_ready {
+                    if let Some(src) = layer.kv_src {
+                        let j = compress_len - 1;
+                        k::rope(
+                            c,
+                            k::base(&s1.latent),
+                            k::base(&rope_cos[layer.freq]),
+                            k::base(&rope_sin[layer.freq]),
+                            1,
+                            hd,
+                            rd,
+                            pos + 1 - ratio,
+                            false,
+                        );
+                        k::fp4_snap(c, k::base(&s1.latent), hd, 16, true);
+                        for &cl in &bands[src] {
+                            let dst = k::row(&caches.kv_all[cl], win * hd + j * hd, hd);
+                            k::copy_f32(c, k::base(&s1.latent), dst, hd);
+                        }
                     }
                 }
             }
+            let topk_max = cfg.index_topk as usize;
+            let (idxs, n_sel) = if layer.ratio > 0 {
+                (
+                    sm.shared_idxs
+                        .index(i * (win + topk_max)..(i + 1) * (win + topk_max))
+                        .as_device_ptr(),
+                    win + topk_max,
+                )
+            } else {
+                (
+                    sm.win_idxs.index(i * win..(i + 1) * win).as_device_ptr(),
+                    win,
+                )
+            };
+            k::sparse_attn(
+                c,
+                k::row(&sm.q, i * heads * hd, heads * hd),
+                k::base(&caches.kv_all[l]),
+                idxs,
+                k::base(&layer.attn_sink),
+                k::row(&sm.o, i * heads * hd, heads * hd),
+                heads,
+                hd,
+                n_sel,
+                (hd as f32).sqrt().recip(),
+            );
         }
-        let topk_max = cfg.index_topk as usize;
-        let (idxs, n_sel) = if layer.ratio > 0 {
-            (
-                sm.shared_idxs
-                    .index(i * (win + topk_max)..(i + 1) * (win + topk_max))
-                    .as_device_ptr(),
-                win + topk_max,
-            )
-        } else {
-            (sm.win_idxs.index(i * win..(i + 1) * win).as_device_ptr(), win)
-        };
-        k::sparse_attn(
-            c,
-            k::row(&sm.q, i * heads * hd, heads * hd),
-            k::base(&caches.kv_all[l]),
-            idxs,
-            k::base(&layer.attn_sink),
-            k::row(&sm.o, i * heads * hd, heads * hd),
-            heads,
-            hd,
-            n_sel,
-            (hd as f32).sqrt().recip(),
-        );
     }
-    }
-
 
     // inverse rope, snap, wo_a per (pos, group), wo_b batched
     k::rope_uniform_pos_buf(
@@ -4742,7 +5211,16 @@ fn attention_step_m(
         k::base(&sm.act_fl_s),
         m * og * ol,
     );
-    gemm_q8(c, &layer.wo_b, k::base(&sm.act_fl), k::base(&sm.act_fl_s), k::base(&sm.attn_out), m, dim, og * ol);
+    gemm_q8(
+        c,
+        &layer.wo_b,
+        k::base(&sm.act_fl),
+        k::base(&sm.act_fl_s),
+        k::base(&sm.attn_out),
+        m,
+        dim,
+        og * ol,
+    );
     if let Some(comm) = comm.as_deref_mut() {
         for i in 0..m {
             let mut partial = vec![0.0f32; dim];
@@ -4800,13 +5278,122 @@ fn moe_step_m(
         m * dim,
     );
 
-    if world > 1 && layer.w1_all.is_none() {
+    if world > 1 && layer.w1_all.is_none() && layer.w1_tl.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "decode_m: TP4 requires grouped expert slabs",
         ));
     }
-    if layer.w1_all.is_some() {
+    if layer.w1_tl.is_some() {
+        let routes = m * top_k;
+        let tiles = (routes + 31) / 32 + e_len;
+        for i in 0..m {
+            k::moe_select(
+                c,
+                k::row(&sm.gate_scores, i * n_experts, n_experts),
+                k::base(&layer.gate_bias),
+                k::row(&s1.gate_w_out, i * top_k, top_k),
+                k::row_i32(&s1.gate_i_out, i * top_k, top_k),
+                n_experts,
+                top_k,
+                cfg.route_scale,
+            );
+        }
+        let packed_a =
+            k::U32::from_raw(sm.act_x_s.as_device_ptr().as_raw() + (m * dim / 32) as u64);
+        k::pack_scales(c, k::base(&sm.act_x_s), packed_a, m * dim);
+        k::moe_dispatch_ids(
+            c,
+            k::base(&s1.gate_i_out),
+            k::base(&s1.dispatch_idx),
+            routes,
+            e_start,
+            e_len,
+        );
+        k::moe_dispatch_tl(
+            c,
+            k::base(&s1.dispatch_idx),
+            k::base(&s1.gate_w_out),
+            k::base(&s1.order),
+            k::base(&s1.layout_weights),
+            k::base(&s1.route_pos),
+            k::base(&s1.tile_expert),
+            k::base(&s1.expert_count),
+            k::base(&s1.expert_offset),
+            k::base(&s1.expert_psum),
+            k::base(&s1.num_tiles),
+            m,
+            tiles,
+        );
+        k::moe_grouped_tl(
+            c,
+            k::TlMoe::GateUp,
+            k::base(&sm.act_x),
+            packed_a,
+            k::base(layer.w1_tl.as_ref().unwrap()),
+            k::base(layer.w1s_tl.as_ref().unwrap()),
+            k::base(&s1.order),
+            k::base(&s1.tile_expert),
+            k::base(&s1.route_h),
+            tiles,
+            m,
+        );
+        k::moe_grouped_tl(
+            c,
+            k::TlMoe::GateUp,
+            k::base(&sm.act_x),
+            packed_a,
+            k::base(layer.w3_tl.as_ref().unwrap()),
+            k::base(layer.w3s_tl.as_ref().unwrap()),
+            k::base(&s1.order),
+            k::base(&s1.tile_expert),
+            k::base(&s1.route_y),
+            tiles,
+            m,
+        );
+        k::moe_swiglu_route(
+            c,
+            k::base(&s1.route_h),
+            k::base(&s1.route_y),
+            k::base(&s1.layout_weights),
+            k::base(&s1.route_h),
+            inter,
+            tiles * 32,
+        );
+        k::emit8(
+            c,
+            k::base(&s1.route_h),
+            k::base(&s1.route_q),
+            k::base(&s1.route_q_s),
+            tiles * 32 * inter,
+        );
+        let packed_route = k::U32::from_raw(
+            s1.route_q_s.as_device_ptr().as_raw() + (tiles * 32 * inter / 32) as u64,
+        );
+        k::pack_scales(c, k::base(&s1.route_q_s), packed_route, tiles * 32 * inter);
+        k::moe_grouped_tl(
+            c,
+            k::TlMoe::Down,
+            k::base(&s1.route_q),
+            packed_route,
+            k::base(layer.w2_tl.as_ref().unwrap()),
+            k::base(layer.w2s_tl.as_ref().unwrap()),
+            k::base(&s1.order),
+            k::base(&s1.tile_expert),
+            k::base(&s1.route_y),
+            tiles,
+            m,
+        );
+        k::moe_combine_f32(
+            c,
+            k::base(&s1.route_y),
+            k::base(&s1.route_pos),
+            k::base(&sm.y_moe),
+            dim,
+            top_k,
+            m,
+        );
+    } else if layer.w1_all.is_some() {
         // grouped-expert path (real checkpoint, upload mode)
         let w1 = layer.w1_all.as_ref().unwrap();
         let w1s = layer.w1s_all.as_ref().unwrap();
@@ -4815,68 +5402,68 @@ fn moe_step_m(
         let w3 = layer.w3_all.as_ref().unwrap();
         let w3s = layer.w3s_all.as_ref().unwrap();
         for i in 0..m {
-        k::moe_select(
-            c,
-            k::row(&sm.gate_scores, i * n_experts, n_experts),
-            k::base(&layer.gate_bias),
-            k::base(&s1.gate_w_out),
-            k::base(&s1.gate_i_out),
-            n_experts,
-            top_k,
-            cfg.route_scale,
-        );
-        k::moe_local_slots(
-            c,
-            k::base(&s1.gate_i_out),
-            k::base(&s1.local_slots),
-            k::base(&s1.local_experts),
-            k::base(&s1.local_count),
-            top_k,
-            e_start,
-            e_len,
-        );
-        k::expert_glu(
-            c,
-            k::row_u8(&sm.act_x, i * dim, dim),
-            k::row_u8(&sm.act_x_s, i * dim / 32, dim / 32),
-            k::base(w1),
-            k::base(w1s),
-            k::base(w3),
-            k::base(w3s),
-            k::base(&s1.gate_w_out),
-            k::base(&s1.local_slots),
-            k::base(&s1.local_experts),
-            k::base(&s1.local_count),
-            k::base(&s1.h_slots),
-            inter,
-            dim,
-            top_k,
-        );
-        k::expert_quant(
-            c,
-            k::base(&s1.h_slots),
-            k::base(&s1.local_slots),
-            k::base(&s1.local_count),
-            k::base(&s1.q_slots),
-            k::base(&s1.qs_slots),
-            inter,
-            top_k,
-        );
-        k::expert_reduce(
-            c,
-            k::base(&s1.q_slots),
-            k::base(&s1.qs_slots),
-            k::base(w2),
-            k::base(w2s),
-            k::base(&s1.gate_i_out),
-            k::base(&s1.local_slots),
-            k::base(&s1.local_count),
-            k::row(&sm.y_moe, i * dim, dim),
-            dim,
-            inter,
-            top_k,
-            e_start,
-        );
+            k::moe_select(
+                c,
+                k::row(&sm.gate_scores, i * n_experts, n_experts),
+                k::base(&layer.gate_bias),
+                k::base(&s1.gate_w_out),
+                k::base(&s1.gate_i_out),
+                n_experts,
+                top_k,
+                cfg.route_scale,
+            );
+            k::moe_local_slots(
+                c,
+                k::base(&s1.gate_i_out),
+                k::base(&s1.local_slots),
+                k::base(&s1.local_experts),
+                k::base(&s1.local_count),
+                top_k,
+                e_start,
+                e_len,
+            );
+            k::expert_glu(
+                c,
+                k::row_u8(&sm.act_x, i * dim, dim),
+                k::row_u8(&sm.act_x_s, i * dim / 32, dim / 32),
+                k::base(w1),
+                k::base(w1s),
+                k::base(w3),
+                k::base(w3s),
+                k::base(&s1.gate_w_out),
+                k::base(&s1.local_slots),
+                k::base(&s1.local_experts),
+                k::base(&s1.local_count),
+                k::base(&s1.h_slots),
+                inter,
+                dim,
+                top_k,
+            );
+            k::expert_quant(
+                c,
+                k::base(&s1.h_slots),
+                k::base(&s1.local_slots),
+                k::base(&s1.local_count),
+                k::base(&s1.q_slots),
+                k::base(&s1.qs_slots),
+                inter,
+                top_k,
+            );
+            k::expert_reduce(
+                c,
+                k::base(&s1.q_slots),
+                k::base(&s1.qs_slots),
+                k::base(w2),
+                k::base(w2s),
+                k::base(&s1.gate_i_out),
+                k::base(&s1.local_slots),
+                k::base(&s1.local_count),
+                k::row(&sm.y_moe, i * dim, dim),
+                dim,
+                inter,
+                top_k,
+                e_start,
+            );
         }
     } else {
         // per-expert path (synthetic gate and small uploads): read the
@@ -4896,8 +5483,17 @@ fn moe_step_m(
             let mut i_host = vec![0i32; top_k];
             {
                 let stream = c.stream.as_inner();
-                s1.gate_stage.dtoh(s1.gate_w_out.as_device_ptr().as_raw() as u64, top_k * 4, stream)?;
-                s1.gate_stage.dtoh_at(s1.gate_i_out.as_device_ptr().as_raw() as u64, top_k * 4, top_k * 4, stream)?;
+                s1.gate_stage.dtoh(
+                    s1.gate_w_out.as_device_ptr().as_raw() as u64,
+                    top_k * 4,
+                    stream,
+                )?;
+                s1.gate_stage.dtoh_at(
+                    s1.gate_i_out.as_device_ptr().as_raw() as u64,
+                    top_k * 4,
+                    top_k * 4,
+                    stream,
+                )?;
                 s1.gate_stage.sync(stream)?;
                 let f32s = s1.gate_stage.as_f32();
                 w_host.copy_from_slice(&f32s[..top_k]);
@@ -4936,8 +5532,21 @@ fn moe_step_m(
                     inter,
                     dim,
                 );
-                k::swiglu(c, k::base(&s1.gate_buf), k::base(&s1.up_buf), k::base(&s1.h_e), inter, w);
-                k::emit8(c, k::base(&s1.h_e), k::base(&s1.act_h), k::base(&s1.act_h_s), inter);
+                k::swiglu(
+                    c,
+                    k::base(&s1.gate_buf),
+                    k::base(&s1.up_buf),
+                    k::base(&s1.h_e),
+                    inter,
+                    w,
+                );
+                k::emit8(
+                    c,
+                    k::base(&s1.h_e),
+                    k::base(&s1.act_h),
+                    k::base(&s1.act_h_s),
+                    inter,
+                );
                 drop((w1d, w1sd, w3d, w3sd));
                 let (w2d, w2sd) = (w2.w.stage(c, arena)?, w2.s.stage(c, arena)?);
                 k::fp4_gemm(
@@ -4952,7 +5561,12 @@ fn moe_step_m(
                     inter,
                 );
                 drop((w2d, w2sd));
-                k::acc_f32(c, k::base(&s1.expert_y), k::row(&sm.y_moe, i * dim, dim), dim);
+                k::acc_f32(
+                    c,
+                    k::base(&s1.expert_y),
+                    k::row(&sm.y_moe, i * dim, dim),
+                    dim,
+                );
             }
         }
     }
@@ -4974,8 +5588,26 @@ fn moe_step_m(
 
     // shared expert, batched, added last per row
     let [w1, w2, w3] = &layer.shared_experts;
-    gemm_q8(c, w1, k::base(&sm.act_x), k::base(&sm.act_x_s), k::base(&sm.gate_buf), m, inter, dim);
-    gemm_q8(c, w3, k::base(&sm.act_x), k::base(&sm.act_x_s), k::base(&sm.up_buf), m, inter, dim);
+    gemm_q8(
+        c,
+        w1,
+        k::base(&sm.act_x),
+        k::base(&sm.act_x_s),
+        k::base(&sm.gate_buf),
+        m,
+        inter,
+        dim,
+    );
+    gemm_q8(
+        c,
+        w3,
+        k::base(&sm.act_x),
+        k::base(&sm.act_x_s),
+        k::base(&sm.up_buf),
+        m,
+        inter,
+        dim,
+    );
     k::swiglu(
         c,
         k::base(&sm.gate_buf),
@@ -4991,7 +5623,16 @@ fn moe_step_m(
         k::base(&sm.act_h_s),
         m * inter,
     );
-    gemm_q8(c, w2, k::base(&sm.act_h), k::base(&sm.act_h_s), k::base(&sm.expert_y), m, dim, inter);
+    gemm_q8(
+        c,
+        w2,
+        k::base(&sm.act_h),
+        k::base(&sm.act_h_s),
+        k::base(&sm.expert_y),
+        m,
+        dim,
+        inter,
+    );
     k::acc_f32(c, k::base(&sm.expert_y), k::base(&sm.y_moe), m * dim);
 
     Ok(())
