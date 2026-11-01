@@ -400,6 +400,7 @@ pub fn moe_dispatch_tl(
     expert_psum: I32,
     num_tiles: I32,
     rows: usize,
+    top_k: usize,
     tiles: usize,
 ) {
     let f = c
@@ -420,6 +421,7 @@ pub fn moe_dispatch_tl(
             topk_idx,
             topk_weights,
             rows as i32,
+            top_k as i32,
             tiles as i32
         ))
         .unwrap()
@@ -445,6 +447,7 @@ pub fn moe_grouped_tl(
     out: F32,
     tiles: usize,
     tokens: usize,
+    top_k: usize,
 ) {
     let (module, n_tiles, tiles_count) = match kind {
         TlMoe::GateUp => (&c.tl_moe_gate_up, 18, 69120),
@@ -467,9 +470,14 @@ pub fn moe_grouped_tl(
         );
         assert_eq!(status, cust::sys::CUresult::CUDA_SUCCESS);
         let stream = &c.stream;
-        launch!(f<<<(n_tiles, tiles as u32), 128, 64000, stream>>>(
-            a, map, out, order, sfa, sfb, tile_expert, tiles as i32, input_rows as i32
-        ))
+        match kind {
+            TlMoe::GateUp => launch!(f<<<(n_tiles, tiles as u32), 128, 64000, stream>>>(
+                a, map, out, order, sfa, sfb, tile_expert, tiles as i32, input_rows as i32, top_k as i32
+            )),
+            TlMoe::Down => launch!(f<<<(n_tiles, tiles as u32), 128, 64000, stream>>>(
+                a, map, out, order, sfa, sfb, tile_expert, tiles as i32, input_rows as i32
+            )),
+        }
         .unwrap()
     }
 }

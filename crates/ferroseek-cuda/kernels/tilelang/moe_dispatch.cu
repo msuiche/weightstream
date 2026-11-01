@@ -14,8 +14,8 @@
 #include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>
 #endif
 
-extern "C" __global__ void moe_dispatch_kernel(int* __restrict__ ExpertCount, int* __restrict__ ExpertOffset, float* __restrict__ LayoutWeights, int* __restrict__ NumTiles, int* __restrict__ Order, int* __restrict__ Psum, int* __restrict__ RoutePos, int* __restrict__ TileExpert, const int64_t* __restrict__ TopkIdx, const float* __restrict__ TopkWeights, int rows, int tiles);
-extern "C" __global__ void __launch_bounds__(512, 1) moe_dispatch_kernel(int* __restrict__ ExpertCount, int* __restrict__ ExpertOffset, float* __restrict__ LayoutWeights, int* __restrict__ NumTiles, int* __restrict__ Order, int* __restrict__ Psum, int* __restrict__ RoutePos, int* __restrict__ TileExpert, const int64_t* __restrict__ TopkIdx, const float* __restrict__ TopkWeights, int rows, int tiles) {
+extern "C" __global__ void moe_dispatch_kernel(int* __restrict__ ExpertCount, int* __restrict__ ExpertOffset, float* __restrict__ LayoutWeights, int* __restrict__ NumTiles, int* __restrict__ Order, int* __restrict__ Psum, int* __restrict__ RoutePos, int* __restrict__ TileExpert, const int64_t* __restrict__ TopkIdx, const float* __restrict__ TopkWeights, int rows, int top_k, int tiles);
+extern "C" __global__ void __launch_bounds__(512, 1) moe_dispatch_kernel(int* __restrict__ ExpertCount, int* __restrict__ ExpertOffset, float* __restrict__ LayoutWeights, int* __restrict__ NumTiles, int* __restrict__ Order, int* __restrict__ Psum, int* __restrict__ RoutePos, int* __restrict__ TileExpert, const int64_t* __restrict__ TopkIdx, const float* __restrict__ TopkWeights, int rows, int top_k, int tiles) {
   extern __shared__ __align__(1024) uchar buf_dyn_shmem[];
   void* scan = ((void*)((char*)buf_dyn_shmem + 0));
   void* warp_count = ((void*)((char*)buf_dyn_shmem + 0));
@@ -36,8 +36,8 @@ extern "C" __global__ void __launch_bounds__(512, 1) moe_dispatch_kernel(int* __
   }
   __syncthreads();
   int condval;
-  if ((((int)threadIdx.x) < (rows * 6))) {
-    condval = ((int)TopkIdx[min(((int64_t)((int)threadIdx.x)), ((((int64_t)rows) * (int64_t)6) - (int64_t)1))]);
+  if ((((int)threadIdx.x) < (rows * top_k))) {
+    condval = ((int)TopkIdx[min(((int64_t)((int)threadIdx.x)), ((((int64_t)rows) * ((int64_t)top_k)) - (int64_t)1))]);
   } else {
     condval = -1;
   }
@@ -133,7 +133,7 @@ extern "C" __global__ void __launch_bounds__(512, 1) moe_dispatch_kernel(int* __
     ((int*)scan)[((int)threadIdx.x)] = offset_1;
   }
   __syncthreads();
-  if (((int)threadIdx.x) < (rows * 6)) {
+  if (((int)threadIdx.x) < (rows * top_k)) {
     if (0 <= expert_1) {
       if (0 <= (((int*)scan)[((int64_t)expert_1)] + rank_1)) {
         if ((((int*)scan)[((int64_t)expert_1)] + rank_1) < (tiles * 32)) {

@@ -31,15 +31,23 @@ extern "C" __global__ void sparse_attn(
     float acc[4];
 #pragma unroll
     for (int i = 0; i < 4; i++) acc[i] = 0.0f;
+    float qv[4];
+    {
+        int k = 0;
+        for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) qv[k] = qh[d];
+    }
 
     for (int i = 0; i < n_sel; i++) {
         int idx = idxs[i];
         // dot(q_h, kv[idx])
         float partial = 0.0f;
+        float v[4];
         if (idx >= 0) {
             const float* row = kv + (size_t)idx * dim;
-            for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-                partial += qh[d] * row[d];
+            int k = 0;
+            for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) {
+                v[k] = row[d];
+                partial += qv[k] * v[k];
             }
         }
         if (threadIdx.x == 0) s_dot = 0.0f;
@@ -57,10 +65,9 @@ extern "C" __global__ void sparse_attn(
         float w = expf(logit - mnew);
         s = s * corr + w;
         if (idx >= 0) {
-            const float* row = kv + (size_t)idx * dim;
             int k = 0;
             for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) {
-                acc[k] = acc[k] * corr + w * row[d];
+                acc[k] = acc[k] * corr + w * v[k];
             }
         } else {
             int k = 0;
@@ -108,14 +115,22 @@ extern "C" __global__ void sparse_attn_m(
     float acc[4];
 #pragma unroll
     for (int i = 0; i < 4; i++) acc[i] = 0.0f;
+    float qv[4];
+    {
+        int k = 0;
+        for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) qv[k] = qh[d];
+    }
 
     for (int i = 0; i < n_sel; i++) {
         int idx = pidx[i];
         float partial = 0.0f;
+        float v[4];
         if (idx >= 0) {
             const float* row = kv + (size_t)idx * dim;
-            for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-                partial += qh[d] * row[d];
+            int k = 0;
+            for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) {
+                v[k] = row[d];
+                partial += qv[k] * v[k];
             }
         }
         if (threadIdx.x == 0) s_dot = 0.0f;
@@ -129,10 +144,9 @@ extern "C" __global__ void sparse_attn_m(
         float w = expf(logit - mnew);
         s = s * corr + w;
         if (idx >= 0) {
-            const float* row = kv + (size_t)idx * dim;
             int k = 0;
             for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) {
-                acc[k] = acc[k] * corr + w * row[d];
+                acc[k] = acc[k] * corr + w * v[k];
             }
         } else {
             int k = 0;

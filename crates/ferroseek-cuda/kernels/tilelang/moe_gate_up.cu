@@ -20,8 +20,8 @@
 #include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>
 #endif
 
-extern "C" __global__ void moe_grouped_fp8_fp4_gemm_kernel(const fp8_e4_t* __restrict__ A, __grid_constant__ const CUtensorMap B_desc, float* __restrict__ C, const int* __restrict__ Order, const uint* __restrict__ SFA, const uint* __restrict__ SFB, const int* __restrict__ TileExpert, int tiles, int tokens);
-extern "C" __global__ void __launch_bounds__(128, 1) moe_grouped_fp8_fp4_gemm_kernel(const fp8_e4_t* __restrict__ A, __grid_constant__ const CUtensorMap B_desc, float* __restrict__ C, const int* __restrict__ Order, const uint* __restrict__ SFA, const uint* __restrict__ SFB, const int* __restrict__ TileExpert, int tiles, int tokens) {
+extern "C" __global__ void moe_grouped_fp8_fp4_gemm_kernel(const fp8_e4_t* __restrict__ A, __grid_constant__ const CUtensorMap B_desc, float* __restrict__ C, const int* __restrict__ Order, const uint* __restrict__ SFA, const uint* __restrict__ SFB, const int* __restrict__ TileExpert, int tiles, int tokens, int top_k);
+extern "C" __global__ void __launch_bounds__(128, 1) moe_grouped_fp8_fp4_gemm_kernel(const fp8_e4_t* __restrict__ A, __grid_constant__ const CUtensorMap B_desc, float* __restrict__ C, const int* __restrict__ Order, const uint* __restrict__ SFA, const uint* __restrict__ SFB, const int* __restrict__ TileExpert, int tiles, int tokens, int top_k) {
   extern __shared__ __align__(1024) uchar buf_dyn_shmem[];
   void* rows_shared = ((void*)((char*)buf_dyn_shmem + 0));
   void* SFA_shared = ((void*)((char*)buf_dyn_shmem + 128));
@@ -51,7 +51,7 @@ extern "C" __global__ void __launch_bounds__(128, 1) moe_grouped_fp8_fp4_gemm_ke
     int route = Order[((((int64_t)((int)blockIdx.y)) * (int64_t)32) + ((int64_t)((int)threadIdx.x)))];
     int condval;
     if ((0 <= route)) {
-      condval = (route / 6);
+      condval = (route / top_k);
     } else {
       condval = -1;
     }

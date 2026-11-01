@@ -683,6 +683,7 @@ pub struct GpuModel<'a> {
     scratch: Scratch,
     /// M-row scratch for `decode_m`, grown on first use (None until then).
     scratch_m: Option<ScratchM>,
+    drafter_scratch_m: Option<ScratchM>,
     /// Publisher fan-out: for kv-source ordinal s, the layers attending its
     /// compressed rows (source included).
     bands: Vec<Vec<usize>>,
@@ -1818,7 +1819,7 @@ impl<'a> GpuModel<'a> {
         for li in 0..layers.len() {
             let layer = &layers[li];
             if capture_drafter {
-                Self::capture_main_hidden(main_hiddens, c, cfg, &s.h[h_cur], layer.layer)?;
+                Self::capture_main_hidden(main_hiddens, c, cfg, &s.h[h_cur], 0, layer.layer)?;
             }
 
             // engram merge before the block (model.py:1264-1266)
@@ -2817,6 +2818,7 @@ impl<'a> GpuModel<'a> {
             final_norm,
             scratch,
             scratch_m: None,
+            drafter_scratch_m: None,
             bands,
             run: RunState {
                 compress_len: vec![0; n_sources],
@@ -3457,7 +3459,7 @@ fn moe_step(
     prof.add_us(2, t_gate);
 
     if layer.w1_tl.is_some() {
-        let tiles = (top_k + 31) / 32 + e_len;
+        let tiles = (top_k + 31) / 32 + top_k.min(e_len);
         let packed_a = k::U32::from_raw(s.act_x_s.as_device_ptr().as_raw() + (dim / 32) as u64);
         k::pack_scales(c, k::base(&s.act_x_s), packed_a, dim);
         k::moe_dispatch_ids(
@@ -3481,6 +3483,7 @@ fn moe_step(
             k::base(&s.expert_psum),
             k::base(&s.num_tiles),
             1,
+            top_k,
             tiles,
         );
         k::moe_grouped_tl(
@@ -3495,6 +3498,7 @@ fn moe_step(
             k::base(&s.route_h),
             tiles,
             1,
+            top_k,
         );
         k::moe_grouped_tl(
             c,
@@ -3508,6 +3512,7 @@ fn moe_step(
             k::base(&s.route_y),
             tiles,
             1,
+            top_k,
         );
         k::moe_swiglu_route(
             c,
@@ -3541,6 +3546,7 @@ fn moe_step(
             k::base(&s.route_y),
             tiles,
             1,
+            top_k,
         );
         k::moe_combine_f32(
             c,
@@ -3817,6 +3823,7 @@ fn moe_step(
 /// M-row scratch, grown on demand.
 struct ScratchM {
     m_max: usize,
+    n_routed: usize,
     h: [D<f32>; 2],
     x: D<f32>,
     qr: D<f32>,
@@ -3891,6 +3898,7 @@ impl ScratchM {
         };
         Ok(Self {
             m_max: m,
+            n_routed: cfg.n_routed as usize,
             h: [alloc(m * hc * dim)?, alloc(m * hc * dim)?],
             x: alloc(m * dim)?,
             qr: alloc(m * ql)?,
@@ -3951,6 +3959,7 @@ impl<'a> GpuModel<'a> {
         c: &Cuda,
         cfg: &RefConfig,
         h: &D<f32>,
+        row: usize,
         layer: u32,
     ) -> io::Result<()> {
         if !matches!(layer, 37 | 38 | 39) {
@@ -3959,7 +3968,9 @@ impl<'a> GpuModel<'a> {
         let dim = cfg.dim as usize;
         let hc = cfg.hc_mult as usize;
         let mut hv = vec![0.0f32; hc * dim];
-        h.copy_to(&mut hv).map_err(cuda_err)?;
+        h.index(row * hc * dim..(row + 1) * hc * dim)
+            .copy_to(&mut hv)
+            .map_err(cuda_err)?;
         let mean: Vec<f32> = (0..dim)
             .map(|i| (0..hc).map(|j| hv[j * dim + i]).sum::<f32>() / hc as f32)
             .collect();
@@ -3986,6 +3997,9 @@ impl<'a> GpuModel<'a> {
         let m = tokens.len();
         let cfg = cfg_override.unwrap_or(&self.cfg);
         let capture_drafter = self.drafter.is_some();
+        if capture_drafter && layers_override.is_none() {
+            self.main_hiddens.clear();
+        }
         if m == 0 {
             return Ok(Vec::new());
         }
@@ -4060,17 +4074,13 @@ impl<'a> GpuModel<'a> {
             }
         }
 
-        // grow the m-row scratch on demand
-        if self.scratch_m.as_ref().map(|s| s.m_max).unwrap_or(0) < m {
-            self.scratch_m = Some(ScratchM::new(cfg, &self.engram, m)?);
-        }
-
         let GpuModel {
             cfg: cfg_self,
             layers: layers_self,
             caches,
             scratch: s1,
             scratch_m,
+            drafter_scratch_m,
             rope_cos,
             rope_sin,
             emb,
@@ -4086,8 +4096,21 @@ impl<'a> GpuModel<'a> {
             ..
         } = self;
         let cfg = cfg_override.unwrap_or(cfg_self);
+        let scratch_slot = if layers_override.is_some() {
+            drafter_scratch_m
+        } else {
+            scratch_m
+        };
+        if scratch_slot
+            .as_ref()
+            .map(|s| (s.m_max, s.n_routed))
+            .unwrap_or((0, 0))
+            != (m, cfg.n_routed as usize)
+        {
+            *scratch_slot = Some(ScratchM::new(cfg, engram, m)?);
+        }
         let layers = layers_override.unwrap_or(layers_self);
-        let sm = scratch_m.as_mut().unwrap();
+        let sm = scratch_slot.as_mut().unwrap();
         let arena_opt: Option<&crate::stream::HostArena> = arena.as_ref();
         let sh = *sharding;
         let mut comm_opt: Option<&mut (dyn Collectives + 'static)> = comm.as_deref_mut();
@@ -4170,8 +4193,8 @@ impl<'a> GpuModel<'a> {
         let mut h_cur = 0usize;
         for li in 0..layers.len() {
             let layer = &layers[li];
-            if capture_drafter {
-                Self::capture_main_hidden(main_hiddens, c, cfg, &s1.h[h_cur], layer.layer)?;
+            if capture_drafter && layers_override.is_none() {
+                Self::capture_main_hidden(main_hiddens, c, cfg, &sm.h[h_cur], m - 1, layer.layer)?;
             }
 
             // engram merge (per position: gather -> batched wkv -> merge)
@@ -5286,7 +5309,7 @@ fn moe_step_m(
     }
     if layer.w1_tl.is_some() {
         let routes = m * top_k;
-        let tiles = (routes + 31) / 32 + e_len;
+        let tiles = (routes + 31) / 32 + routes.min(e_len);
         for i in 0..m {
             k::moe_select(
                 c,
@@ -5323,6 +5346,7 @@ fn moe_step_m(
             k::base(&s1.expert_psum),
             k::base(&s1.num_tiles),
             m,
+            top_k,
             tiles,
         );
         k::moe_grouped_tl(
@@ -5337,6 +5361,7 @@ fn moe_step_m(
             k::base(&s1.route_h),
             tiles,
             m,
+            top_k,
         );
         k::moe_grouped_tl(
             c,
@@ -5350,6 +5375,7 @@ fn moe_step_m(
             k::base(&s1.route_y),
             tiles,
             m,
+            top_k,
         );
         k::moe_swiglu_route(
             c,
@@ -5383,6 +5409,7 @@ fn moe_step_m(
             k::base(&s1.route_y),
             tiles,
             m,
+            top_k,
         );
         k::moe_combine_f32(
             c,

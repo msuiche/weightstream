@@ -769,6 +769,7 @@ fn tilelang_grouped_moe_matches_closed_form() {
         expert_psum.as_device_ptr(),
         num_tiles.as_device_ptr(),
         1,
+        top_k,
         tiles,
     );
     let a = vec![ferroseek_core::quant::f32_to_e4m3(0.01); k];
@@ -796,6 +797,7 @@ fn tilelang_grouped_moe_matches_closed_form() {
         out.as_device_ptr(),
         tiles,
         1,
+        top_k,
     );
     c.stream.synchronize().unwrap();
     let mut got = vec![0.0f32; n];
@@ -869,6 +871,7 @@ fn tilelang_grouped_moe_matches_closed_form() {
         down_out.as_device_ptr(),
         tiles,
         1,
+        top_k,
     );
     let d_sb_orig = DeviceBuffer::from_slice(&down_sb).unwrap();
     let mut scalar = DeviceBuffer::from_slice(&vec![0.0f32; down_n]).unwrap();
@@ -977,6 +980,7 @@ fn tilelang_real_grouped_pipeline_matches_scalar() {
         expert_psum.as_device_ptr(),
         num_tiles.as_device_ptr(),
         1,
+        top_k,
         tiles,
     );
     let mut raw = vec![0u8; experts * w0b.len()];
@@ -1085,6 +1089,7 @@ fn tilelang_real_grouped_pipeline_matches_scalar() {
             out.as_device_ptr(),
             tiles,
             1,
+            top_k,
         );
     }
     crate::launch::moe_swiglu_route(
@@ -1122,6 +1127,7 @@ fn tilelang_real_grouped_pipeline_matches_scalar() {
         route_down.as_device_ptr(),
         tiles,
         1,
+        top_k,
     );
     let combined = DeviceBuffer::from_slice(&vec![0.0f32; dim]).unwrap();
     crate::launch::moe_combine_f32(
