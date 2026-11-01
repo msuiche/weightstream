@@ -434,6 +434,7 @@ impl W8 {
 struct Q8 {
     w: W8,
     s: W8,
+    packed_s: Option<D<u32>>,
 }
 
 /// Packed fp4 expert weight + per-1x32-K ue8m0 scales.
@@ -726,6 +727,20 @@ fn up_zero_f32(_c: &Cuda, n: usize) -> io::Result<D<f32>> {
     DeviceBuffer::zeroed(n.max(1)).map_err(cuda_err)
 }
 
+fn pack_weight_scales(bytes: &[u8], n: usize, k: usize) -> Vec<u32> {
+    let kb = k / 32;
+    let words = k / 128;
+    let mut out = vec![0u32; n * words];
+    for row in 0..n {
+        for w in 0..words {
+            for j in 0..4 {
+                out[row * words + w] |= (bytes[(row / 32) * kb + w * 4 + j] as u32) << (8 * j);
+            }
+        }
+    }
+    out
+}
+
 fn load_q8(
     store: &mut dyn WeightStore,
     c: &Cuda,
@@ -741,21 +756,32 @@ fn load_q8(
         Ok(Q8 {
             w: W8::streamed(wb.as_slice(), Some(a), c)?,
             s: W8::streamed(sb.as_slice(), Some(a), c)?,
+            packed_s: None,
         })
     } else {
         // upload mode (synthetic gate): snapshot both slices to owned bytes
         // first — the store lends one view at a time
-        let wb: Vec<u8> = {
+        let (wb, n, k) = {
             let v = store.get(wname)?;
-            shard_weight(v.bytes, &v.shape, shard)?.as_slice().to_vec()
+            let wb = shard_weight(v.bytes, &v.shape, shard)?.as_slice().to_vec();
+            let k = match shard {
+                WShard::Cols { len, .. } => len,
+                _ => v.shape[1],
+            };
+            let n = wb.len() / k;
+            (wb, n, k)
         };
         let sb: Vec<u8> = {
             let v = store.get(sname)?;
             shard_scale(v.bytes, &v.shape, shard)?.as_slice().to_vec()
         };
+        let packed = (k % 128 == 0).then(|| pack_weight_scales(&sb, n, k));
         Ok(Q8 {
             w: W8::device(up_u8(c, &wb)?),
             s: W8::device(up_u8(c, &sb)?),
+            packed_s: packed
+                .map(|packed| DeviceBuffer::from_slice(&packed).map_err(cuda_err))
+                .transpose()?,
         })
     }
 }
@@ -1849,17 +1875,7 @@ impl<'a> GpuModel<'a> {
                     k::base(&s.act_e_s),
                     ncols * ehd,
                 );
-                k::fp8_gemm(
-                    c,
-                    k::base(&s.act_e),
-                    k::base(&s.act_e_s),
-                    e.wkv.w.ptr(),
-                    e.wkv.s.ptr(),
-                    k::base(&s.ekv),
-                    1,
-                    dim * (hc + 1),
-                    ncols * ehd,
-                );
+                gemm_q8(c, &e.wkv, k::base(&s.act_e), k::base(&s.act_e_s), k::base(&s.ekv), 1, dim * (hc + 1), ncols * ehd);
                 let inv = (dim as f32).sqrt().recip();
                 for j in 0..hc {
                     k::engram_merge(
@@ -2582,7 +2598,7 @@ impl<'a> GpuModel<'a> {
             assert!(n % 32 == 0 && n > 0);
             Ok((
                 DeviceBuffer::zeroed(n).map_err(cuda_err)?,
-                DeviceBuffer::zeroed(n / 32).map_err(cuda_err)?,
+                DeviceBuffer::zeroed(n / 16).map_err(cuda_err)?,
             ))
         };
         let (act_x, act_x_s) = act(dim)?;
@@ -2698,6 +2714,38 @@ impl<'a> GpuModel<'a> {
         })
     }
 }
+fn gemm_q8(
+    c: &Cuda,
+    q: &Q8,
+    a: k::U8,
+    sa: k::U8,
+    out: k::F32,
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    let kind = match (n, k) {
+        (1280, 5120) => Some(k::TlGemm::Qa),
+        (8192, 1280) => Some(k::TlGemm::Qb),
+        (512, 5120) => Some(k::TlGemm::Wkv),
+        (5120, 2048) => Some(k::TlGemm::WoB),
+        (2304, 5120) => Some(k::TlGemm::SharedW13),
+        (5120, 2304) => Some(k::TlGemm::SharedW2),
+        (25600, 5120) => Some(k::TlGemm::EngramWkv),
+        (1280, 15360) => Some(k::TlGemm::DrafterMainProj),
+        _ => None,
+    };
+    if m <= 16 {
+        if let (Some(kind), Some(packed)) = (kind, q.packed_s.as_ref()) {
+            let packed_a = k::U32::from_raw(sa.as_raw() + (m * k / 32) as u64);
+            k::pack_scales(c, sa, packed_a, m * k);
+            k::fp8_gemm_tl(c, kind, a, packed_a, q.w.ptr(), k::base(packed), out, m);
+            return;
+        }
+    }
+    k::fp8_gemm(c, a, sa, q.w.ptr(), q.s.ptr(), out, m, n, k);
+}
+
 
 // ---------------------------------------------------------------------------
 // decode sublayers
@@ -2753,17 +2801,7 @@ fn attention_step(
     );
     dump_u8(c, &s.act_x, dim, format!("d_pos{pos}_actx{l}.u8"));
     dump_u8(c, &s.act_x_s, dim / 32, format!("d_pos{pos}_actxs{l}.u8"));
-    k::fp8_gemm(
-        c,
-        k::base(&s.act_x),
-        k::base(&s.act_x_s),
-        layer.wq_a.w.ptr(),
-        layer.wq_a.s.ptr(),
-        k::base(&s.qr),
-        1,
-        cfg.q_lora as usize,
-        dim,
-    );
+    gemm_q8(c, &layer.wq_a, k::base(&s.act_x), k::base(&s.act_x_s), k::base(&s.qr), 1, cfg.q_lora as usize, dim);
     k::rmsnorm(
         c,
         k::base(&s.qr),
@@ -2797,17 +2835,7 @@ fn attention_step(
         cfg.q_lora as usize / 32,
         format!("d_pos{pos}_actqrs{l}.u8"),
     );
-    k::fp8_gemm(
-        c,
-        k::base(&s.act_qr),
-        k::base(&s.act_qr_s),
-        layer.wq_b.w.ptr(),
-        layer.wq_b.s.ptr(),
-        k::base(&s.q),
-        1,
-        heads * hd,
-        cfg.q_lora as usize,
-    );
+    gemm_q8(c, &layer.wq_b, k::base(&s.act_qr), k::base(&s.act_qr_s), k::base(&s.q), 1, heads * hd, cfg.q_lora as usize);
     k::rope_uniform_pos(
         c,
         k::base(&s.q),
@@ -2822,17 +2850,7 @@ fn attention_step(
     dump_dev(c, &s.q, heads * hd, format!("d_pos{pos}_q{l}.f32"));
 
     // window KV: one shared latent, rope tail, fp8 snap, ring write
-    k::fp8_gemm(
-        c,
-        k::base(&s.act_x),
-        k::base(&s.act_x_s),
-        layer.wkv.w.ptr(),
-        layer.wkv.s.ptr(),
-        k::base(&s.kvrow),
-        1,
-        hd,
-        dim,
-    );
+    gemm_q8(c, &layer.wkv, k::base(&s.act_x), k::base(&s.act_x_s), k::base(&s.kvrow), 1, hd, dim);
     let slot = (pos % win as u64) as usize;
     let ring = k::row(&caches.kv_all[l], slot * hd, hd);
     k::rmsnorm(
@@ -2970,17 +2988,7 @@ fn attention_step(
                 k::fp4_snap(c, krow_dst, ihd, 32, false);
             }
             // query side: wq_b(qr) at pos, fp4(32, e8m0) snap
-            k::fp8_gemm(
-                c,
-                k::base(&s.act_qr),
-                k::base(&s.act_qr_s),
-                layer.indexer.as_ref().unwrap().wq_b.w.ptr(),
-                layer.indexer.as_ref().unwrap().wq_b.s.ptr(),
-                k::base(&s.qidx),
-                1,
-                inh * ihd,
-                cfg.q_lora as usize,
-            );
+            gemm_q8(c, &layer.indexer.as_ref().unwrap().wq_b, k::base(&s.act_qr), k::base(&s.act_qr_s), k::base(&s.qidx), 1, inh * ihd, cfg.q_lora as usize);
             k::rope_uniform_pos(
                 c,
                 k::base(&s.qidx),
@@ -3159,17 +3167,7 @@ fn attention_step(
         (og * ol) / 32,
         format!("d_pos{pos}_actflS{l}.u8"),
     );
-    k::fp8_gemm(
-        c,
-        k::base(&s.act_fl),
-        k::base(&s.act_fl_s),
-        layer.wo_b.w.ptr(),
-        layer.wo_b.s.ptr(),
-        k::base(&s.attn_out),
-        1,
-        dim,
-        og * ol,
-    );
+    gemm_q8(c, &layer.wo_b, k::base(&s.act_fl), k::base(&s.act_fl_s), k::base(&s.attn_out), 1, dim, og * ol);
     // wo_b is row-parallel: fp32 partial-sum all-reduce (spec §3)
     if let Some(comm) = comm.as_deref_mut() {
         let stream = c.stream.as_inner();
@@ -3490,28 +3488,8 @@ fn moe_step(
     );
     // shared expert on every token, added last (model.py:905)
     let [w1, w2, w3] = &layer.shared_experts;
-    k::fp8_gemm(
-        c,
-        k::base(&s.act_x),
-        k::base(&s.act_x_s),
-        w1.w.ptr(),
-        w1.s.ptr(),
-        k::base(&s.gate_buf),
-        1,
-        inter,
-        dim,
-    );
-    k::fp8_gemm(
-        c,
-        k::base(&s.act_x),
-        k::base(&s.act_x_s),
-        w3.w.ptr(),
-        w3.s.ptr(),
-        k::base(&s.up_buf),
-        1,
-        inter,
-        dim,
-    );
+    gemm_q8(c, w1, k::base(&s.act_x), k::base(&s.act_x_s), k::base(&s.gate_buf), 1, inter, dim);
+    gemm_q8(c, w3, k::base(&s.act_x), k::base(&s.act_x_s), k::base(&s.up_buf), 1, inter, dim);
     k::swiglu(
         c,
         k::base(&s.gate_buf),
@@ -3527,17 +3505,7 @@ fn moe_step(
         k::base(&s.act_h_s),
         inter,
     );
-    k::fp8_gemm(
-        c,
-        k::base(&s.act_h),
-        k::base(&s.act_h_s),
-        w2.w.ptr(),
-        w2.s.ptr(),
-        k::base(&s.expert_y),
-        1,
-        dim,
-        inter,
-    );
+    gemm_q8(c, w2, k::base(&s.act_h), k::base(&s.act_h_s), k::base(&s.expert_y), 1, dim, inter);
     k::acc_f32(c, k::base(&s.expert_y), k::base(&s.y_moe), dim);
     dump_dev(
         c,
@@ -3665,15 +3633,15 @@ impl ScratchM {
             ones_hc: alloc(m * hc)?,
             comb_zero: alloc(m * hc * hc)?,
             act_x: alloc_u(m * dim)?,
-            act_x_s: alloc_u(m * dim / 32)?,
+            act_x_s: alloc_u(m * dim / 16)?,
             act_qr: alloc_u(m * ql)?,
-            act_qr_s: alloc_u(m * ql / 32)?,
+            act_qr_s: alloc_u(m * ql / 16)?,
             act_fl: alloc_u(m * og * ol)?,
-            act_fl_s: alloc_u(m * og * ol / 32)?,
+            act_fl_s: alloc_u(m * og * ol / 16)?,
             act_h: alloc_u(m * inter)?,
-            act_h_s: alloc_u(m * inter / 32)?,
+            act_h_s: alloc_u(m * inter / 16)?,
             act_e: alloc_u(m * ncols * ehd)?,
-            act_e_s: alloc_u(m * ncols * ehd / 32)?,
+            act_e_s: alloc_u(m * ncols * ehd / 16)?,
             gate_scores: alloc(m * cfg.n_routed as usize)?,
             qidx: alloc(m * inh * ihd)?,
             widx: alloc(m * inh)?,
@@ -3976,17 +3944,7 @@ impl<'a> GpuModel<'a> {
                     k::base(&sm.act_e_s),
                     m * ncols * ehd,
                 );
-                k::fp8_gemm(
-                    c,
-                    k::base(&sm.act_e),
-                    k::base(&sm.act_e_s),
-                    e.wkv.w.ptr(),
-                    e.wkv.s.ptr(),
-                    k::base(&sm.ekv),
-                    m,
-                    dim * (hc + 1),
-                    ncols * ehd,
-                );
+                gemm_q8(c, &e.wkv, k::base(&sm.act_e), k::base(&sm.act_e_s), k::base(&sm.ekv), m, dim * (hc + 1), ncols * ehd);
                 let inv = (dim as f32).sqrt().recip();
                 for i in 0..m {
                     for j in 0..hc {
@@ -4177,20 +4135,10 @@ impl<'a> GpuModel<'a> {
                 .map_err(cuda_err)?;
         }
         let act = DeviceBuffer::<u8>::zeroed(3 * dim).map_err(cuda_err)?;
-        let act_s = DeviceBuffer::<u8>::zeroed(3 * dim / 128).map_err(cuda_err)?;
+        let act_s = DeviceBuffer::<u8>::zeroed(3 * dim / 16).map_err(cuda_err)?;
         k::emit8(c, k::base(&main_hidden), k::base(&act), k::base(&act_s), 3 * dim);
         let main_x = up_zero_f32(c, dim)?;
-        k::fp8_gemm(
-            c,
-            k::base(&act),
-            k::base(&act_s),
-            drafter.main_proj.w.ptr(),
-            drafter.main_proj.s.ptr(),
-            k::base(&main_x),
-            1,
-            dim,
-            3 * dim,
-        );
+        gemm_q8(c, &drafter.main_proj, k::base(&act), k::base(&act_s), k::base(&main_x), 1, dim, 3 * dim);
         k::rmsnorm(
             c,
             k::base(&main_x),
@@ -4213,21 +4161,11 @@ impl<'a> GpuModel<'a> {
             let rd = self.cfg.rope_dim as usize;
             let win = self.cfg.window_size as usize;
             let act = DeviceBuffer::<u8>::zeroed(dim).map_err(cuda_err)?;
-            let act_s = DeviceBuffer::<u8>::zeroed(dim / 128).map_err(cuda_err)?;
+            let act_s = DeviceBuffer::<u8>::zeroed(dim / 16).map_err(cuda_err)?;
             let kv = up_zero_f32(c, hd)?;
             k::emit8(c, k::base(&main_x), k::base(&act), k::base(&act_s), dim);
             for layer in &drafter.layers {
-                k::fp8_gemm(
-                    c,
-                    k::base(&act),
-                    k::base(&act_s),
-                    layer.wkv.w.ptr(),
-                    layer.wkv.s.ptr(),
-                    k::base(&kv),
-                    1,
-                    hd,
-                    dim,
-                );
+                gemm_q8(c, &layer.wkv, k::base(&act), k::base(&act_s), k::base(&kv), 1, hd, dim);
                 let ring = k::row(
                     &drafter.caches.kv_all[layer.layer as usize],
                     (position as usize % win) * hd,
@@ -4381,17 +4319,7 @@ fn attention_step_m(
         k::base(&sm.act_x_s),
         m * dim,
     );
-    k::fp8_gemm(
-        c,
-        k::base(&sm.act_x),
-        k::base(&sm.act_x_s),
-        layer.wq_a.w.ptr(),
-        layer.wq_a.s.ptr(),
-        k::base(&sm.qr),
-        m,
-        cfg.q_lora as usize,
-        dim,
-    );
+    gemm_q8(c, &layer.wq_a, k::base(&sm.act_x), k::base(&sm.act_x_s), k::base(&sm.qr), m, cfg.q_lora as usize, dim);
     k::rmsnorm_m(
         c,
         k::base(&sm.qr),
@@ -4408,17 +4336,7 @@ fn attention_step_m(
         k::base(&sm.act_qr_s),
         m * cfg.q_lora as usize,
     );
-    k::fp8_gemm(
-        c,
-        k::base(&sm.act_qr),
-        k::base(&sm.act_qr_s),
-        layer.wq_b.w.ptr(),
-        layer.wq_b.s.ptr(),
-        k::base(&sm.q),
-        m,
-        heads * hd,
-        cfg.q_lora as usize,
-    );
+    gemm_q8(c, &layer.wq_b, k::base(&sm.act_qr), k::base(&sm.act_qr_s), k::base(&sm.q), m, heads * hd, cfg.q_lora as usize);
     k::rope_uniform_pos_buf(
         c,
         k::base(&sm.q),
@@ -4439,17 +4357,7 @@ fn attention_step_m(
         // current slot was already seeded by decode(), so this is the same
         // value rewritten through the shared DSpark forward path.
         k::emit8(c, k::base(kv_x), k::base(&sm.act_x), k::base(&sm.act_x_s), dim);
-        k::fp8_gemm(
-            c,
-            k::base(&sm.act_x),
-            k::base(&sm.act_x_s),
-            layer.wkv.w.ptr(),
-            layer.wkv.s.ptr(),
-            k::base(&sm.kvrow),
-            1,
-            hd,
-            dim,
-        );
+        gemm_q8(c, &layer.wkv, k::base(&sm.act_x), k::base(&sm.act_x_s), k::base(&sm.kvrow), 1, hd, dim);
         let ring = k::row(&caches.kv_all[l], (pos0 as usize % win) * hd, hd);
         k::rmsnorm(c, k::base(&sm.kvrow), k::base(&layer.kv_norm_w), ring, hd, eps);
         k::rope(
@@ -4468,17 +4376,7 @@ fn attention_step_m(
         // Draft KVs are transient rows after the window. Every draft query
         // attends every draft row (non-causal block attention).
         k::emit8(c, k::base(&sm.x), k::base(&sm.act_x), k::base(&sm.act_x_s), m * dim);
-        k::fp8_gemm(
-            c,
-            k::base(&sm.act_x),
-            k::base(&sm.act_x_s),
-            layer.wkv.w.ptr(),
-            layer.wkv.s.ptr(),
-            k::base(&sm.kvrow),
-            m,
-            hd,
-            dim,
-        );
+        gemm_q8(c, &layer.wkv, k::base(&sm.act_x), k::base(&sm.act_x_s), k::base(&sm.kvrow), m, hd, dim);
         for i in 0..m {
             let draft = k::row(&caches.kv_all[l], (win + i) * hd, hd);
             k::rmsnorm(
@@ -4534,17 +4432,7 @@ fn attention_step_m(
         k::base(&sm.act_x_s),
         m * dim,
     );
-    k::fp8_gemm(
-        c,
-        k::base(&sm.act_x),
-        k::base(&sm.act_x_s),
-        layer.wkv.w.ptr(),
-        layer.wkv.s.ptr(),
-        k::base(&sm.kvrow),
-        m,
-        hd,
-        dim,
-    );
+    gemm_q8(c, &layer.wkv, k::base(&sm.act_x), k::base(&sm.act_x_s), k::base(&sm.kvrow), m, hd, dim);
     for i in 0..m {
         let pos = pos0 + i as u64;
         let slot = (pos % win as u64) as usize;
@@ -4854,17 +4742,7 @@ fn attention_step_m(
         k::base(&sm.act_fl_s),
         m * og * ol,
     );
-    k::fp8_gemm(
-        c,
-        k::base(&sm.act_fl),
-        k::base(&sm.act_fl_s),
-        layer.wo_b.w.ptr(),
-        layer.wo_b.s.ptr(),
-        k::base(&sm.attn_out),
-        m,
-        dim,
-        og * ol,
-    );
+    gemm_q8(c, &layer.wo_b, k::base(&sm.act_fl), k::base(&sm.act_fl_s), k::base(&sm.attn_out), m, dim, og * ol);
     if let Some(comm) = comm.as_deref_mut() {
         for i in 0..m {
             let mut partial = vec![0.0f32; dim];
@@ -5096,28 +4974,8 @@ fn moe_step_m(
 
     // shared expert, batched, added last per row
     let [w1, w2, w3] = &layer.shared_experts;
-    k::fp8_gemm(
-        c,
-        k::base(&sm.act_x),
-        k::base(&sm.act_x_s),
-        w1.w.ptr(),
-        w1.s.ptr(),
-        k::base(&sm.gate_buf),
-        m,
-        inter,
-        dim,
-    );
-    k::fp8_gemm(
-        c,
-        k::base(&sm.act_x),
-        k::base(&sm.act_x_s),
-        w3.w.ptr(),
-        w3.s.ptr(),
-        k::base(&sm.up_buf),
-        m,
-        inter,
-        dim,
-    );
+    gemm_q8(c, w1, k::base(&sm.act_x), k::base(&sm.act_x_s), k::base(&sm.gate_buf), m, inter, dim);
+    gemm_q8(c, w3, k::base(&sm.act_x), k::base(&sm.act_x_s), k::base(&sm.up_buf), m, inter, dim);
     k::swiglu(
         c,
         k::base(&sm.gate_buf),
@@ -5133,17 +4991,7 @@ fn moe_step_m(
         k::base(&sm.act_h_s),
         m * inter,
     );
-    k::fp8_gemm(
-        c,
-        k::base(&sm.act_h),
-        k::base(&sm.act_h_s),
-        w2.w.ptr(),
-        w2.s.ptr(),
-        k::base(&sm.expert_y),
-        m,
-        dim,
-        inter,
-    );
+    gemm_q8(c, w2, k::base(&sm.act_h), k::base(&sm.act_h_s), k::base(&sm.expert_y), m, dim, inter);
     k::acc_f32(c, k::base(&sm.expert_y), k::base(&sm.y_moe), m * dim);
 
     Ok(())

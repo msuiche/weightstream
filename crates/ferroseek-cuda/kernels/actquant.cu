@@ -76,3 +76,18 @@ extern "C" __global__ void act_quant_fp8_emit(
         q[(size_t)group * 32 + threadIdx.x] = f32_to_e4m3_bits(y);
     }
 }
+
+// Expand the emit format's UE8M0 bytes into TileLang's packed words:
+// four consecutive K32 exponents per uint32, little-endian byte order.
+extern "C" __global__ void pack_scale_words(
+    const uint8_t* __restrict__ src,
+    uint32_t* __restrict__ dst,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n / 128) return;
+    dst[i] = (uint32_t)src[i * 4]
+        | ((uint32_t)src[i * 4 + 1] << 8)
+        | ((uint32_t)src[i * 4 + 2] << 16)
+        | ((uint32_t)src[i * 4 + 3] << 24);
+}

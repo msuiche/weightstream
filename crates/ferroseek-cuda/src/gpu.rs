@@ -22,6 +22,15 @@ const SAMPLE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/sample.ptx"));
 const MOE_GROUPED_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_grouped.ptx"));
 const FP8_GEMM_TILE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fp8_gemm_tile.ptx"));
 const FP4_GEMM_TILE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fp4_gemm_tile.ptx"));
+const TL_Q_A_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/q_a.ptx"));
+const TL_Q_B_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/q_b.ptx"));
+const TL_WKV_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/wkv.ptx"));
+const TL_WO_A_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/wo_a.ptx"));
+const TL_WO_B_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/wo_b.ptx"));
+const TL_SHARED_W13_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/shared_w13.ptx"));
+const TL_SHARED_W2_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/shared_w2.ptx"));
+const TL_ENGRAM_WKV_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/engram_wkv.ptx"));
+const TL_DRAFTER_MAIN_PROJ_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/drafter_main_proj.ptx"));
 
 pub struct Cuda {
     pub context: Context,
@@ -45,6 +54,15 @@ pub struct Cuda {
     pub moe_grouped: Module,
     pub fp8_gemm_tile: Module,
     pub fp4_gemm_tile: Module,
+    pub tl_q_a: Module,
+    pub tl_q_b: Module,
+    pub tl_wkv: Module,
+    pub tl_wo_a: Module,
+    pub tl_wo_b: Module,
+    pub tl_shared_w13: Module,
+    pub tl_shared_w2: Module,
+    pub tl_engram_wkv: Module,
+    pub tl_drafter_main_proj: Module,
 }
 
 static CUDA: Mutex<Option<Cuda>> = Mutex::new(None);
@@ -87,6 +105,15 @@ impl Cuda {
                 Module::from_ptx(FP8_GEMM_TILE_PTX, &[]).expect("fp8_gemm_tile module");
             let fp4_gemm_tile =
                 Module::from_ptx(FP4_GEMM_TILE_PTX, &[]).expect("fp4_gemm_tile module");
+            let tl_q_a = Module::from_ptx(TL_Q_A_PTX, &[]).expect("tilelang q_a module");
+            let tl_q_b = Module::from_ptx(TL_Q_B_PTX, &[]).expect("tilelang q_b module");
+            let tl_wkv = Module::from_ptx(TL_WKV_PTX, &[]).expect("tilelang wkv module");
+            let tl_wo_a = Module::from_ptx(TL_WO_A_PTX, &[]).expect("tilelang wo_a module");
+            let tl_wo_b = Module::from_ptx(TL_WO_B_PTX, &[]).expect("tilelang wo_b module");
+            let tl_shared_w13 = Module::from_ptx(TL_SHARED_W13_PTX, &[]).expect("tilelang shared_w13 module");
+            let tl_shared_w2 = Module::from_ptx(TL_SHARED_W2_PTX, &[]).expect("tilelang shared_w2 module");
+            let tl_engram_wkv = Module::from_ptx(TL_ENGRAM_WKV_PTX, &[]).expect("tilelang engram_wkv module");
+            let tl_drafter_main_proj = Module::from_ptx(TL_DRAFTER_MAIN_PROJ_PTX, &[]).expect("tilelang main_proj module");
             *guard = Some(Cuda {
                 context,
                 device,
@@ -109,6 +136,15 @@ impl Cuda {
                 moe_grouped,
                 fp8_gemm_tile,
                 fp4_gemm_tile,
+                tl_q_a,
+                tl_q_b,
+                tl_wkv,
+                tl_wo_a,
+                tl_wo_b,
+                tl_shared_w13,
+                tl_shared_w2,
+                tl_engram_wkv,
+                tl_drafter_main_proj,
             });
         }
         // tests run on many threads; the lock holder always becomes current

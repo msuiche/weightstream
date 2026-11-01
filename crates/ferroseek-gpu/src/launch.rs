@@ -10,6 +10,7 @@ pub type F32 = DevicePointer<f32>;
 pub type U8 = DevicePointer<u8>;
 pub type U16 = DevicePointer<u16>;
 pub type I32 = DevicePointer<i32>;
+pub type U32 = DevicePointer<u32>;
 pub type I64 = DevicePointer<i64>;
 
 /// Pointer to `buf[a..a+n]`.
@@ -279,6 +280,68 @@ pub fn emit8(c: &Cuda, x: F32, q: U8, s: U8, n: usize) {
     let f = c.actquant.get_function("act_quant_fp8_emit").unwrap();
     let stream = &c.stream;
     unsafe { launch!(f<<<gx(n, 32), 32, 0, stream>>>(x, q, s, n as i32)).unwrap() }
+}
+
+pub fn pack_scales(c: &Cuda, src: U8, dst: U32, n: usize) {
+    let f = c.actquant.get_function("pack_scale_words").unwrap();
+    let stream = &c.stream;
+    let words = n / 128;
+    unsafe {
+        launch!(f<<<gx(words, 256), 256, 0, stream>>>(src, dst, n as i32)).unwrap()
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum TlGemm {
+    Qa,
+    Qb,
+    Wkv,
+    WoA,
+    WoB,
+    SharedW13,
+    SharedW2,
+    EngramWkv,
+    DrafterMainProj,
+}
+
+/// Production TileLang block-scaled tensor-core decode GEMM (M <= 16).
+/// `sa` points at the packed-word half of an activation scale buffer;
+/// `sb` is the weight's upload-time packed scale table.
+pub fn fp8_gemm_tl(
+    c: &Cuda,
+    kind: TlGemm,
+    a: U8,
+    sa: U32,
+    b: U8,
+    sb: U32,
+    out: F32,
+    m: usize,
+) {
+    let (module, grid_x, shared): (_, u32, u32) = match kind {
+        TlGemm::Qa => (&c.tl_q_a, 20, 31_680),
+        TlGemm::Qb => (&c.tl_q_b, 64, 57_024),
+        TlGemm::Wkv => (&c.tl_wkv, 8, 31_680),
+        TlGemm::WoA => (&c.tl_wo_a, 32, 42_240),
+        TlGemm::WoB => (&c.tl_wo_b, 40, 57_024),
+        TlGemm::SharedW13 => (&c.tl_shared_w13, 36, 31_680),
+        TlGemm::SharedW2 => (&c.tl_shared_w2, 80, 31_680),
+        TlGemm::EngramWkv => (&c.tl_engram_wkv, 400, 31_680),
+        TlGemm::DrafterMainProj => (&c.tl_drafter_main_proj, 20, 31_680),
+    };
+    let f = module.get_function("gemm_mxfp8_kernel").unwrap();
+    unsafe {
+        let status = cust::sys::cuFuncSetAttribute(
+            f.to_raw(),
+            cust::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            shared as i32,
+        );
+        assert_eq!(status, cust::sys::CUresult::CUDA_SUCCESS);
+        let stream = &c.stream;
+        launch!(f<<<(grid_x, (m + 15) as u32 / 16), 128, shared, stream>>>(
+            a, b, out, sa, sb, m as i32, m as i32
+        ))
+        .unwrap()
+    }
 }
 
 /// `fp4_act_quant_snap` (fp4_actquant.cu): e8m0 path (indexer, block 32)

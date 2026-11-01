@@ -44,9 +44,14 @@ fn main() {
 
     let mut built = Vec::new();
     if let Some(nvcc) = nvcc() {
-        let entries: Vec<_> = std::fs::read_dir(kernels_dir)
+        let mut entries: Vec<_> = std::fs::read_dir(kernels_dir)
             .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect())
             .unwrap_or_default();
+        entries.extend(
+            std::fs::read_dir(kernels_dir.join("tilelang"))
+                .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        );
         for path in entries {
             if path.extension().and_then(|e| e.to_str()) != Some("cu") {
                 continue;
@@ -64,6 +69,9 @@ fn main() {
             cmd.args(["-ptx", "-arch=compute_121", "-O3"]);
             if stem == "moe" {
                 cmd.arg("-fmad=false");
+            }
+            if path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) == Some("tilelang") {
+                cmd.arg("-I").arg("vendor");
             }
             cmd.arg("-o").arg(&ptx).arg(&path);
             let status = cmd.status().expect("nvcc run");
