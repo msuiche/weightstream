@@ -2107,7 +2107,7 @@ impl<'a> GpuModel<'a> {
         };
         prof.steps += 1;
         prof.add_us(4, t_head);
-        self.seed_drafter(position)?;
+        self.seed_drafter(c, position)?;
         Ok(out)
     }
 
@@ -4201,15 +4201,11 @@ impl<'a> GpuModel<'a> {
         Ok(main_x)
     }
 
-    fn seed_drafter(&mut self, position: u64) -> io::Result<()> {
+    fn seed_drafter(&mut self, c: &Cuda, position: u64) -> io::Result<()> {
         let Some(drafter) = self.drafter.take() else {
             return Ok(());
         };
         let result = (|| {
-            let guard = Cuda::global();
-            let c = guard
-                .as_ref()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "cuda init"))?;
             let main_x = Self::drafter_main_x(c, &drafter, &self.main_hiddens, &self.cfg)?;
             let dim = self.cfg.dim as usize;
             let hd = self.cfg.head_dim as usize;
