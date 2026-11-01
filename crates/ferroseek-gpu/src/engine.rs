@@ -3718,10 +3718,15 @@ impl<'a> GpuModel<'a> {
     }
 
     pub fn decode_m(&mut self, tokens: &[u32]) -> io::Result<Vec<Vec<f32>>> {
-        self.decode_layers(tokens, None, None, None, None)
+        let guard = Cuda::global();
+        let c = guard
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "cuda init"))?;
+        self.decode_layers(c, tokens, None, None, None, None)
     }
     fn decode_layers(
         &mut self,
+        c: &Cuda,
         tokens: &[u32],
         cfg_override: Option<&RefConfig>,
         layers_override: Option<&[GpuLayer]>,
@@ -3756,10 +3761,6 @@ impl<'a> GpuModel<'a> {
         if tokens.iter().any(|&t| t >= cfg.vocab) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "token id out of vocab"));
         }
-        let guard = Cuda::global();
-        let c = guard
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "cuda init"))?;
 
         // embedding rows (host bf16 dequant like decode(), or device gather)
         let dim0 = cfg.dim as usize;
@@ -4274,6 +4275,7 @@ impl<'a> GpuModel<'a> {
             std::mem::swap(&mut self.eng_cache, &mut drafter.eng_cache);
             std::mem::swap(&mut self.pos, &mut drafter.pos);
             let result = self.decode_layers(
+                c,
                 &drafts,
                 Some(&dcfg),
                 Some(&drafter.layers),
