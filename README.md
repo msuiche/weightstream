@@ -33,12 +33,14 @@ What works today:
   points plus the logits all-gather
 - **TP4 M-batch prefill** — TP-local `decode_m` batches across the ring;
   132-token A/B prefill 9.625 s vs 12.964 s sequential (25.8% faster)
+- **DSpark speculative decode** — three MTP blocks, target-hidden capture,
+  non-causal draft attention, Markov-biased proposals and greedy target
+  verification; TP4 output is bit-identical across ranks (`--no-spec` for A/B)
 - **Serving** — `ferroseek serve --tp4 --ring ...`: OpenAI-compatible
   endpoint on the head rank, SSE streaming, `temperature`/`top_p`/`seed`
   broadcast with `Phase::Next` so all ranks draw identically
 
-Remaining: speculative decode and multi-request batching on the serving
-path. See
+Remaining: multi-request batching on the serving path. See
 [`docs/architecture.md`](docs/architecture.md),
 [`docs/model-spec.md`](docs/model-spec.md), [`docs/streaming.md`](docs/streaming.md),
 [`docs/transport.md`](docs/transport.md).

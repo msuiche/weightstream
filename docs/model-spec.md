@@ -615,6 +615,11 @@ return (output_ids [B,6], logits [B,5,V], confidence [B,5])
 is never called by a verify loop (`model.py:129-131`); a server must define
 it (see Open questions).
 
+Ferroseek defines greedy acceptance: decode the anchor through the target,
+then accept each draft only when it matches the target's next-token argmax.
+Rejected drafts are never decoded, so target and drafter state contain only
+accepted tokens.
+
 ## 10. Sampling / generation (`generate.py`)
 
 - Tokenizer: `AutoTokenizer.from_pretrained(ckpt_path)` — HF fast tokenizer
