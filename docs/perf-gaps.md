@@ -2,7 +2,7 @@
 
 Handoff for the agent picking up performance work. Everything here is
 measured on the same hardware; sources are cited per claim. Repo state:
-`main` @ `cd3c6f4` (2026-10-31).
+`main` @ `6858d11` (2026-11-01).
 
 ## Hardware and model
 
@@ -25,9 +25,9 @@ The dsv41f lane with GLP-27 fold-site steering armed (α=3.5), TP4 ring,
 DSpark speculative decoding, thermal cap on. Measured by
 `bin/spark bench` on the four-node ring, zero foreign requests:
 
-| metric | GLP-27 lane | ferroseek upload TP4 (2026-10-31) |
+| metric | GLP-27 lane | ferroseek upload TP4 (2026-11-01, no-spec) |
 |---|---|---|
-| decode t/s, single stream (C1) | **58.64** (tpot p50 16.57 ms) | **10.24** (tpot p50 97.20 ms) |
+| decode t/s, single stream (C1) | **58.64** (tpot p50 16.57 ms) | **~13.0** (~77 ms/token) |
 | decode t/s, aggregate (C16) | **215.94** (tpot p50 73.86 ms) | — (single-request lockstep) |
 | cold prefill | **5.3k t/s** (32K / 131K) | not measured at those sizes |
 
@@ -40,10 +40,12 @@ writer overhead.
 Upload validation used `72323e6` plus the worker-barrier fix `b5e6f61`,
 the real 1017 checkpoint, upload mode, and a drained ring. All four ranks
 completed `The capital of France is` → ` Paris.` with 620 collectives.
-The C1 measurement used one model load, a 64-token warm-up request, then
-64 greedy tokens for `The capital of Italy is`; mean 97.635 ms/token,
-p50 97.196 ms, range 84.524–112.863 ms. GLP-27 remains **5.73×** the
-ferroseek C1 throughput. C16 is not an apples-to-apples measurement:
+The older C1 measurement used one model load, a 64-token warm-up request,
+then 64 greedy tokens for `The capital of Italy is`; mean 97.635 ms/token,
+p50 97.196 ms, range 84.524–112.863 ms. GLP was 5.73× faster on that
+measurement and is about 4.5× faster at the current ~77 ms. The current
+64-token run used `Write a long story about a dragon` to avoid early EOS,
+so it is a steady-state C1 data point, not a prompt-matched GLP rerun.
 ferroseek serving serializes requests. No 32K/131K prefill comparison
 was run. Raw logs: `spark-*:/tmp/tp4-upload-rank{0..3}.log` (validation)
 and `spark-*:/tmp/tp4-bench-rank{0..3}.log` (benchmark).
@@ -55,6 +57,41 @@ the trained drafter (64 Italy tokens, 7.137 s, mean 111.509 ms/token), versus
 **10.24 tok/s** without speculation: **0.876×**, a **12.4% regression**.
 Target verification is sequential; no speedup is claimed. Raw logs on the
 driver: `/tmp/tp4-c1-dspark-spark-*.log`.
+
+## Experiment log (2026-11-01) — do not duplicate blindly
+
+- **Grouped TileLang MoE landed (`051c152`).** The correctness fixes were
+  specific: grouped-down reads compacted activation rows (not `route / 6`),
+  M-batch dispatch selects every row's top-k, M=1 SwiGLU consumes
+  `layout_weights`, and dispatch/gate-up take a runtime top-k. The last fix
+  is required for the drafter's `dspark_activated != 6`; without it, stale
+  target routes cause illegal drafter accesses. Real-checkpoint pipeline
+  tests and all four ranks produce ` Paris.` identically.
+- **Active-tile bound + sparse register caching landed (`6858d11`).** Grouped
+  MoE now runs `ceil(routes/32) + min(routes, local_experts)` tiles instead
+  of all 97. This removed the padded SwiGLU/requant work. Sparse attention
+  also caches Q and each selected KV row in registers instead of reading
+  both twice. Short decode is 74.8 ms/token; 64-token C1 is ~77 ms/token.
+  Profile: MXFP8 13.8 ms, sparse attention 10.9 ms, grouped MoE 5.6 ms,
+  BF16 GEMV 3.9 ms per token. Full GPU suite: 28/28.
+- **Warp-shuffle block reduction: REJECTED.** A shared-tree/warp hybrid
+  failed HC and long-decode numerical gates; irregular block sizes made the
+  first version diverge, and the power-of-two path was not transparent
+  either. Reverted completely. Do not retry without a bit-exact proof on HC
+  and long decode, not just a sparse-attention unit test.
+- **Thread-0-only softmax scalarization: REJECTED as performance-neutral.**
+  Computing the two exponentials once per block added a broadcast barrier
+  that offset the saved work. Reverted to per-thread scalar state.
+- **Batched DSpark verification: CORRECT BUT NOT VIABLE YET.** One `decode_m`
+  over five drafts plus snapshot/rollback and accepted-prefix replay passed
+  ` Rome.` on all ranks, but M=5 target verification cost ~0.5–0.8 s and was
+  slower than five M=1 decodes. Reverted to sequential verification. Do not
+  restore batched speculation until `decode_m` beats sequential M=1 on the
+  same short batch. Separate target/drafter M-scratch and runtime top-k fixes
+  remain landed.
+- **Build note:** `cargo clean -p ferroseek-cuda` without `--release` removed
+  nothing useful; use `cargo clean -p ferroseek-cuda --release` when forcing
+  a kernel rebuild. Normal builds were otherwise reliable.
 
 TP4 M-batch prefill measured separately on the same checkpoint: a
 132-token window-crossing prompt took 9.625 s versus 12.964 s with
@@ -129,8 +166,8 @@ Multiplicative, ordered by impact:
 
 ## Already verified — do not redo
 
-- Synthetic GPU suite 25/25 on `spark-4687` (2026-10-30):
-  `cargo test --release -p ferroseek-gpu --features cuda`.
+- Synthetic GPU suite 28/28 on `spark-4687` (2026-11-01):
+  `cargo test --release -p ferroseek-gpu --features cuda -- --test-threads=1`.
 - Real-checkpoint streaming decode (above) — known-answer green.
 - Ring transport: 10.5 µs p50 4 KB all-reduce, zero loss in 100k soak
   (`docs/transport.md`).

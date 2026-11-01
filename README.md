@@ -6,13 +6,12 @@ cache, cluster transport and serving layer are Rust; the tensor-core kernels
 are CUDA, reused from proven stacks first and rewritten only where profiling
 says so.
 
-Status: **TP4 upload mode, 10.6 tok/s.** Real 4-rank decode of the 1017
-checkpoint on the drained ring (2026-10-26): "The capital of France is"
-→ " Paris.", raw logits bit-identical on all four ranks, 94 ms/token in
-lockstep — 12.7× the first 4-rank run, after the nsys-driven kernel pass
-(fused grouped-expert MoE with device-side top-6 dispatch, split hc
-mixes, parallel gate, vectorized fp4/fp8 GEMV loads, parallel engram row
-gather; every change gate-verified bit-exact).
+Status: **TP4 upload mode, ~13 tok/s without speculation.** Real 4-rank
+decode of the 1017 checkpoint on the drained ring (2026-11-01): a 64-token
+greedy story decode runs at roughly 77 ms/token in lockstep. The grouped
+TileLang MoE path consumes only active routing tiles, and sparse attention
+caches Q/KV rows in registers; every landed change passes the 28-test GPU
+suite and the four-rank ` Paris.` identity gate.
 What works today:
 
 - **CPU reference engine** (`ferroseek-ref`) — full DS4.1F decode on the real
