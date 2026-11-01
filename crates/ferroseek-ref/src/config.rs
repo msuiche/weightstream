@@ -17,6 +17,7 @@ pub struct RefConfig {
     pub vocab: u32,
     pub dim: u32,
     pub n_layers: u32,
+    pub n_mtp_layers: u32,
     pub n_heads: u32,
     /// Total per-head Q/V width; the rope tail is inside it (nope + rope).
     pub head_dim: u32,
@@ -54,6 +55,10 @@ pub struct RefConfig {
     pub n_shared: u32,
     pub n_activated: u32,
     pub inter_dim: u32,
+    pub dspark_n_routed: u32,
+    pub dspark_activated: u32,
+    pub dspark_noise_token_id: u32,
+    pub dspark_markov_rank: usize,
     pub score_func: String,
     pub gate_temp: f32,
     pub norm_topk_prob: bool,
@@ -163,6 +168,7 @@ impl RefConfig {
             vocab: cfg.vocab_size,
             dim,
             n_layers,
+            n_mtp_layers: cfg.num_nextn_predict_layers.unwrap_or(0),
             n_heads,
             head_dim,
             rope_dim,
@@ -210,6 +216,14 @@ impl RefConfig {
             n_routed,
             n_shared,
             n_activated,
+            dspark_n_routed: opt_u32(extra, &["dspark_n_routed_experts"])
+                .unwrap_or(128),
+            dspark_activated: opt_u32(extra, &["dspark_num_experts_per_tok"])
+                .unwrap_or(3),
+            dspark_noise_token_id: opt_u32(extra, &["dspark_noise_token_id"])
+                .unwrap_or(128_799),
+            dspark_markov_rank: opt_u32(extra, &["dspark_markov_rank"])
+                .unwrap_or(256) as usize,
             inter_dim,
             score_func: opt_string(extra, &["score_func", "scoring_func"])
                 .unwrap_or_else(|| "sqrtsoftplus".into()),

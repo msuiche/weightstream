@@ -10,7 +10,7 @@ USAGE:
     ferroseek info <model-dir>     Parse config.json, print shape and KV sizing
     ferroseek weights <model-dir>  Validate shard coverage against the DS4.1F census
     ferroseek tokens <model-dir> <text>  Encode text, print token ids
-    ferroseek decode <model-dir> <prompt> [max-tokens] [--engine cpu|gpu] [--stream] [--max-seq N]
+    ferroseek decode <model-dir> <prompt> [max-tokens] [--engine cpu|gpu] [--stream] [--max-seq N] [--no-spec]
                                    [--tp4 --rank N --ring nodes-ring4.local.json]
                                    [--prompts-file path]  More requests after the first (one per line)
                                    [--temperature T] [--top-p P] [--seed N]  Sampling (0 = greedy)
@@ -172,8 +172,23 @@ trait Decoder {
     fn reset(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+    fn can_speculate(&self) -> bool {
+        false
+    }
+    fn disable_speculation(&mut self) {}
+
+    fn speculate(
+        &mut self,
+        position: u64,
+        anchor: u32,
+    ) -> std::io::Result<(Vec<u32>, u64, Vec<f32>)> {
+        let _ = (position, anchor);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "speculative decode is only available on the GPU engine",
+        ))
+    }
     /// Prefill a whole prompt (serving). The GPU engine's override uses
-    /// the prefix cache — the default is the plain per-token decode.
     fn decode_prefill(&mut self, ids: &[u32]) -> std::io::Result<Vec<f32>> {
         let mut logits = Vec::new();
         for (n, &t) in ids.iter().enumerate() {
@@ -227,6 +242,19 @@ impl Decoder for ferroseek_gpu::engine::GpuModel<'static> {
                 }
             }
         }
+    }
+    fn can_speculate(&self) -> bool {
+        ferroseek_gpu::engine::GpuModel::can_speculate(self)
+    }
+    fn disable_speculation(&mut self) {
+        ferroseek_gpu::engine::GpuModel::disable_speculation(self);
+    }
+    fn speculate(
+        &mut self,
+        position: u64,
+        anchor: u32,
+    ) -> std::io::Result<(Vec<u32>, u64, Vec<f32>)> {
+        ferroseek_gpu::engine::GpuModel::speculate(self, position, anchor)
     }
 }
 fn ferroseek_gpu_stream_env() -> bool {
@@ -326,6 +354,7 @@ fn build_engine(
     Ok(Box::new(model))
 }
 
+
 /// `decode <model-dir> <prompt> [max-tokens] [--force-ids "1,2,3"] [--logits-out path]`
 fn cmd_decode(args: &[String]) -> ExitCode {
     let (Some(dir), Some(prompt)) = (args.get(1), args.get(2)) else {
@@ -348,6 +377,7 @@ fn cmd_decode(args: &[String]) -> ExitCode {
     let mut top_p: f32 = 1.0;
     let mut seed: u64 = ferroseek_ref::REFERENCE_SEED;
     let mut tp_wait_ms: u64 = 60_000;
+    let mut no_spec = false;
     let mut i = 4;
     while i < args.len() {
         match args[i].as_str() {
@@ -393,6 +423,10 @@ fn cmd_decode(args: &[String]) -> ExitCode {
             "--max-seq" if i + 1 < args.len() => {
                 max_seq = args[i + 1].parse().unwrap_or(max_seq);
                 i += 2;
+            }
+            "--no-spec" => {
+                no_spec = true;
+                i += 1;
             }
             "--tp4" => {
                 tp4 = true;
@@ -483,6 +517,9 @@ fn cmd_decode(args: &[String]) -> ExitCode {
             }
         }
     };
+    if no_spec {
+        model.disable_speculation();
+    }
     eprintln!("model loaded in {:?}", t0_load.elapsed());
     let t_map = std::time::Instant::now();
     match ferroseek_tokenizer::engram_map::build_compressed_token_map(&tk) {
@@ -591,7 +628,32 @@ fn cmd_decode(args: &[String]) -> ExitCode {
 
         let mut generated = Vec::new();
         let mut forced = force_ids.iter();
-        for _ in 0..max_tokens {
+        let speculative = !no_spec && model.can_speculate() && force_ids.is_empty() && logits_out.is_none() && logits_raw.is_none();
+        while (generated.len() as u32) < max_tokens {
+            if speculative {
+                let anchor = ferroseek_ref::sample::argmax(&logits);
+                let t1 = std::time::Instant::now();
+                match model.speculate(pos, anchor) {
+                    Ok((accepted, new_pos, last)) => {
+                        let start = pos;
+                        let remaining = max_tokens as usize - generated.len();
+                        let eos_at = accepted.iter().position(|&t| Some(t) == tk.eos_token_id);
+                        let take = eos_at.map(|i| i + 1).unwrap_or(accepted.len()).min(remaining);
+                        generated.extend_from_slice(&accepted[..take]);
+                        pos = new_pos;
+                        logits = last;
+                        eprintln!("  [{}..{}] {} tokens in {:?}", start + 1, pos, take, t1.elapsed());
+                        if take < accepted.len() || eos_at.is_some() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("speculate@{pos}: {e}");
+                        return None;
+                    }
+                }
+                continue;
+            }
             let next = match forced.next() {
                 Some(&id) => id, // teacher-forced (gate mode)
                 None => ferroseek_ref::sample::argmax(&logits),
@@ -842,6 +904,7 @@ fn cmd_serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    model.disable_speculation();
     if let Err(e) = session.start_barrier() {
         eprintln!("tp4 start barrier: {e}");
         return ExitCode::FAILURE;

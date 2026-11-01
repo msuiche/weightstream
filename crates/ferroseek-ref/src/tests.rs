@@ -273,6 +273,7 @@ fn release_config_json_parses_with_release_key_spellings() {
 
     assert_eq!(r.dim, 5120);
     assert_eq!(r.n_layers, 40);
+    assert_eq!(r.n_mtp_layers, 3);
     assert_eq!(r.n_heads, 64);
     assert_eq!(r.head_dim, 512);
     assert_eq!(r.rope_dim, 64);
@@ -303,6 +304,10 @@ fn release_config_json_parses_with_release_key_spellings() {
     assert_eq!(r.n_activated, 6);
     assert_eq!(r.n_shared, 1);
     assert_eq!(r.inter_dim, 2304);
+    assert_eq!(r.dspark_n_routed, 128);
+    assert_eq!(r.dspark_activated, 3);
+    assert_eq!(r.dspark_noise_token_id, 128_799);
+    assert_eq!(r.dspark_markov_rank, 256);
     assert_eq!(r.score_func, "sqrtsoftplus", "scoring_func alias");
     assert_eq!(r.route_scale, 1.5, "routed_scaling_factor alias");
     assert_eq!(r.swiglu_limit, 10.0);
@@ -318,6 +323,7 @@ fn release_config_json_parses_with_release_key_spellings() {
     assert_eq!(&r.compress_ratios[..4], &[0, 0, 2, 2]);
     assert_eq!(r.compress_ratios[20], 1);
     assert_eq!(r.compress_ratios[39], 1);
+    assert_eq!(r.compress_ratios.len(), 40);
     // the engram layout the release table row counts must cover
     let layout = crate::engram::EngramLayout::build(&r).unwrap();
     assert_eq!(layout.layer_ids, vec![1, 14]);

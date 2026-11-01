@@ -520,7 +520,20 @@ pub struct GpuLayer {
     engram_w: Option<GpuEngram>,
 }
 
-/// Per-step scratch, allocated once at build.
+struct GpuDrafter {
+    layers: Vec<GpuLayer>,
+    caches: GpuCaches,
+    run: RunState,
+    eng_cache: Vec<i64>,
+    pos: u64,
+    main_proj: Q8,
+    main_norm: D<f32>,
+    markov_embed: D<f32>,
+    markov_head: D<f32>,
+    norm: D<f32>,
+}
+
+ /// Per-step scratch, allocated once at build.
 struct Scratch {
     h: [D<f32>; 2],
     x: D<f32>,
@@ -626,6 +639,7 @@ pub struct CacheSnapshot {
     comp_score: Vec<D<f32>>,
     run: RunState,
     eng_cache: Vec<i64>,
+    drafter_kv_all: Vec<D<f32>>,
 }
 
 /// The GPU decode engine.
@@ -667,10 +681,10 @@ pub struct GpuModel<'a> {
     pub comm: Option<Box<dyn Collectives>>,
     /// Decode-section profiler (`FERROSEEK_PROF`, see [`Prof`]).
     pub prof: Prof,
+    /// Drafter modules and captured target-layer hidden means.
+    drafter: Option<GpuDrafter>,
+    main_hiddens: Vec<D<f32>>,
     /// Prefix cache (serving): snapshots of per-request state keyed by
-    /// the token ids that produced them, so a request sharing a prefix
-    /// prefills only the remainder (see `decode_prefill`). Bounded —
-    /// each snapshot is ~82 MB of device memory.
     prefix_cache: Vec<(Vec<u32>, CacheSnapshot)>,
 }
 
@@ -891,20 +905,24 @@ fn upload_layer(
     arena: Option<&crate::stream::HostArena>,
     sh: &Sharding,
 ) -> io::Result<GpuLayer> {
-    let p = format!("layers.{l}");
+    let (p, n_routed) = if l >= cfg.n_layers as usize {
+        (format!("mtp.{}", l - cfg.n_layers as usize), cfg.dspark_n_routed as usize)
+    } else {
+        (format!("layers.{l}"), cfg.n_routed as usize)
+    };
     let dim = cfg.dim as usize;
     let hd = cfg.head_dim as usize;
     let inh = cfg.index_n_heads as usize;
     let ihd = cfg.index_head_dim as usize;
-    let ratio = cfg.compress_ratios[l];
+    let ratio = if l >= cfg.n_layers as usize { 0 } else { cfg.compress_ratios[l] };
     // TP4 locals (spec §3): 16 heads, 2 o-groups, 8 index heads, 96 experts
     let world = sh.world_size as usize;
     let rank = sh.rank as usize;
     let heads_l = cfg.n_heads as usize / world;
     let og_l = cfg.o_groups as usize / world;
     let inh_l = inh / world;
-    let e_start = rank * cfg.n_routed as usize / world;
-    let e_len = cfg.n_routed as usize / world;
+    let e_start = rank * n_routed / world;
+    let e_len = n_routed / world;
     let idx_src = cfg.index_sources.contains(&(l as u32)) && ratio > 0;
 
     let layer = l as u32;
@@ -1154,7 +1172,7 @@ fn upload_layer(
     )?;
     let gate_w = up_u16(c, &{
         let v = store.get(&format!("{p}.ffn.gate.weight"))?;
-        let n = cfg.n_routed as usize * dim;
+        let n = n_routed * dim;
         if v.bytes.len() != n * 2 {
             return ioerr("gate weight size mismatch".into());
         }
@@ -1238,7 +1256,7 @@ fn upload_layer(
 // ---------------------------------------------------------------------------
 // decode
 
-impl GpuModel<'static> {
+impl<'a> GpuModel<'a> {
     /// Install the tokenizer-derived compressed id map (engram; spec §11).
     pub fn set_token_map(&mut self, map: Vec<i64>) {
         self.token_map = Some(map);
@@ -1336,6 +1354,15 @@ impl GpuModel<'static> {
                 buf.copy_from(&host).map_err(cuda_err)?;
             }
         }
+        if let Some(drafter) = self.drafter.as_mut() {
+            for buf in drafter.caches.kv_all.iter_mut() {
+                zero(buf)?;
+            }
+            drafter.eng_cache.clear();
+            drafter.pos = 0;
+            drafter.run.shared_n_sel = 0;
+        }
+        self.main_hiddens.clear();
         self.eng_cache.clear();
         let n_sources = self.run.compress_len.len();
         self.run = RunState {
@@ -1379,6 +1406,12 @@ impl GpuModel<'static> {
         for b in self.caches.comp_score.iter().flatten() {
             comp_score.push(clone_buf(b)?);
         }
+        let mut drafter_kv_all = Vec::new();
+        if let Some(drafter) = self.drafter.as_ref() {
+            for b in &drafter.caches.kv_all {
+                drafter_kv_all.push(clone_buf(b)?);
+            }
+        }
         Ok(CacheSnapshot {
             pos: self.pos,
             kv_all,
@@ -1387,6 +1420,7 @@ impl GpuModel<'static> {
             comp_score,
             run: self.run.clone(),
             eng_cache: self.eng_cache.clone(),
+            drafter_kv_all,
         })
     }
 
@@ -1412,6 +1446,11 @@ impl GpuModel<'static> {
             .zip(&snap.comp_score)
         {
             dst.copy_from(src).map_err(cuda_err)?;
+        }
+        if let Some(drafter) = self.drafter.as_mut() {
+            for (dst, src) in drafter.caches.kv_all.iter_mut().zip(&snap.drafter_kv_all) {
+                dst.copy_from(src).map_err(cuda_err)?;
+            }
         }
         self.run = snap.run.clone();
         self.eng_cache = snap.eng_cache.clone();
@@ -1466,7 +1505,7 @@ impl GpuModel<'static> {
             let win = self.cfg.window_size as usize;
             let room = win - (self.pos as usize % win);
             let chunk = (ids.len() - n).min(room);
-            let r = if std::env::var_os("FERROSEEK_SEQ_PREFILL").is_some() {
+            let r = if self.drafter.is_some() || std::env::var_os("FERROSEEK_SEQ_PREFILL").is_some() {
                 Err(io::Error::new(io::ErrorKind::Unsupported, "forced sequential"))
             } else {
                 self.decode_m(&ids[n..n + chunk])
@@ -1542,6 +1581,8 @@ impl GpuModel<'static> {
                 "position beyond max_seq_len",
             ));
         }
+        self.main_hiddens.clear();
+        let capture_drafter = self.drafter.is_some();
         self.pos += 1;
         if token >= self.cfg.vocab {
             return Err(io::Error::new(
@@ -1609,6 +1650,7 @@ impl GpuModel<'static> {
             arena,
             sharding,
             comm,
+            main_hiddens,
             prof,
             ..
         } = self;
@@ -1667,6 +1709,9 @@ impl GpuModel<'static> {
         let mut h_cur = 0usize;
         for li in 0..layers.len() {
             let layer = &layers[li];
+            if capture_drafter {
+                Self::capture_main_hidden(main_hiddens, c, cfg, &s.h[h_cur], layer.layer)?;
+            }
 
             // engram merge before the block (model.py:1264-1266)
             let t_eng = Instant::now();
@@ -2062,6 +2107,7 @@ impl GpuModel<'static> {
         };
         prof.steps += 1;
         prof.add_us(4, t_head);
+        self.seed_drafter(position)?;
         Ok(out)
     }
 
@@ -2391,6 +2437,68 @@ impl<'a> GpuModel<'a> {
         }
         eprintln!("build: {n_layers} layers in {:?}", t_layers.elapsed());
 
+        let n_mtp = cfg.n_mtp_layers as usize;
+        let drafter = if n_mtp > 0 {
+            let mut drafter_layers = Vec::with_capacity(n_mtp);
+            let mut draft_kv = Vec::with_capacity(n_layers + n_mtp);
+            for l in 0..n_layers + n_mtp {
+                if l < n_layers {
+                    draft_kv.push(DeviceBuffer::zeroed(0).map_err(cuda_err)?);
+                    continue;
+                }
+                drafter_layers.push(upload_layer(&cfg, store, c, l, None, arena, sh)?);
+                // Five transient draft rows follow the persistent main-KV window.
+                draft_kv.push(up_zero_f32(c, (win + 5) * hd)?);
+            }
+            Some(GpuDrafter {
+                layers: drafter_layers,
+                caches: GpuCaches {
+                    kv_all: draft_kv,
+                    index_k: Vec::new(),
+                    comp_kv: Vec::new(),
+                    comp_score: Vec::new(),
+                },
+                run: RunState {
+                    compress_len: Vec::new(),
+                    index_k_src: 0,
+                    candidates: Vec::new(),
+                    shared_n_sel: 0,
+                    capture_x: None,
+                    capture_y: None,
+                },
+                eng_cache: Vec::new(),
+                pos: 0,
+                main_proj: load_q8(
+                    store,
+                    c,
+                    arena,
+                    "mtp.0.main_proj.weight",
+                    "mtp.0.main_proj.scale",
+                    WShard::All,
+                )?,
+                main_norm: up_f32(c, &view_f32(store, "mtp.0.main_norm.weight")?)?,
+                markov_embed: up_f32(c, &view_f32(store, &format!("mtp.{}.markov_head.embed.weight", n_mtp - 1))?)?,
+                markov_head: {
+                    let v = store.get(&format!("mtp.{}.markov_head.head.weight", n_mtp - 1))?;
+                    let row_bytes = 256 * dtype_size(v.dtype);
+                    let vl = cfg.vocab as usize / sh.world_size as usize;
+                    let r0 = sh.rank as usize * vl;
+                    if v.dtype != DType::Bf16 || (r0 + vl) * row_bytes > v.bytes.len() {
+                        return ioerr("invalid DSpark Markov head shard".into());
+                    }
+                    let host: Vec<f32> = v.bytes[r0 * row_bytes..(r0 + vl) * row_bytes]
+                        .chunks_exact(2)
+                        .map(|b| ferroseek_core::quant::bf16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+                        .collect();
+                    drop(v);
+                    up_f32(c, &host)?
+                },
+                norm: up_f32(c, &view_f32(store, &format!("mtp.{}.norm.weight", n_mtp - 1))?)?,
+            })
+        } else {
+            None
+        };
+
         // embedding + head as f32 (spec §11: head held fp32; embed is
         // row-gathered)
         // streaming mode reads embedding rows host-side (no 2.6 GB device
@@ -2582,6 +2690,8 @@ impl<'a> GpuModel<'a> {
             sharding: *sh,
             comm: None,
             prof: Prof::from_env(),
+            drafter,
+            main_hiddens: Vec::new(),
             prefix_cache: Vec::new(),
             arena: None,
             store_keepalive: None,
@@ -3585,8 +3695,42 @@ impl<'a> GpuModel<'a> {
     /// position, so the post-pass model state equals m sequential
     /// `decode` calls. v1 bounds: upload mode (TP1 or TP4), and the batch
     /// must not wrap the attention ring (chunk at the window boundary).
+
+    fn capture_main_hidden(
+        main_hiddens: &mut Vec<D<f32>>,
+        c: &Cuda,
+        cfg: &RefConfig,
+        h: &D<f32>,
+        layer: u32,
+    ) -> io::Result<()> {
+        if !matches!(layer, 37 | 38 | 39) {
+            return Ok(());
+        }
+        let dim = cfg.dim as usize;
+        let hc = cfg.hc_mult as usize;
+        let mut hv = vec![0.0f32; hc * dim];
+        h.copy_to(&mut hv).map_err(cuda_err)?;
+        let mean: Vec<f32> = (0..dim)
+            .map(|i| (0..hc).map(|j| hv[j * dim + i]).sum::<f32>() / hc as f32)
+            .collect();
+        main_hiddens.push(up_f32(c, &mean)?);
+        Ok(())
+    }
+
     pub fn decode_m(&mut self, tokens: &[u32]) -> io::Result<Vec<Vec<f32>>> {
+        self.decode_layers(tokens, None, None, None, None)
+    }
+    fn decode_layers(
+        &mut self,
+        tokens: &[u32],
+        cfg_override: Option<&RefConfig>,
+        layers_override: Option<&[GpuLayer]>,
+        kv_x: Option<&D<f32>>,
+        final_norm_override: Option<&D<f32>>,
+    ) -> io::Result<Vec<Vec<f32>>> {
         let m = tokens.len();
+        let cfg = cfg_override.unwrap_or(&self.cfg);
+        let capture_drafter = self.drafter.is_some();
         if m == 0 {
             return Ok(Vec::new());
         }
@@ -3598,7 +3742,7 @@ impl<'a> GpuModel<'a> {
             ));
         }
 
-        let win = self.cfg.window_size as usize;
+        let win = cfg.window_size as usize;
         let pos0 = self.pos;
         if pos0 + m as u64 > self.max_seq {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "batch beyond max_seq_len"));
@@ -3609,7 +3753,7 @@ impl<'a> GpuModel<'a> {
                 "decode_m batch wraps the attention ring: chunk at the window boundary",
             ));
         }
-        if tokens.iter().any(|&t| t >= self.cfg.vocab) {
+        if tokens.iter().any(|&t| t >= cfg.vocab) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "token id out of vocab"));
         }
         let guard = Cuda::global();
@@ -3618,7 +3762,7 @@ impl<'a> GpuModel<'a> {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "cuda init"))?;
 
         // embedding rows (host bf16 dequant like decode(), or device gather)
-        let dim0 = self.cfg.dim as usize;
+        let dim0 = cfg.dim as usize;
         let mut emb_host: Option<Vec<f32>> = None;
         if self.emb.is_none() {
             if let Some(store) = self.store_keepalive.as_mut() {
@@ -3649,7 +3793,7 @@ impl<'a> GpuModel<'a> {
             } else {
                 let token_map = self.token_map.clone();
                 hashes_m.push(hash_ids(
-                    &self.cfg,
+                    cfg,
                     &self.engram,
                     &mut self.eng_cache,
                     token_map.as_deref(),
@@ -3661,12 +3805,12 @@ impl<'a> GpuModel<'a> {
 
         // grow the m-row scratch on demand
         if self.scratch_m.as_ref().map(|s| s.m_max).unwrap_or(0) < m {
-            self.scratch_m = Some(ScratchM::new(&self.cfg, &self.engram, m)?);
+            self.scratch_m = Some(ScratchM::new(cfg, &self.engram, m)?);
         }
 
         let GpuModel {
-            cfg,
-            layers,
+            cfg: cfg_self,
+            layers: layers_self,
             caches,
             scratch: s1,
             scratch_m,
@@ -3681,8 +3825,11 @@ impl<'a> GpuModel<'a> {
             arena,
             sharding,
             comm,
+            main_hiddens,
             ..
         } = self;
+        let cfg = cfg_override.unwrap_or(cfg_self);
+        let layers = layers_override.unwrap_or(layers_self);
         let sm = scratch_m.as_mut().unwrap();
         let arena_opt: Option<&crate::stream::HostArena> = arena.as_ref();
         let sh = *sharding;
@@ -3752,7 +3899,7 @@ impl<'a> GpuModel<'a> {
                 .copy_from(&w)
                 .map_err(cuda_err)?;
             let pos_q: Vec<i32> = (0..m * heads)
-                .map(|r| (pos0 + (r / heads) as u64) as i32)
+                .map(|r| (pos0 + u64::from(layers_override.is_some()) + (r / heads) as u64) as i32)
                 .collect();
             sm.pos_q
                 .index(0..m * heads)
@@ -3763,6 +3910,9 @@ impl<'a> GpuModel<'a> {
         let mut h_cur = 0usize;
         for li in 0..layers.len() {
             let layer = &layers[li];
+            if capture_drafter {
+                Self::capture_main_hidden(main_hiddens, c, cfg, &s1.h[h_cur], layer.layer)?;
+            }
 
             // engram merge (per position: gather -> batched wkv -> merge)
             if let Some(ei) = layer.engram {
@@ -3888,7 +4038,7 @@ impl<'a> GpuModel<'a> {
             );
 
             attention_step_m(
-                c, cfg, layer, sm, s1, caches, run, bands, rope_cos, rope_sin, pos0, m, sh,
+                c, cfg, layer, sm, s1, caches, run, bands, rope_cos, rope_sin, pos0, m, kv_x, sh,
                 comm_opt.as_deref_mut(),
             )?;
 
@@ -3958,6 +4108,7 @@ impl<'a> GpuModel<'a> {
             }
         }
 
+        let final_norm = final_norm_override.unwrap_or(final_norm);
         // tail: collapse, final norm, local vocab head + TP all-gather per row
         let vocab_l = cfg.vocab as usize / world;
         k::hc_pre(
@@ -3986,6 +4137,8 @@ impl<'a> GpuModel<'a> {
                     stream,
                 )?;
                 s1.coll_stage.sync(stream)?;
+
+
                 let full = comm.allgather(&s1.coll_stage.as_f32()[..vocab_l])?;
                 sm.logits
                     .index(i * cfg.vocab as usize..(i + 1) * cfg.vocab as usize)
@@ -4000,6 +4153,189 @@ impl<'a> GpuModel<'a> {
             .map_err(cuda_err)?;
         self.pos += m as u64;
         Ok(out.chunks(cfg.vocab as usize).map(|c| c.to_vec()).collect())
+    }
+
+    fn drafter_main_x(
+        c: &Cuda,
+        drafter: &GpuDrafter,
+        main_hiddens: &[D<f32>],
+        cfg: &RefConfig,
+    ) -> io::Result<D<f32>> {
+        if main_hiddens.len() != 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DSpark requires main_hiddens from layers 37, 38 and 39",
+            ));
+        }
+        let dim = cfg.dim as usize;
+        let mut main_hidden = up_zero_f32(c, 3 * dim)?;
+        for i in 0..3 {
+            main_hidden
+                .index(i * dim..(i + 1) * dim)
+                .copy_from(&main_hiddens[i])
+                .map_err(cuda_err)?;
+        }
+        let act = DeviceBuffer::<u8>::zeroed(3 * dim).map_err(cuda_err)?;
+        let act_s = DeviceBuffer::<u8>::zeroed(3 * dim / 128).map_err(cuda_err)?;
+        k::emit8(c, k::base(&main_hidden), k::base(&act), k::base(&act_s), 3 * dim);
+        let main_x = up_zero_f32(c, dim)?;
+        k::fp8_gemm(
+            c,
+            k::base(&act),
+            k::base(&act_s),
+            drafter.main_proj.w.ptr(),
+            drafter.main_proj.s.ptr(),
+            k::base(&main_x),
+            1,
+            dim,
+            3 * dim,
+        );
+        k::rmsnorm(
+            c,
+            k::base(&main_x),
+            k::base(&drafter.main_norm),
+            k::base(&main_x),
+            dim,
+            cfg.norm_eps,
+        );
+        Ok(main_x)
+    }
+
+    fn seed_drafter(&mut self, position: u64) -> io::Result<()> {
+        let Some(drafter) = self.drafter.take() else {
+            return Ok(());
+        };
+        let result = (|| {
+            let guard = Cuda::global();
+            let c = guard
+                .as_ref()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "cuda init"))?;
+            let main_x = Self::drafter_main_x(c, &drafter, &self.main_hiddens, &self.cfg)?;
+            let dim = self.cfg.dim as usize;
+            let hd = self.cfg.head_dim as usize;
+            let rd = self.cfg.rope_dim as usize;
+            let win = self.cfg.window_size as usize;
+            let act = DeviceBuffer::<u8>::zeroed(dim).map_err(cuda_err)?;
+            let act_s = DeviceBuffer::<u8>::zeroed(dim / 128).map_err(cuda_err)?;
+            let kv = up_zero_f32(c, hd)?;
+            k::emit8(c, k::base(&main_x), k::base(&act), k::base(&act_s), dim);
+            for layer in &drafter.layers {
+                k::fp8_gemm(
+                    c,
+                    k::base(&act),
+                    k::base(&act_s),
+                    layer.wkv.w.ptr(),
+                    layer.wkv.s.ptr(),
+                    k::base(&kv),
+                    1,
+                    hd,
+                    dim,
+                );
+                let ring = k::row(
+                    &drafter.caches.kv_all[layer.layer as usize],
+                    (position as usize % win) * hd,
+                    hd,
+                );
+                k::rmsnorm(c, k::base(&kv), k::base(&layer.kv_norm_w), ring, hd, self.cfg.norm_eps);
+                k::rope(
+                    c,
+                    ring,
+                    k::base(&self.rope_cos[layer.freq]),
+                    k::base(&self.rope_sin[layer.freq]),
+                    1,
+                    hd,
+                    rd,
+                    position,
+                    false,
+                );
+                k::snap8(c, ring, hd);
+            }
+            Ok(())
+        })();
+        self.drafter = Some(drafter);
+        result
+    }
+
+    fn drafter_step(&mut self, anchor: u32, position: u64) -> io::Result<Vec<u32>> {
+        let mut drafter = self.drafter.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "DSpark drafter is not loaded")
+        })?;
+        let result = (|| {
+            let guard = Cuda::global();
+            let c = guard
+                .as_ref()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "cuda init"))?;
+            let main_x = Self::drafter_main_x(c, &drafter, &self.main_hiddens, &self.cfg)?;
+            let mut dcfg = self.cfg.clone();
+            dcfg.n_routed = self.cfg.dspark_n_routed;
+            dcfg.n_activated = self.cfg.dspark_activated;
+            let noise = dcfg.dspark_noise_token_id;
+            let drafts = [anchor, noise, noise, noise, noise];
+            drafter.pos = position;
+            drafter.eng_cache = self.eng_cache[..position as usize].to_vec();
+            std::mem::swap(&mut self.caches, &mut drafter.caches);
+            std::mem::swap(&mut self.run, &mut drafter.run);
+            std::mem::swap(&mut self.eng_cache, &mut drafter.eng_cache);
+            std::mem::swap(&mut self.pos, &mut drafter.pos);
+            let result = self.decode_layers(
+                &drafts,
+                Some(&dcfg),
+                Some(&drafter.layers),
+                Some(&main_x),
+                Some(&drafter.norm),
+            );
+            std::mem::swap(&mut self.caches, &mut drafter.caches);
+            std::mem::swap(&mut self.run, &mut drafter.run);
+            std::mem::swap(&mut self.eng_cache, &mut drafter.eng_cache);
+            std::mem::swap(&mut self.pos, &mut drafter.pos);
+            let rows = result?;
+            let vocab_l = self.cfg.vocab as usize / self.sharding.world_size as usize;
+            let emb = up_zero_f32(c, 256)?;
+            let markov = up_zero_f32(c, vocab_l)?;
+            let mut previous = anchor;
+            let mut ids = Vec::with_capacity(rows.len());
+            for mut row in rows {
+                let idx = DeviceBuffer::from_slice(&[previous as i64]).map_err(cuda_err)?;
+                k::gather_f32(c, k::base(&drafter.markov_embed), k::base(&idx), k::base(&emb), 1, 256);
+                k::f32_gemv(c, k::base(&drafter.markov_head), k::base(&emb), k::base(&markov), vocab_l, 256);
+                let mut local = vec![0.0f32; vocab_l];
+                markov.copy_to(&mut local).map_err(cuda_err)?;
+                let full = match self.comm.as_deref_mut() {
+                    Some(comm) => comm.allgather(&local)?,
+                    None => local,
+                };
+                for (logit, bias) in row.iter_mut().zip(full) {
+                    *logit += bias;
+                }
+                previous = ferroseek_ref::sample::argmax(&row);
+                ids.push(previous);
+            }
+            Ok(ids)
+        })();
+        self.drafter = Some(drafter);
+        result
+    }
+
+    pub fn can_speculate(&self) -> bool {
+        self.drafter.is_some() && !(self.sharding.world_size > 1 && self.arena.is_some())
+    }
+    pub fn disable_speculation(&mut self) {
+        self.drafter = None;
+        self.main_hiddens.clear();
+    }
+
+
+    pub fn speculate(&mut self, position: u64, anchor: u32) -> io::Result<(Vec<u32>, u64, Vec<f32>)> {
+        let mut logits = self.decode(anchor, position)?;
+        let mut accepted = vec![anchor];
+        for draft in self.drafter_step(anchor, position)? {
+            if ferroseek_ref::sample::argmax(&logits) != draft {
+                break;
+            }
+            logits = self.decode(draft, self.pos)?;
+            accepted.push(draft);
+        }
+        Ok((accepted, self.pos, logits))
     }
 }
 
@@ -4020,6 +4356,7 @@ fn attention_step_m(
     rope_sin: &[D<f32>; 2],
     pos0: u64,
     m: usize,
+    kv_x: Option<&D<f32>>,
     sh: Sharding,
     mut comm: Option<&mut (dyn Collectives + 'static)>,
 ) -> io::Result<()> {
@@ -4036,6 +4373,7 @@ fn attention_step_m(
     let inh = cfg.index_n_heads as usize / world;
     let ihd = cfg.index_head_dim as usize;
     let ratio = layer.ratio as u64;
+    let kv_x = kv_x.unwrap_or(&sm.x);
 
     // q path: emit8 -> wq_a -> q_norm -> emit8 -> wq_b -> rope(buf)
     k::emit8(
@@ -4095,7 +4433,109 @@ fn attention_step_m(
         false,
     );
 
+    if layer.layer >= cfg.n_layers {
+        if m != 5 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "DSpark expects five draft rows"));
+        }
+        // Target-token KV at p. The ring contains only target tokens; the
+        // current slot was already seeded by decode(), so this is the same
+        // value rewritten through the shared DSpark forward path.
+        k::emit8(c, k::base(kv_x), k::base(&sm.act_x), k::base(&sm.act_x_s), dim);
+        k::fp8_gemm(
+            c,
+            k::base(&sm.act_x),
+            k::base(&sm.act_x_s),
+            layer.wkv.w.ptr(),
+            layer.wkv.s.ptr(),
+            k::base(&sm.kvrow),
+            1,
+            hd,
+            dim,
+        );
+        let ring = k::row(&caches.kv_all[l], (pos0 as usize % win) * hd, hd);
+        k::rmsnorm(c, k::base(&sm.kvrow), k::base(&layer.kv_norm_w), ring, hd, eps);
+        k::rope(
+            c,
+            ring,
+            k::base(&rope_cos[layer.freq]),
+            k::base(&rope_sin[layer.freq]),
+            1,
+            hd,
+            rd,
+            pos0,
+            false,
+        );
+        k::snap8(c, ring, hd);
+
+        // Draft KVs are transient rows after the window. Every draft query
+        // attends every draft row (non-causal block attention).
+        k::emit8(c, k::base(&sm.x), k::base(&sm.act_x), k::base(&sm.act_x_s), m * dim);
+        k::fp8_gemm(
+            c,
+            k::base(&sm.act_x),
+            k::base(&sm.act_x_s),
+            layer.wkv.w.ptr(),
+            layer.wkv.s.ptr(),
+            k::base(&sm.kvrow),
+            m,
+            hd,
+            dim,
+        );
+        for i in 0..m {
+            let draft = k::row(&caches.kv_all[l], (win + i) * hd, hd);
+            k::rmsnorm(
+                c,
+                k::row(&sm.kvrow, i * hd, hd),
+                k::base(&layer.kv_norm_w),
+                draft,
+                hd,
+                eps,
+            );
+            k::rope(
+                c,
+                draft,
+                k::base(&rope_cos[layer.freq]),
+                k::base(&rope_sin[layer.freq]),
+                1,
+                hd,
+                rd,
+                pos0 + 1 + i as u64,
+                false,
+            );
+            k::snap8(c, draft, hd);
+        }
+        let filled = (pos0 as usize + 1).min(win);
+        let list: Vec<i32> = (0..filled as i32)
+            .chain((win as i32)..(win + m) as i32)
+            .collect();
+        let stride = win + cfg.index_topk as usize;
+        for i in 0..m {
+            sm.shared_idxs
+                .index(i * stride..i * stride + list.len())
+                .copy_from(&list)
+                .map_err(cuda_err)?;
+            k::sparse_attn(
+                c,
+                k::row(&sm.q, i * heads * hd, heads * hd),
+                k::base(&caches.kv_all[l]),
+                sm.shared_idxs.index(i * stride..i * stride + list.len()).as_device_ptr(),
+                k::base(&layer.attn_sink),
+                k::row(&sm.o, i * heads * hd, heads * hd),
+                heads,
+                hd,
+                list.len(),
+                (hd as f32).sqrt().recip(),
+            );
+        }
+    } else {
     // window KV projection (batched), ring writes (per position)
+    k::emit8(
+        c,
+        k::base(kv_x),
+        k::base(&sm.act_x),
+        k::base(&sm.act_x_s),
+        m * dim,
+    );
     k::fp8_gemm(
         c,
         k::base(&sm.act_x),
@@ -4379,6 +4819,7 @@ fn attention_step_m(
             n_sel,
             (hd as f32).sqrt().recip(),
         );
+    }
     }
 
 
