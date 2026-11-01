@@ -36,7 +36,8 @@ What works today:
 - **DSpark speculative decode** — three MTP blocks, target-hidden capture,
   non-causal draft attention, Markov-biased proposals and greedy target
   verification; full-draft acceptance and `--no-spec` output identity verified
-  on TP4. Verification is currently sequential; no tok/s improvement claimed.
+  on TP4. C1 is 8.97 tok/s versus 10.24 without speculation (0.876×);
+  verification is currently sequential, so no speedup is claimed.
 - **Serving** — `ferroseek serve --tp4 --ring ...`: OpenAI-compatible
   endpoint on the head rank, SSE streaming, `temperature`/`top_p`/`seed`
   broadcast with `Phase::Next` so all ranks draw identically

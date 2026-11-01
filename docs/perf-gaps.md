@@ -2,7 +2,7 @@
 
 Handoff for the agent picking up performance work. Everything here is
 measured on the same hardware; sources are cited per claim. Repo state:
-`main` @ `b5e6f61` (2026-10-31).
+`main` @ `cd3c6f4` (2026-10-31).
 
 ## Hardware and model
 
@@ -47,6 +47,14 @@ ferroseek C1 throughput. C16 is not an apples-to-apples measurement:
 ferroseek serving serializes requests. No 32K/131K prefill comparison
 was run. Raw logs: `spark-*:/tmp/tp4-upload-rank{0..3}.log` (validation)
 and `spark-*:/tmp/tp4-bench-rank{0..3}.log` (benchmark).
+
+DSpark correctness landing (`abf63f2`, `a91917a`, `67402d5`): full
+five-draft-plus-anchor acceptance and exact `--no-spec` output identity passed
+on all four ranks. The same C1 method above then measured **8.97 tok/s** for
+the trained drafter (64 Italy tokens, 7.137 s, mean 111.509 ms/token), versus
+**10.24 tok/s** without speculation: **0.876×**, a **12.4% regression**.
+Target verification is sequential; no speedup is claimed. Raw logs on the
+driver: `/tmp/tp4-c1-dspark-spark-*.log`.
 
 TP4 M-batch prefill measured separately on the same checkpoint: a
 132-token window-crossing prompt took 9.625 s versus 12.964 s with
