@@ -90,6 +90,10 @@ driver: `/tmp/tp4-c1-dspark-spark-*.log`.
   so this skips only invalid work and directly targets the slow M=5
   verification path. `cargo check -p ferroseek-gpu` passes; no timing or GPU
   correctness claim is made while the ring is offline.
+- **TMA tensor-map caching (GPU validation pending).** Grouped MoE layers now
+  encode each weight's tensor map once at upload instead of 120 times per
+  token. Kernel inputs and launch geometry are unchanged; `cargo check`
+  passes, with timing and GPU validation deferred while the ring is offline.
 - **Warp-shuffle block reduction: REJECTED.** A shared-tree/warp hybrid
   failed HC and long-decode numerical gates; irregular block sizes made the
   first version diverge, and the power-of-two path was not transparent

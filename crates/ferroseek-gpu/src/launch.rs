@@ -360,7 +360,7 @@ extern "C" {
     ) -> i32;
 }
 
-fn tensor_map_fp4(weights: U8, tiles: usize) -> TensorMap {
+pub(crate) fn tensor_map_fp4(weights: U8, tiles: usize) -> TensorMap {
     let mut map = TensorMap([0; 16]);
     let dims = [128u64, 128, tiles as u64];
     let strides = [1u64, 64, 8192];
@@ -449,16 +449,42 @@ pub fn moe_grouped_tl(
     tokens: usize,
     top_k: usize,
 ) {
-    let (module, n_tiles, tiles_count) = match kind {
-        TlMoe::GateUp => (&c.tl_moe_gate_up, 18, 69120),
-        TlMoe::Down => (&c.tl_moe_down, 40, 69120),
+    let map = tensor_map_fp4(weights, 69120);
+    moe_grouped_tl_cached(
+        c,
+        kind,
+        a,
+        sfa,
+        map,
+        sfb,
+        order,
+        tile_expert,
+        out,
+        tiles,
+        tokens,
+        top_k,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_tl_cached(
+    c: &Cuda,
+    kind: TlMoe,
+    a: U8,
+    sfa: U32,
+    map: TensorMap,
+    sfb: U32,
+    order: I32,
+    tile_expert: I32,
+    out: F32,
+    tiles: usize,
+    tokens: usize,
+    top_k: usize,
+) {
+    let (module, n_tiles) = match kind {
+        TlMoe::GateUp => (&c.tl_moe_gate_up, 18),
+        TlMoe::Down => (&c.tl_moe_down, 40),
     };
-    // Gate/up reads token rows; down reads the grouped SwiGLU layout.
-    let input_rows = match kind {
-        TlMoe::GateUp => tokens,
-        TlMoe::Down => tiles * 32,
-    };
-    let map = tensor_map_fp4(weights, tiles_count);
     let f = module
         .get_function("moe_grouped_fp8_fp4_gemm_kernel")
         .unwrap();

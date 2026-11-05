@@ -520,6 +520,9 @@ pub struct GpuLayer {
     w2s_tl: Option<D<u32>>,
     w3_tl: Option<D<u8>>,
     w3s_tl: Option<D<u32>>,
+    w1_map: Option<k::TensorMap>,
+    w2_map: Option<k::TensorMap>,
+    w3_map: Option<k::TensorMap>,
     shared_experts: [Q8; 3],
     compressor: Option<GpuCompressor>,
     indexer: Option<GpuIndexer>,
@@ -1138,6 +1141,9 @@ fn upload_layer(
     let mut w2s_tl: Option<D<u32>> = None;
     let mut w3_tl: Option<D<u8>> = None;
     let mut w3s_tl: Option<D<u32>> = None;
+    let mut w1_map = None;
+    let mut w2_map = None;
+    let mut w3_map = None;
     if arena.is_none() && e_len > 0 && sh.world_size == 4 {
         let inter = cfg.inter_dim as usize;
         let dim = cfg.dim as usize;
@@ -1173,6 +1179,9 @@ fn upload_layer(
             DeviceBuffer::from_slice(&pack_expert_scales(&b3s, e_len * inter, dim))
                 .map_err(cuda_err)?,
         );
+        w1_map = Some(k::tensor_map_fp4(k::base(w1_tl.as_ref().unwrap()), 69120));
+        w2_map = Some(k::tensor_map_fp4(k::base(w2_tl.as_ref().unwrap()), 69120));
+        w3_map = Some(k::tensor_map_fp4(k::base(w3_tl.as_ref().unwrap()), 69120));
         eprintln!(
             "build: layer {l} experts fused into grouped slabs ({} x 3, {:.1} GB)",
             e_len,
@@ -1351,6 +1360,9 @@ fn upload_layer(
         w2s_tl,
         w3_tl,
         w3s_tl,
+        w1_map,
+        w2_map,
+        w3_map,
         shared_experts,
         compressor,
         indexer,
@@ -3514,12 +3526,11 @@ fn moe_step(
             top_k,
             tiles,
         );
-        k::moe_grouped_tl(
+        k::moe_grouped_tl_cached(
             c,
             k::TlMoe::GateUp,
             k::base(&s.act_x),
-            packed_a,
-            k::base(layer.w1_tl.as_ref().unwrap()),
+            layer.w1_map.unwrap(),
             k::base(layer.w1s_tl.as_ref().unwrap()),
             k::base(&s.order),
             k::base(&s.tile_expert),
@@ -3528,12 +3539,11 @@ fn moe_step(
             1,
             top_k,
         );
-        k::moe_grouped_tl(
+        k::moe_grouped_tl_cached(
             c,
             k::TlMoe::GateUp,
             k::base(&s.act_x),
-            packed_a,
-            k::base(layer.w3_tl.as_ref().unwrap()),
+            layer.w3_map.unwrap(),
             k::base(layer.w3s_tl.as_ref().unwrap()),
             k::base(&s.order),
             k::base(&s.tile_expert),
@@ -3562,12 +3572,12 @@ fn moe_step(
             s.route_q_s.as_device_ptr().as_raw() + (tiles * 32 * inter / 32) as u64,
         );
         k::pack_scales(c, k::base(&s.route_q_s), packed_route, tiles * 32 * inter);
-        k::moe_grouped_tl(
+        k::moe_grouped_tl_cached(
             c,
             k::TlMoe::Down,
             k::base(&s.route_q),
             packed_route,
-            k::base(layer.w2_tl.as_ref().unwrap()),
+            layer.w2_map.unwrap(),
             k::base(layer.w2s_tl.as_ref().unwrap()),
             k::base(&s.order),
             k::base(&s.tile_expert),
@@ -5380,12 +5390,12 @@ fn moe_step_m(
             top_k,
             tiles,
         );
-        k::moe_grouped_tl(
+        k::moe_grouped_tl_cached(
             c,
             k::TlMoe::GateUp,
             k::base(&sm.act_x),
             packed_a,
-            k::base(layer.w1_tl.as_ref().unwrap()),
+            layer.w1_map.unwrap(),
             k::base(layer.w1s_tl.as_ref().unwrap()),
             k::base(&s1.order),
             k::base(&s1.tile_expert),
@@ -5394,12 +5404,12 @@ fn moe_step_m(
             m,
             top_k,
         );
-        k::moe_grouped_tl(
+        k::moe_grouped_tl_cached(
             c,
             k::TlMoe::GateUp,
             k::base(&sm.act_x),
             packed_a,
-            k::base(layer.w3_tl.as_ref().unwrap()),
+            layer.w3_map.unwrap(),
             k::base(layer.w3s_tl.as_ref().unwrap()),
             k::base(&s1.order),
             k::base(&s1.tile_expert),
@@ -5428,12 +5438,12 @@ fn moe_step_m(
             s1.route_q_s.as_device_ptr().as_raw() + (tiles * 32 * inter / 32) as u64,
         );
         k::pack_scales(c, k::base(&s1.route_q_s), packed_route, tiles * 32 * inter);
-        k::moe_grouped_tl(
+        k::moe_grouped_tl_cached(
             c,
             k::TlMoe::Down,
             k::base(&s1.route_q),
             packed_route,
-            k::base(layer.w2_tl.as_ref().unwrap()),
+            layer.w2_map.unwrap(),
             k::base(layer.w2s_tl.as_ref().unwrap()),
             k::base(&s1.order),
             k::base(&s1.tile_expert),
