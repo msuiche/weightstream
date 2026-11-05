@@ -1604,19 +1604,20 @@ impl<'a> GpuModel<'a> {
                 0
             }
         };
-        // chunked M-batch prefill (decode_m): ring-safe chunks, falling
-        // back to the sequential loop where decode_m is unsupported
-        // (streaming mode, TP). FERROSEEK_SEQ_PREFILL forces sequential.
+        // Sequential prefill is the correctness default: real-checkpoint
+        // greedy streams diverge from decode_m, so M-batch is opt-in while
+        // that path lacks an end-to-end identity proof.
         let mut n = start as usize;
         while n < ids.len() {
             let win = self.cfg.window_size as usize;
             let room = win - (self.pos as usize % win);
             let chunk = (ids.len() - n).min(room);
-            let r = if self.drafter.is_some() || std::env::var_os("FERROSEEK_SEQ_PREFILL").is_some()
+            let r = if self.drafter.is_some()
+                || std::env::var_os("FERROSEEK_MBATCH_PREFILL").is_none()
             {
                 Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "forced sequential",
+                    "sequential prefill",
                 ))
             } else {
                 self.decode_m(&ids[n..n + chunk])

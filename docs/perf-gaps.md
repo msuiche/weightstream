@@ -2,7 +2,7 @@
 
 Handoff for the agent picking up performance work. Everything here is
 measured on the same hardware; sources are cited per claim. Repo state:
-`main` @ `6858d11` (2026-11-01).
+`main` @ `b979944` (2026-11-05).
 
 ## Hardware and model
 
@@ -74,6 +74,16 @@ driver: `/tmp/tp4-c1-dspark-spark-*.log`.
   both twice. Short decode is 74.8 ms/token; 64-token C1 is ~77 ms/token.
   Profile: MXFP8 13.8 ms, sparse attention 10.9 ms, grouped MoE 5.6 ms,
   BF16 GEMV 3.9 ms per token. Full GPU suite: 28/28.
+- **Split-KV sparse attention landed (`b979944`).** Long selections use
+  128-entry segments and an ordered merge, matching dsv41f's decode
+  schedule without changing the FP32 cache layout. C1 is ~76.6 ms/token,
+  output-identical to single-pass. Segment reassociation is bounded at
+  6.6e-7 in the unit gate (threshold 1e-5); the full suite is 29/29.
+- **M-batch prefill is now opt-in.** A 64-token story diverged between
+  M-batch-prefill no-spec and sequential-prefill DSpark. Use sequential
+  prefill by default so speculation and no-spec share the same target
+  state; `FERROSEEK_MBATCH_PREFILL=1` enables the faster experimental path
+  for A/B. This does not affect steady-state decode throughput.
 - **Warp-shuffle block reduction: REJECTED.** A shared-tree/warp hybrid
   failed HC and long-decode numerical gates; irregular block sizes made the
   first version diverge, and the power-of-two path was not transparent
@@ -166,7 +176,7 @@ Multiplicative, ordered by impact:
 
 ## Already verified — do not redo
 
-- Synthetic GPU suite 28/28 on `spark-4687` (2026-11-01):
+- Synthetic GPU suite 29/29 on `spark-4687` (2026-11-01):
   `cargo test --release -p ferroseek-gpu --features cuda -- --test-threads=1`.
 - Real-checkpoint streaming decode (above) — known-answer green.
 - Ring transport: 10.5 µs p50 4 KB all-reduce, zero loss in 100k soak
@@ -200,7 +210,8 @@ FERROSEEK_STREAM_BUDGET_GB=24 ./target/release/ferroseek decode "$S" \
 Env knobs: `FERROSEEK_STREAM_BUDGET_GB` (registration budget, default
 96, 0 = off), `FERROSEEK_PROF=1` (per-section decode profiler, prints
 at exit), `FERROSEEK_DUMP_GPU=<dir>` (per-layer/op tensor dumps),
-`FERROSEEK_SEQ_PREFILL=1` (force sequential prefill).
+`FERROSEEK_MBATCH_PREFILL=1` (opt into M-batch prefill; sequential is the
+correctness default).
 
 ## Key code locations
 

@@ -64,12 +64,13 @@ first hc_post.
 Gate (`decode_m_matches_sequential_decode`): 8-position batch vs
 sequential — bit-exact (0.0) on every position AND on two further
 sequential continuation steps; wall 8.0 ms vs 13.9 ms (1.7x) on the
-`decode_prefill` routes through decode_m chunks
-supported (per-expert staging mirrors the m=1 path);
-FERROSEEK_SEQ_PREFILL forces the sequential loop for A/B. TP4 is
-supported: local head/expert shapes, per-position index/attention/MoE
-all-reduces and the vocab all-gather. Sparse attention runs in causal
-order so later window writes cannot clobber earlier rows, and the final
+`decode_prefill` uses the sequential loop by default because the real
+64-token story stream diverged from M-batch prefill even though the
+synthetic gate above is bit-exact. `FERROSEEK_MBATCH_PREFILL=1` opts into
+decode_m chunks for A/B; drafter-loaded models always use sequential
+prefill. TP4 is supported: local head/expert shapes, per-position
+index/attention/MoE all-reduces and the vocab all-gather. Sparse attention
+runs in causal order so later window writes cannot clobber earlier rows, and the final
 top-k list is published for sequential continuation. Real-ring A/B:
 132-token prefill 9.625 s vs 12.964 s sequential (25.8% faster), with
 identical output on all four ranks. New kernels gated bit-exact vs

@@ -30,8 +30,10 @@ What works today:
   --rank N --ring nodes-ring4.local.json`: per-rank slices (16 heads,
   96 experts, vocab shard) with all-reduces at the spec's three reduction
   points plus the logits all-gather
-- **TP4 M-batch prefill** — TP-local `decode_m` batches across the ring;
-  132-token A/B prefill 9.625 s vs 12.964 s sequential (25.8% faster)
+- **TP4 M-batch prefill (opt-in)** — `FERROSEEK_MBATCH_PREFILL=1` enables
+  TP-local `decode_m` batches; sequential prefill is the default until its
+  real-checkpoint greedy-stream divergence is root-caused. The measured
+  132-token A/B was 9.625 s vs 12.964 s sequential (25.8% faster).
 - **DSpark speculative decode** — three MTP blocks, target-hidden capture,
   non-causal draft attention, Markov-biased proposals and greedy target
   verification; full-draft acceptance and `--no-spec` output identity verified
