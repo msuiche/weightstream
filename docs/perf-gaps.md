@@ -84,6 +84,12 @@ driver: `/tmp/tp4-c1-dspark-spark-*.log`.
   prefill by default so speculation and no-spec share the same target
   state; `FERROSEEK_MBATCH_PREFILL=1` enables the faster experimental path
   for A/B. This does not affect steady-state decode throughput.
+- **Offline M-batch selection fix (GPU validation pending).**
+  `attention_step_m` now passes the valid selection length instead of always
+  processing `window + index_topk` entries. The tail was already -1-padded,
+  so this skips only invalid work and directly targets the slow M=5
+  verification path. `cargo check -p ferroseek-gpu` passes; no timing or GPU
+  correctness claim is made while the ring is offline.
 - **Warp-shuffle block reduction: REJECTED.** A shared-tree/warp hybrid
   failed HC and long-decode numerical gates; irregular block sizes made the
   first version diverge, and the power-of-two path was not transparent

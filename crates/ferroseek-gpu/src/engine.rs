@@ -4955,6 +4955,7 @@ fn attention_step_m(
                 false,
             );
             k::snap8(c, ring, hd);
+            let mut selected_len = win;
             if layer.ratio > 0 {
                 let pos = pos0 + i as u64;
                 let compress_len = ((pos + 1) / ratio) as usize;
@@ -5157,6 +5158,7 @@ fn attention_step_m(
                         }
                         let topk = topk_max.min(compress_len);
                         let cmp = select_topk(&score, topk, compress_len, win as i32);
+                        selected_len = win + cmp.len();
                         let wi = window_topk_idxs(win, pos);
                         list[..win].copy_from_slice(&wi);
                         for (j, &v) in cmp.iter().enumerate() {
@@ -5200,16 +5202,17 @@ fn attention_step_m(
                     }
                 }
             }
+            // The list is -1-padded to win + topk_max; only the valid prefix
+            // needs attention. This matters for short M-batch verification.
             let topk_max = cfg.index_topk as usize;
             let (idxs, n_sel) = if layer.ratio > 0 {
+                let n_sel = selected_len;
                 (
                     sm.shared_idxs
                         .index(i * (win + topk_max)..(i + 1) * (win + topk_max))
                         .as_device_ptr(),
-                    win + topk_max,
-                )
-            } else {
-                (
+                    n_sel,
+                )(
                     sm.win_idxs.index(i * win..(i + 1) * win).as_device_ptr(),
                     win,
                 )
