@@ -31,6 +31,11 @@ DSpark speculative decoding, thermal cap on. Measured by
 | decode t/s, aggregate (C16) | **215.94** (tpot p50 73.86 ms) | — (single-request lockstep) |
 | cold prefill | **5.3k t/s** (32K / 131K) | not measured at those sizes |
 
+The later LocalArena engine showdown measured the same spark-ds41f
+TileLang + DSpark stack at **85 tok/s single-stream**, **262 tok/s at eight
+users**, and **6,636 tok/s cold prefill**. Against that newer 85 tok/s
+reference, ferroseek's current ~15.1 tok/s is about **5.6× slower**.
+
 This is the apples-to-apples bar for ferroseek's upload-TP4 work: same
 hardware, same checkpoint, same DSpark spec-decode, steering armed. The
 2026-10-17 reference below is the UNSTEERED stock 1022 lane (a different
@@ -105,6 +110,9 @@ driver: `/tmp/tp4-c1-dspark-spark-*.log`.
   DSpark averages ~72 ms/token versus ~66 ms without speculation, so it is
   still a regression. Target verification remains sequential; no speedup is
   claimed. Full GPU suite: 29/29.
+- **Production restored (2026-11-07).** The promoted GLP-27 TP4 containers
+  are running on all four nodes. `/v1/models` and a completion succeed,
+  steering is active at α=3.5, and live doctor matches the configuration.
 - **Warp-shuffle block reduction: REJECTED.** A shared-tree/warp hybrid
   failed HC and long-decode numerical gates; irregular block sizes made the
   first version diverge, and the power-of-two path was not transparent
