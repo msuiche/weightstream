@@ -3530,6 +3530,7 @@ fn moe_step(
             c,
             k::TlMoe::GateUp,
             k::base(&s.act_x),
+            packed_a,
             layer.w1_map.unwrap(),
             k::base(layer.w1s_tl.as_ref().unwrap()),
             k::base(&s.order),
@@ -3543,6 +3544,7 @@ fn moe_step(
             c,
             k::TlMoe::GateUp,
             k::base(&s.act_x),
+            packed_a,
             layer.w3_map.unwrap(),
             k::base(layer.w3s_tl.as_ref().unwrap()),
             k::base(&s.order),
@@ -5216,13 +5218,14 @@ fn attention_step_m(
             // needs attention. This matters for short M-batch verification.
             let topk_max = cfg.index_topk as usize;
             let (idxs, n_sel) = if layer.ratio > 0 {
-                let n_sel = selected_len;
                 (
                     sm.shared_idxs
                         .index(i * (win + topk_max)..(i + 1) * (win + topk_max))
                         .as_device_ptr(),
-                    n_sel,
-                )(
+                    selected_len,
+                )
+            } else {
+                (
                     sm.win_idxs.index(i * win..(i + 1) * win).as_device_ptr(),
                     win,
                 )

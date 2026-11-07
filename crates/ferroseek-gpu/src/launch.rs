@@ -485,6 +485,11 @@ pub fn moe_grouped_tl_cached(
         TlMoe::GateUp => (&c.tl_moe_gate_up, 18),
         TlMoe::Down => (&c.tl_moe_down, 40),
     };
+    // Gate/up reads token rows; down reads the grouped SwiGLU layout.
+    let input_rows = match kind {
+        TlMoe::GateUp => tokens,
+        TlMoe::Down => tiles * 32,
+    };
     let f = module
         .get_function("moe_grouped_fp8_fp4_gemm_kernel")
         .unwrap();
