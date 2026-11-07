@@ -2,7 +2,7 @@
 
 Handoff for the agent picking up performance work. Everything here is
 measured on the same hardware; sources are cited per claim. Repo state:
-`main` @ `b979944` (2026-11-05).
+`main` @ `3e9aa04` (2026-11-07).
 
 ## Hardware and model
 
@@ -25,9 +25,9 @@ The dsv41f lane with GLP-27 fold-site steering armed (α=3.5), TP4 ring,
 DSpark speculative decoding, thermal cap on. Measured by
 `bin/spark bench` on the four-node ring, zero foreign requests:
 
-| metric | GLP-27 lane | ferroseek upload TP4 (2026-11-01, no-spec) |
+| metric | GLP-27 lane | ferroseek upload TP4 (2026-11-07, no-spec) |
 |---|---|---|
-| decode t/s, single stream (C1) | **58.64** (tpot p50 16.57 ms) | **~13.0** (~77 ms/token) |
+| decode t/s, single stream (C1) | **58.64** (tpot p50 16.57 ms) | **~15.1** (65–67 ms/token) |
 | decode t/s, aggregate (C16) | **215.94** (tpot p50 73.86 ms) | — (single-request lockstep) |
 | cold prefill | **5.3k t/s** (32K / 131K) | not measured at those sizes |
 
@@ -43,9 +43,10 @@ completed `The capital of France is` → ` Paris.` with 620 collectives.
 The older C1 measurement used one model load, a 64-token warm-up request,
 then 64 greedy tokens for `The capital of Italy is`; mean 97.635 ms/token,
 p50 97.196 ms, range 84.524–112.863 ms. GLP was 5.73× faster on that
-measurement and is about 4.5× faster at the current ~77 ms. The current
-64-token run used `Write a long story about a dragon` to avoid early EOS,
-so it is a steady-state C1 data point, not a prompt-matched GLP rerun.
+measurement and is about 3.9× faster at the current 65–67 ms. The current
+story decode used `Write a long story about a dragon` to avoid an immediate
+EOS and produced the same 20-token stream with and without DSpark. This is
+a steady-state C1 data point, not a prompt-matched GLP rerun.
 ferroseek serving serializes requests. No 32K/131K prefill comparison
 was run. Raw logs: `spark-*:/tmp/tp4-upload-rank{0..3}.log` (validation)
 and `spark-*:/tmp/tp4-bench-rank{0..3}.log` (benchmark).
@@ -94,6 +95,16 @@ driver: `/tmp/tp4-c1-dspark-spark-*.log`.
   encode each weight's tensor map once at upload instead of 120 times per
   token. Kernel inputs and launch geometry are unchanged; `cargo check`
   passes, with timing and GPU validation deferred while the ring is offline.
+- **Offline fixes validated (2026-11-07).** CUDA-only issues in the
+  tensor-map extraction and M-batch selection branch were fixed in
+  `3e9aa04`; the full GPU suite passes 29/29 on `spark-4687`. Host-only
+  `cargo check` had not covered those CUDA-only paths.
+- **Current DSpark identity and speed (2026-11-07).** Sequential prefill
+  removed the stream mismatch: DSpark and no-spec both produce
+  `who is afraid of mice. Include a mouse in the story.` on all four ranks.
+  DSpark averages ~72 ms/token versus ~66 ms without speculation, so it is
+  still a regression. Target verification remains sequential; no speedup is
+  claimed. Full GPU suite: 29/29.
 - **Warp-shuffle block reduction: REJECTED.** A shared-tree/warp hybrid
   failed HC and long-decode numerical gates; irregular block sizes made the
   first version diverge, and the power-of-two path was not transparent

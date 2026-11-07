@@ -6,12 +6,11 @@ cache, cluster transport and serving layer are Rust; the tensor-core kernels
 are CUDA, reused from proven stacks first and rewritten only where profiling
 says so.
 
-Status: **TP4 upload mode, ~13 tok/s without speculation.** Real 4-rank
-decode of the 1017 checkpoint on the drained ring (2026-11-01): a 64-token
-greedy story decode runs at roughly 77 ms/token in lockstep. The grouped
-TileLang MoE path consumes only active routing tiles, and sparse attention
-caches Q/KV rows in registers; every landed change passes the 28-test GPU
-suite and the four-rank ` Paris.` identity gate.
+Status: **TP4 upload mode, ~15 tok/s without speculation.** Real 4-rank
+decode of the 1017 checkpoint on the drained ring (2026-11-07): a greedy
+story decode runs at 65–67 ms/token in lockstep. Grouped TileLang MoE,
+active routing tiles, split-KV sparse attention, and cached TMA maps are
+landed; the 29-test GPU suite and four-rank output-identity gates pass.
 What works today:
 
 - **CPU reference engine** (`ferroseek-ref`) — full DS4.1F decode on the real
