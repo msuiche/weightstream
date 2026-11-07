@@ -76,3 +76,23 @@ top-k list is published for sequential continuation. Real-ring A/B:
 identical output on all four ranks. New kernels gated bit-exact vs
 sequential launches: sparse_attn_m, rope_uniform_pos_buf, moe_gate_m,
 rmsnorm_m (same kernel, grid.x = rows).
+
+## Fused sparse-MLA decode (2026-11-07)
+
+For the real DS4.1F shape (16 local heads, head dimension 512), the default
+attention path uses `tilelang/sparse_mla_decode.cu`: a split kernel over FP8
+SWA records and FP4 compressed records, followed by the merge kernel with
+conjugate output RoPE and FP8 activation snapping. Set
+`FERROSEEK_SPARSE_FP32=1` to use the older FP32 gather/attention path for
+A/B debugging.
+
+The kernel's `SwaLengths` is a **valid-prefix length**, not a physical ring
+watermark. GPU index handoff therefore compacts the reference's oldest-first
+window list and pads the tail with `-1`; compressed indices follow the window
+prefix. Cosine and sine tables are separate `[position][32]` arrays, matching
+`rope.cu` (the merge kernel must not use a 64-float interleaved stride).
+
+Verification on the real 1017 checkpoint: four-rank TP4 greedy decode emits
+` Paris.` identically on every rank. A CUDA memcheck run during bring-up was
+clean. The `sparse_mla_packed_window_prefix` regression test covers the
+one-valid-key prefix case that the physical-ring layout used to mask out.

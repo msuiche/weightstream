@@ -527,6 +527,12 @@ pub fn f32_to_bf16(c: &Cuda, x: F32, y: U16, n: usize) {
     unsafe { launch!(f<<<gx(n, 256), 256, 0, stream>>>(x, y, n as i32)).unwrap() }
 }
 
+pub fn copy_u8(c: &Cuda, x: U8, y: U8, n: usize) {
+    let f = c.attn.get_function("copy_u8").unwrap();
+    let stream = &c.stream;
+    unsafe { launch!(f<<<gx(n, 256), 256, 0, stream>>>(x, y, n as i32)).unwrap() }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn sparse_mla_decode(
     c: &Cuda,
@@ -571,7 +577,7 @@ pub fn sparse_mla_decode(
             1, swa_pool as i32, swa_stride as i32
         ))
         .unwrap();
-        launch!(merge<<<(n_heads as u32, 1), 128, 0, stream>>>(
+        launch!(merge<<<(n_heads as u32, 1), 128, 2048, stream>>>(
             cos, sin, out, partial, stats, positions, sinks,
             positions_max as i32, 1, segments as i32
         ))

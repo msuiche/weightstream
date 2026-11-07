@@ -103,6 +103,18 @@ impl Prof {
     }
 }
 
+/// TileLang's sparse kernel treats `SwaLengths` as a valid prefix length.
+/// The reference keeps physical ring order with leading holes, so compact
+/// only the GPU handoff; valid entries retain their oldest-first order.
+fn packed_window_idxs(window: usize, pos: u64) -> Vec<i32> {
+    let mut out: Vec<i32> = window_topk_idxs(window, pos)
+        .into_iter()
+        .filter(|&i| i >= 0)
+        .collect();
+    out.resize(window, -1);
+    out
+}
+
 /// Default decode-position bound; caches are preallocated for it
 /// (docs/kernels.md: never reallocated mid-sequence).
 pub const DEFAULT_MAX_SEQ_LEN: u64 = 65536;
@@ -555,6 +567,11 @@ struct Scratch {
     attn_out: D<f32>,
     attn_part: D<f32>,
     attn_stats: D<f32>,
+    q_bf16: D<u16>,
+    pos_i64: D<i64>,
+    swa_len: D<i32>,
+    idx_len: D<i32>,
+    page_table: D<i32>,
     y_moe: D<f32>,
     gate_buf: D<f32>,
     up_buf: D<f32>,
@@ -634,6 +651,8 @@ struct Scratch {
 /// the index-key cache and the CSA open-pair state.
 struct GpuCaches {
     kv_all: Vec<D<f32>>,
+    kv_swa: Vec<D<u8>>,
+    idx_records: Vec<D<u8>>,
     index_k: Vec<D<f32>>,
     comp_kv: Vec<Option<D<f32>>>,
     comp_score: Vec<Option<D<f32>>>,
@@ -661,6 +680,8 @@ pub struct CacheSnapshot {
     kv_all: Vec<D<f32>>,
     index_k: Vec<D<f32>>,
     comp_kv: Vec<D<f32>>,
+    kv_swa: Vec<D<u8>>,
+    idx_records: Vec<D<u8>>,
     comp_score: Vec<D<f32>>,
     run: RunState,
     eng_cache: Vec<i64>,
@@ -1455,6 +1476,12 @@ impl<'a> GpuModel<'a> {
         for buf in self.caches.kv_all.iter_mut() {
             zero(buf)?;
         }
+        for buf in self.caches.kv_swa.iter_mut() {
+            let _ = buf.set_zero();
+        }
+        for buf in self.caches.idx_records.iter_mut() {
+            let _ = buf.set_zero();
+        }
         for buf in self.caches.index_k.iter_mut() {
             zero(buf)?;
         }
@@ -1514,6 +1541,19 @@ impl<'a> GpuModel<'a> {
             kv_all.push(clone_buf(b)?);
         }
         let mut index_k = Vec::with_capacity(self.caches.index_k.len());
+        let mut kv_swa = Vec::with_capacity(self.caches.kv_swa.len());
+        let mut idx_records = Vec::with_capacity(self.caches.idx_records.len());
+        let clone_u8 = |b: &D<u8>| -> io::Result<D<u8>> {
+            let mut out = unsafe { DeviceBuffer::uninitialized(b.len()) }.map_err(cuda_err)?;
+            out.copy_from(b).map_err(cuda_err)?;
+            Ok(out)
+        };
+        for b in &self.caches.kv_swa {
+            kv_swa.push(clone_u8(b)?);
+        }
+        for b in &self.caches.idx_records {
+            idx_records.push(clone_u8(b)?);
+        }
         for b in &self.caches.index_k {
             index_k.push(clone_buf(b)?);
         }
@@ -1536,6 +1576,8 @@ impl<'a> GpuModel<'a> {
             kv_all,
             index_k,
             comp_kv,
+            kv_swa,
+            idx_records,
             comp_score,
             run: self.run.clone(),
             eng_cache: self.eng_cache.clone(),
@@ -1549,6 +1591,12 @@ impl<'a> GpuModel<'a> {
     /// (same prefix, same weights, bit-identical state) before stepping.
     pub fn restore(&mut self, snap: &CacheSnapshot) -> io::Result<()> {
         for (dst, src) in self.caches.kv_all.iter_mut().zip(&snap.kv_all) {
+            dst.copy_from(src).map_err(cuda_err)?;
+        }
+        for (dst, src) in self.caches.kv_swa.iter_mut().zip(&snap.kv_swa) {
+            dst.copy_from(src).map_err(cuda_err)?;
+        }
+        for (dst, src) in self.caches.idx_records.iter_mut().zip(&snap.idx_records) {
             dst.copy_from(src).map_err(cuda_err)?;
         }
         for (dst, src) in self.caches.index_k.iter_mut().zip(&snap.index_k) {
@@ -1826,7 +1874,7 @@ impl<'a> GpuModel<'a> {
             pre[0] = 1.0;
             s.pre_ffn.copy_from(&pre).map_err(cuda_err)?;
             // window-only idxs for ratio-0 layers
-            let widxs = window_topk_idxs(win, position);
+            let widxs = packed_window_idxs(win, position);
             s.win_idxs.copy_from(&widxs).map_err(cuda_err)?;
         }
 
@@ -2577,6 +2625,8 @@ impl<'a> GpuModel<'a> {
                 layers: drafter_layers,
                 caches: GpuCaches {
                     kv_all: draft_kv,
+                    kv_swa: Vec::new(),
+                    idx_records: Vec::new(),
                     index_k: Vec::new(),
                     comp_kv: Vec::new(),
                     comp_score: Vec::new(),
@@ -2671,6 +2721,10 @@ impl<'a> GpuModel<'a> {
         // index_k + compressor state
         let t_caches = std::time::Instant::now();
         let mut kv_all = Vec::with_capacity(n_layers);
+        let mut kv_swa = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            kv_swa.push(DeviceBuffer::zeroed(win * 528).map_err(cuda_err)?);
+        }
         for l in 0..n_layers {
             let ratio = cfg.compress_ratios[l] as u64;
             let rows = if ratio > 0 {
@@ -2681,6 +2735,18 @@ impl<'a> GpuModel<'a> {
             kv_all.push(up_zero_f32(c, rows * hd)?);
         }
         let mut index_k = Vec::new();
+        let mut idx_records = Vec::with_capacity(n_layers);
+        for l in 0..n_layers {
+            let ratio = cfg.compress_ratios[l] as u64;
+            idx_records.push(
+                DeviceBuffer::zeroed(if ratio > 0 {
+                    (max_seq / ratio + 1) as usize * 288
+                } else {
+                    288
+                })
+                .map_err(cuda_err)?,
+            );
+        }
         let mut comp_kv = Vec::new();
         let mut comp_score = Vec::new();
         for &s in &cfg.kv_sources {
@@ -2702,6 +2768,8 @@ impl<'a> GpuModel<'a> {
 
         // scratch
         let t_scratch = std::time::Instant::now();
+        let page_table_host: Vec<i32> =
+            (0..(cfg.original_seq_len as usize / 64 + 1) as i32).collect();
         let score_cap = cfg
             .kv_sources
             .iter()
@@ -2743,6 +2811,11 @@ impl<'a> GpuModel<'a> {
                 c,
                 ((win + cfg.index_topk as usize).div_ceil(128)) * cfg.n_heads as usize * 2,
             )?,
+            q_bf16: DeviceBuffer::zeroed(cfg.n_heads as usize * hd).map_err(cuda_err)?,
+            pos_i64: DeviceBuffer::zeroed(1).map_err(cuda_err)?,
+            swa_len: DeviceBuffer::zeroed(1).map_err(cuda_err)?,
+            idx_len: DeviceBuffer::zeroed(1).map_err(cuda_err)?,
+            page_table: DeviceBuffer::from_slice(&page_table_host).map_err(cuda_err)?,
             y_moe: up_zero_f32(c, dim)?,
             gate_buf: up_zero_f32(c, cfg.inter_dim as usize)?,
             up_buf: up_zero_f32(c, cfg.inter_dim as usize)?,
@@ -2827,6 +2900,8 @@ impl<'a> GpuModel<'a> {
             layers,
             caches: GpuCaches {
                 kv_all,
+                kv_swa,
+                idx_records,
                 index_k,
                 comp_kv,
                 comp_score,
@@ -3040,6 +3115,10 @@ fn attention_step(
         false,
     );
     k::snap8(c, ring, hd);
+    let packed = caches.kv_swa[l]
+        .index(slot * 528..(slot + 1) * 528)
+        .as_device_ptr();
+    k::emit8(c, ring, packed, k::U8::from_raw(packed.as_raw() + 512), hd);
 
     // compressed path (spec §4-§5)
     let mut latent_ready = false;
@@ -3190,7 +3269,7 @@ fn attention_step(
             // score + selection
             let mut idxs_host;
             if compress_len == 0 {
-                idxs_host = window_topk_idxs(win, pos);
+                idxs_host = packed_window_idxs(win, pos);
             } else {
                 k::indexer_score(
                     c,
@@ -3233,7 +3312,7 @@ fn attention_step(
                 }
                 let topk = (cfg.index_topk as usize).min(compress_len);
                 let cmp = select_topk(&score, topk, compress_len, win as i32);
-                idxs_host = window_topk_idxs(win, pos);
+                idxs_host = packed_window_idxs(win, pos);
                 idxs_host.extend(cmp);
             }
             // partial upload: the buffer is sized for the worst case, the
@@ -3264,6 +3343,25 @@ fn attention_step(
                     false,
                 );
                 k::fp4_snap(c, k::base(&s.latent), hd, 16, true);
+                let rec = caches.idx_records[l]
+                    .index(j * 288..(j + 1) * 288)
+                    .as_device_ptr();
+                k::fp4_emit(
+                    c,
+                    k::base(&s.latent),
+                    rec,
+                    k::U8::from_raw(rec.as_raw() + 256),
+                    hd,
+                    16,
+                );
+                for &cl in &bands[src] {
+                    if cl != src {
+                        let dst = caches.idx_records[cl]
+                            .index(j * 288..(j + 1) * 288)
+                            .as_device_ptr();
+                        k::copy_u8(c, rec, dst, 288);
+                    }
+                }
                 for &cl in &bands[src] {
                     let dst = k::row(&caches.kv_all[cl], win * hd + j * hd, hd);
                     k::copy_f32(c, k::base(&s.latent), dst, hd);
@@ -3286,54 +3384,105 @@ fn attention_step(
         caches.kv_all[l].len(),
         format!("d_pos{pos}_kvall{l}.f32"),
     );
-    if n_sel >= 256 {
-        k::sparse_attn_split(
+    if std::env::var_os("FERROSEEK_SPARSE_FP32").is_some() || heads != 16 || hd != 512 {
+        if n_sel >= 256 {
+            k::sparse_attn_split(
+                c,
+                k::base(&s.q),
+                k::base(&caches.kv_all[l]),
+                idxs,
+                k::base(&layer.attn_sink),
+                k::base(&s.attn_part),
+                k::base(&s.attn_stats),
+                k::base(&s.o),
+                heads,
+                hd,
+                n_sel,
+                (hd as f32).sqrt().recip(),
+            );
+        } else {
+            k::sparse_attn(
+                c,
+                k::base(&s.q),
+                k::base(&caches.kv_all[l]),
+                idxs,
+                k::base(&layer.attn_sink),
+                k::base(&s.o),
+                heads,
+                hd,
+                n_sel,
+                (hd as f32).sqrt().recip(),
+            );
+        }
+        dump_dev(c, &s.o, heads * hd, format!("d_pos{pos}_attnraw{l}.f32"));
+        k::rope_uniform_pos(
             c,
-            k::base(&s.q),
-            k::base(&caches.kv_all[l]),
+            k::base(&s.o),
+            k::base(&rope_cos[layer.freq]),
+            k::base(&rope_sin[layer.freq]),
+            heads,
+            hd,
+            rd,
+            pos,
+            true,
+        );
+        let gdim = heads * hd / og;
+        for g in 0..og {
+            k::snap8(c, k::row(&s.o, g * gdim, gdim), gdim);
+        }
+    } else {
+        let filled = ((pos + 1).min(win as u64)) as i32;
+        let compress_len = if layer.ratio > 0 && run.shared_n_sel > 0 {
+            run.compress_len[run.index_k_src] as i32
+        } else {
+            0
+        };
+        let segments = (filled as usize + compress_len as usize)
+            .div_ceil(128)
+            .max(1);
+        let idx_records = if layer.ratio > 0 {
+            caches.idx_records[l].as_device_ptr()
+        } else {
+            caches.idx_records[0].as_device_ptr()
+        };
+        let ratio = layer.ratio as u64;
+        let idx_pool = if ratio > 0 {
+            ((cfg.original_seq_len as u64 / ratio + 63) / 64) as usize
+        } else {
+            1
+        };
+        s.pos_i64.copy_from(&[pos as i64]).map_err(cuda_err)?;
+        s.swa_len.copy_from(&[filled]).map_err(cuda_err)?;
+        s.idx_len.copy_from(&[compress_len]).map_err(cuda_err)?;
+        k::f32_to_bf16(c, k::base(&s.q), k::base(&s.q_bf16), heads * hd);
+        k::sparse_mla_decode(
+            c,
+            k::base(&s.q_bf16),
+            k::base(&caches.kv_swa[l]),
             idxs,
+            k::base(&s.swa_len),
+            idx_records,
+            k::I32::from_raw(idxs.as_raw() + (win * 4) as u64),
+            k::base(&s.idx_len),
+            k::base(&s.page_table),
             k::base(&layer.attn_sink),
+            k::base(&s.pos_i64),
+            k::base(&rope_cos[layer.freq]),
+            k::base(&rope_sin[layer.freq]),
             k::base(&s.attn_part),
             k::base(&s.attn_stats),
             k::base(&s.o),
             heads,
-            hd,
-            n_sel,
-            (hd as f32).sqrt().recip(),
-        );
-    } else {
-        k::sparse_attn(
-            c,
-            k::base(&s.q),
-            k::base(&caches.kv_all[l]),
-            idxs,
-            k::base(&layer.attn_sink),
-            k::base(&s.o),
-            heads,
-            hd,
-            n_sel,
-            (hd as f32).sqrt().recip(),
+            idx_pool,
+            idx_pool,
+            64 * 288,
+            win,
+            528,
+            cfg.original_seq_len as usize + 1,
+            segments,
         );
     }
-    dump_dev(c, &s.o, heads * hd, format!("d_pos{pos}_attnraw{l}.f32"));
-
-    // inverse rope on the output tail (the cache stays in the query-rotated
-    // form), fp8 snap per group row, block-diagonal wo_a, wo_b
-    k::rope_uniform_pos(
-        c,
-        k::base(&s.o),
-        k::base(&rope_cos[layer.freq]),
-        k::base(&rope_sin[layer.freq]),
-        heads,
-        hd,
-        rd,
-        pos,
-        true,
-    );
     let gdim = heads * hd / og;
-    for g in 0..og {
-        k::snap8(c, k::row(&s.o, g * gdim, gdim), gdim);
-    }
     dump_dev(c, &s.o, heads * hd, format!("d_pos{pos}_osnap{l}.f32"));
     for g in 0..og {
         k::bf16_gemv(
@@ -4214,7 +4363,7 @@ impl<'a> GpuModel<'a> {
         {
             // per-position window idx lists and rope position rows
             let mut w = vec![-1i32; m * win];
-            for (i, wi) in (0..m).map(|i| (i, window_topk_idxs(win, pos0 + i as u64))) {
+            for (i, wi) in (0..m).map(|i| (i, packed_window_idxs(win, pos0 + i as u64))) {
                 w[i * win..(i + 1) * win].copy_from_slice(&wi);
             }
             sm.win_idxs
@@ -4967,6 +5116,10 @@ fn attention_step_m(
                 false,
             );
             k::snap8(c, ring, hd);
+            let packed = caches.kv_swa[l]
+                .index(slot * 528..(slot + 1) * 528)
+                .as_device_ptr();
+            k::emit8(c, ring, packed, k::U8::from_raw(packed.as_raw() + 512), hd);
             let mut selected_len = win;
             if layer.ratio > 0 {
                 let pos = pos0 + i as u64;
@@ -5118,7 +5271,7 @@ fn attention_step_m(
                     let topk_max = cfg.index_topk as usize;
                     let mut list = vec![-1i32; win + topk_max];
                     if compress_len == 0 {
-                        let wi = window_topk_idxs(win, pos);
+                        let wi = packed_window_idxs(win, pos);
                         list[..win].copy_from_slice(&wi);
                         if i + 1 == m {
                             run.shared_n_sel = win;
@@ -5171,7 +5324,7 @@ fn attention_step_m(
                         let topk = topk_max.min(compress_len);
                         let cmp = select_topk(&score, topk, compress_len, win as i32);
                         selected_len = win + cmp.len();
-                        let wi = window_topk_idxs(win, pos);
+                        let wi = packed_window_idxs(win, pos);
                         list[..win].copy_from_slice(&wi);
                         for (j, &v) in cmp.iter().enumerate() {
                             list[win + j] = v;
@@ -5207,6 +5360,25 @@ fn attention_step_m(
                             false,
                         );
                         k::fp4_snap(c, k::base(&s1.latent), hd, 16, true);
+                        let rec = caches.idx_records[l]
+                            .index(j * 288..(j + 1) * 288)
+                            .as_device_ptr();
+                        k::fp4_emit(
+                            c,
+                            k::base(&s1.latent),
+                            rec,
+                            k::U8::from_raw(rec.as_raw() + 256),
+                            hd,
+                            16,
+                        );
+                        for &cl in &bands[src] {
+                            if cl != src {
+                                let dst = caches.idx_records[cl]
+                                    .index(j * 288..(j + 1) * 288)
+                                    .as_device_ptr();
+                                k::copy_u8(c, rec, dst, 288);
+                            }
+                        }
                         for &cl in &bands[src] {
                             let dst = k::row(&caches.kv_all[cl], win * hd + j * hd, hd);
                             k::copy_f32(c, k::base(&s1.latent), dst, hd);

@@ -1892,6 +1892,63 @@ fn sparse_attn_split_matches_single_pass() {
 }
 
 #[test]
+fn sparse_mla_packed_window_prefix() {
+    let guard = Cuda::global();
+    let c = guard.as_ref().unwrap();
+    let (heads, dim, win) = (16usize, 512usize, 128usize);
+    let q = DeviceBuffer::from_slice(&vec![0u16; heads * dim]).unwrap();
+    let swa = DeviceBuffer::from_slice(&vec![0u8; win * 528]).unwrap();
+    let wi: Vec<i32> = std::iter::once(0)
+        .chain(std::iter::repeat_n(-1, win - 1))
+        .collect();
+    let idxs = DeviceBuffer::from_slice(&wi).unwrap();
+    let sl = DeviceBuffer::from_slice(&[1i32]).unwrap();
+    let ir = DeviceBuffer::from_slice(&vec![0u8; 64 * 288]).unwrap();
+    let il = DeviceBuffer::from_slice(&[0i32]).unwrap();
+    let pt = DeviceBuffer::from_slice(&[0i32]).unwrap();
+    let sinks = DeviceBuffer::from_slice(&vec![0f32; heads]).unwrap();
+    let pos = DeviceBuffer::from_slice(&[0i64]).unwrap();
+    let cos = DeviceBuffer::from_slice(&vec![0f32; 64]).unwrap();
+    let sin = DeviceBuffer::from_slice(&vec![0f32; 64]).unwrap();
+    let part = DeviceBuffer::from_slice(&vec![0f32; heads * dim]).unwrap();
+    let stats = DeviceBuffer::from_slice(&vec![0f32; heads * 2]).unwrap();
+    let out = DeviceBuffer::from_slice(&vec![0f32; heads * dim]).unwrap();
+    crate::launch::sparse_mla_decode(
+        c,
+        q.as_device_ptr(),
+        swa.as_device_ptr(),
+        idxs.as_device_ptr(),
+        sl.as_device_ptr(),
+        ir.as_device_ptr(),
+        idxs.as_device_ptr(),
+        il.as_device_ptr(),
+        pt.as_device_ptr(),
+        sinks.as_device_ptr(),
+        pos.as_device_ptr(),
+        cos.as_device_ptr(),
+        sin.as_device_ptr(),
+        part.as_device_ptr(),
+        stats.as_device_ptr(),
+        out.as_device_ptr(),
+        heads,
+        1,
+        1,
+        64 * 288,
+        win,
+        528,
+        1,
+        1,
+    );
+    c.stream.synchronize().unwrap();
+    let mut st = vec![0f32; heads * 2];
+    stats.copy_to(&mut st).unwrap();
+    assert!(
+        st[0].is_finite() && st[1] > 0.0,
+        "packed window prefix must expose its sole valid key"
+    );
+}
+
+#[test]
 fn rope_uniform_pos_buf_bitexact_vs_scalar() {
     // Per-row rope positions must be bit-identical to per-position scalar
     // launches: same rotation arithmetic, position read from a buffer.

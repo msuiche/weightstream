@@ -9,8 +9,8 @@ says so.
 Status: **TP4 upload mode, ~15 tok/s without speculation.** Real 4-rank
 decode of the 1017 checkpoint on the drained ring (2026-11-07): a greedy
 story decode runs at 65–67 ms/token in lockstep. Grouped TileLang MoE,
-active routing tiles, split-KV sparse attention, and cached TMA maps are
-landed; the 29-test GPU suite and four-rank output-identity gates pass.
+active routing tiles, fused quantized sparse-MLA attention, and cached TMA
+maps are landed; the GPU gates and four-rank output-identity checks pass.
 What works today:
 
 - **CPU reference engine** (`ferroseek-ref`) — full DS4.1F decode on the real
@@ -22,6 +22,10 @@ What works today:
 - **GPU decode engine** (`ferroseek-gpu`) — real-checkpoint decode via
   unified-memory weight streaming from page-cache mmaps; tokens identical to
   the CPU engine (` Paris.`)
+- **Fused sparse-MLA attention** — TileLang split/merge kernels consume FP8
+  sliding-window records and FP4 compressed records directly; valid window
+  entries are packed into the kernel's prefix contract. The FP32 attention
+  path remains available as `FERROSEEK_SPARSE_FP32=1` for A/B checks.
 - **TP4 transport** (`ferroseek-transport`) — one-shot two-hop fp32
   all-reduce over the 4-node switchless RoCE ring, bit-exact on all ranks,
   ~10 µs/4 KB, zero packet loss in a 100k soak

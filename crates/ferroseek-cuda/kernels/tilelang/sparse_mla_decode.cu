@@ -369,14 +369,14 @@ extern "C" __global__ void __launch_bounds__(128, 1) sparse_mla_kernel_1(const f
     float second = ((float)O_shared[((((int)threadIdx.x) * 2) + 449)]);
     float condval;
     if (((position < ((int64_t)positions_max)) && ((int64_t)0 <= position))) {
-      condval = Cos[((position * (int64_t)64) + ((int64_t)((int)threadIdx.x)))];
+      condval = Cos[((position * (int64_t)32) + ((int64_t)((int)threadIdx.x)))];
     } else {
       condval = 0x0p+0f/*0.000000e+00*/;
     }
     float cosine = condval;
     float condval_1;
     if (((position < ((int64_t)positions_max)) && ((int64_t)0 <= position))) {
-      condval_1 = Sin[(((position * (int64_t)64) + ((int64_t)((int)threadIdx.x))) + (int64_t)32)];
+      condval_1 = Sin[((position * (int64_t)32) + ((int64_t)((int)threadIdx.x)))];
     } else {
       condval_1 = 0x0p+0f/*0.000000e+00*/;
     }
