@@ -52,3 +52,34 @@ extern "C" __global__ void fp4_act_quant_snap(
         g[threadIdx.x] = f32_to_fp4(y) * s;
     }
 }
+
+// Emit the 288-byte compressed-KV record consumed by sparse_mla: 256 bytes
+// of packed E2M1 (low nibble first) and 32 E4M3 scales, one per 16 values.
+extern "C" __global__ void fp4_act_quant_emit(
+    const float* __restrict__ x,
+    uint8_t* __restrict__ packed,
+    uint8_t* __restrict__ scales,
+    int block_size)
+{
+    int group = blockIdx.x;
+    const float* g = x + (size_t)group * block_size;
+    __shared__ float partial[32];
+    float amax = 0.0f;
+    if (threadIdx.x < block_size) amax = fabsf(g[threadIdx.x]);
+    partial[threadIdx.x] = amax;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + s]);
+        __syncthreads();
+    }
+    amax = fmaxf(partial[0], 6.0f * 0x1p-9f);
+    float s = e4m3_to_f32(f32_to_e4m3_bits(amax / 6.0f));
+    if (threadIdx.x == 0) scales[group] = f32_to_e4m3_bits(amax / 6.0f);
+    if (threadIdx.x < block_size) {
+        float y = fminf(fmaxf(g[threadIdx.x] / s, -6.0f), 6.0f);
+        uint8_t q = (uint8_t)__nv_cvt_float_to_fp4(y, __NV_E2M1, cudaRoundNearest);
+        int i = group * block_size + threadIdx.x;
+        if ((i & 1) == 0) packed[i / 2] = q;
+        else packed[i / 2] |= q << 4;
+    }
+}

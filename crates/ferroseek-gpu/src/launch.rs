@@ -513,6 +513,72 @@ pub fn moe_grouped_tl_cached(
     }
 }
 
+pub fn fp4_emit(c: &Cuda, x: F32, packed: U8, scales: U8, n: usize, block: usize) {
+    let f = c.fp4_actquant.get_function("fp4_act_quant_emit").unwrap();
+    let stream = &c.stream;
+    unsafe {
+        launch!(f<<<(n / block) as u32, 32, 0, stream>>>(x, packed, scales, block as i32)).unwrap()
+    }
+}
+
+pub fn f32_to_bf16(c: &Cuda, x: F32, y: U16, n: usize) {
+    let f = c.attn.get_function("f32_to_bf16").unwrap();
+    let stream = &c.stream;
+    unsafe { launch!(f<<<gx(n, 256), 256, 0, stream>>>(x, y, n as i32)).unwrap() }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn sparse_mla_decode(
+    c: &Cuda,
+    q: U16,
+    swa_records: U8,
+    swa_idxs: I32,
+    swa_len: I32,
+    idx_records: U8,
+    idx_idxs: I32,
+    idx_len: I32,
+    page_table: I32,
+    sinks: F32,
+    positions: I64,
+    cos: F32,
+    sin: F32,
+    partial: F32,
+    stats: F32,
+    out: F32,
+    n_heads: usize,
+    idx_pages: usize,
+    idx_pool: usize,
+    idx_stride: usize,
+    swa_pool: usize,
+    swa_stride: usize,
+    positions_max: usize,
+    segments: usize,
+) {
+    let split = c.tl_sparse_mla.get_function("sparse_mla_kernel").unwrap();
+    let merge = c.tl_sparse_mla.get_function("sparse_mla_kernel_1").unwrap();
+    unsafe {
+        let status = cust::sys::cuFuncSetAttribute(
+            split.to_raw(),
+            cust::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            101376,
+        );
+        assert_eq!(status, cust::sys::CUresult::CUDA_SUCCESS);
+        let stream = &c.stream;
+        launch!(split<<<(segments as u32, 1, 1), 256, 101376, stream>>>(
+            idx_idxs, idx_len, page_table, idx_records, partial, stats, q,
+            swa_idxs, swa_len, swa_records,
+            idx_pages as i32, idx_pool as i32, idx_stride as i32,
+            1, swa_pool as i32, swa_stride as i32
+        ))
+        .unwrap();
+        launch!(merge<<<(n_heads as u32, 1), 128, 0, stream>>>(
+            cos, sin, out, partial, stats, positions, sinks,
+            positions_max as i32, 1, segments as i32
+        ))
+        .unwrap();
+    }
+}
+
 pub fn moe_dispatch_ids(
     c: &Cuda,
     gate_idx: I32,

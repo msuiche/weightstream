@@ -34,6 +34,7 @@ const TL_DRAFTER_MAIN_PROJ_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/d
 const TL_MOE_GATE_UP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_gate_up.ptx"));
 const TL_MOE_DOWN_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_down.ptx"));
 const TL_MOE_DISPATCH_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_dispatch.ptx"));
+const TL_SPARSE_MLA_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/sparse_mla_decode.ptx"));
 
 pub struct Cuda {
     pub context: Context,
@@ -69,6 +70,7 @@ pub struct Cuda {
     pub tl_moe_gate_up: Module,
     pub tl_moe_down: Module,
     pub tl_moe_dispatch: Module,
+    pub tl_sparse_mla: Module,
 }
 
 static CUDA: Mutex<Option<Cuda>> = Mutex::new(None);
@@ -123,6 +125,7 @@ impl Cuda {
             let tl_moe_gate_up = Module::from_ptx(TL_MOE_GATE_UP_PTX, &[]).expect("tilelang moe_gate_up module");
             let tl_moe_down = Module::from_ptx(TL_MOE_DOWN_PTX, &[]).expect("tilelang moe_down module");
             let tl_moe_dispatch = Module::from_ptx(TL_MOE_DISPATCH_PTX, &[]).expect("tilelang moe_dispatch module");
+            let tl_sparse_mla = Module::from_ptx(TL_SPARSE_MLA_PTX, &[]).expect("tilelang sparse_mla module");
             *guard = Some(Cuda {
                 context,
                 device,
@@ -157,6 +160,7 @@ impl Cuda {
                 tl_moe_gate_up,
                 tl_moe_down,
                 tl_moe_dispatch,
+                tl_sparse_mla,
             });
         }
         // tests run on many threads; the lock holder always becomes current

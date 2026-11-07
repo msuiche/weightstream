@@ -6,6 +6,7 @@
 // kv rows are 512-wide f32 latents (window + compressed, concatenated).
 
 #include "common.cuh"
+#include <cuda_bf16.h>
 
 extern "C" __global__ void sparse_attn(
     const float* __restrict__ q,        // [n_heads, dim]
@@ -265,4 +266,13 @@ extern "C" __global__ void sparse_attn_merge(
     float* oh = out + (size_t)h * dim;
     int k = 0;
     for (int d = threadIdx.x; d < dim; d += blockDim.x, k++) oh[d] = acc[k] / s;
+}
+
+extern "C" __global__ void f32_to_bf16(
+    const float* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __float2bfloat16(x[i]);
 }
