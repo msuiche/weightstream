@@ -115,6 +115,10 @@ fn packed_window_idxs(window: usize, pos: u64) -> Vec<i32> {
     out
 }
 
+/// Row width baked into the generated sparse-MLA kernel's indexed-list
+/// layout. DS4.1F uses 128 SWA entries plus 512 compressed entries.
+const SPARSE_MLA_IDX_WIDTH: usize = 2048;
+
 /// Default decode-position bound; caches are preallocated for it
 /// (docs/kernels.md: never reallocated mid-sequence).
 pub const DEFAULT_MAX_SEQ_LEN: u64 = 65536;
@@ -688,6 +692,19 @@ pub struct CacheSnapshot {
     drafter_kv_all: Vec<D<f32>>,
 }
 
+struct SpecSnapshot {
+    pos: u64,
+    run: RunState,
+    eng_cache: Vec<i64>,
+    main_hiddens: Vec<D<f32>>,
+    kv_all: Vec<(usize, usize, Vec<f32>)>,
+    kv_swa: Vec<(usize, usize, Vec<u8>)>,
+    idx_records: Vec<(usize, usize, Vec<u8>)>,
+    index_k: Vec<D<f32>>,
+    comp_kv: Vec<D<f32>>,
+    comp_score: Vec<D<f32>>,
+}
+
 /// The GPU decode engine.
 ///
 /// `'a` is the weight-store lifetime in streaming mode: the model borrows
@@ -715,6 +732,7 @@ pub struct GpuModel<'a> {
     bands: Vec<Vec<usize>>,
     run: RunState,
     pos: u64,
+    spec_accept: usize,
     max_seq: u64,
     /// TP hook (see [`Sharding`]); TP1 for now.
     pub sharding: Sharding,
@@ -1520,6 +1538,134 @@ impl<'a> GpuModel<'a> {
             capture_x: None,
         };
         self.pos = 0;
+        self.spec_accept = 0;
+        Ok(())
+    }
+
+    fn spec_snapshot(&self, m: usize) -> io::Result<SpecSnapshot> {
+        let clone_buf = |b: &D<f32>| -> io::Result<D<f32>> {
+            let mut out = unsafe { DeviceBuffer::uninitialized(b.len()) }.map_err(cuda_err)?;
+            out.copy_from(b).map_err(cuda_err)?;
+            Ok(out)
+        };
+        let win = self.cfg.window_size as usize;
+        let hd = self.cfg.head_dim as usize;
+        let mut kv_all = Vec::new();
+        let mut kv_swa = Vec::new();
+        let mut idx_records = Vec::new();
+        for (l, layer) in self.layers.iter().enumerate() {
+            for i in 0..m {
+                let slot = ((self.pos + i as u64) % win as u64) as usize;
+                let row = slot * hd;
+                let mut values = vec![0.0f32; hd];
+                self.caches.kv_all[l]
+                    .index(row..row + hd)
+                    .copy_to(&mut values)
+                    .map_err(cuda_err)?;
+                kv_all.push((l, row, values));
+                let byte_row = slot * 528;
+                let mut packed = vec![0u8; 528];
+                self.caches.kv_swa[l]
+                    .index(byte_row..byte_row + 528)
+                    .copy_to(&mut packed)
+                    .map_err(cuda_err)?;
+                kv_swa.push((l, byte_row, packed));
+            }
+            let ratio = layer.ratio as u64;
+            if ratio > 0 {
+                let first = ((self.pos + 1) / ratio).saturating_sub(1) as usize;
+                let last = ((self.pos + m as u64) / ratio).saturating_sub(1) as usize;
+                for j in first..=last {
+                    let row = (win + j) * hd;
+                    let mut values = vec![0.0f32; hd];
+                    self.caches.kv_all[l]
+                        .index(row..row + hd)
+                        .copy_to(&mut values)
+                        .map_err(cuda_err)?;
+                    kv_all.push((l, row, values));
+                    let byte_row = j * 288;
+                    let mut packed = vec![0u8; 288];
+                    self.caches.idx_records[l]
+                        .index(byte_row..byte_row + 288)
+                        .copy_to(&mut packed)
+                        .map_err(cuda_err)?;
+                    idx_records.push((l, byte_row, packed));
+                }
+            }
+        }
+        let mut main_hiddens = Vec::with_capacity(self.main_hiddens.len());
+        for b in &self.main_hiddens {
+            main_hiddens.push(clone_buf(b)?);
+        }
+        let mut index_k = Vec::with_capacity(self.caches.index_k.len());
+        for b in &self.caches.index_k {
+            index_k.push(clone_buf(b)?);
+        }
+        let mut comp_kv = Vec::with_capacity(self.caches.comp_kv.len());
+        for b in self.caches.comp_kv.iter().flatten() {
+            comp_kv.push(clone_buf(b)?);
+        }
+        let mut comp_score = Vec::with_capacity(self.caches.comp_score.len());
+        for b in self.caches.comp_score.iter().flatten() {
+            comp_score.push(clone_buf(b)?);
+        }
+        Ok(SpecSnapshot {
+            pos: self.pos,
+            run: self.run.clone(),
+            eng_cache: self.eng_cache.clone(),
+            main_hiddens,
+            kv_all,
+            kv_swa,
+            idx_records,
+            index_k,
+            comp_kv,
+            comp_score,
+        })
+    }
+
+    fn spec_restore(&mut self, snap: &SpecSnapshot) -> io::Result<()> {
+        for (l, row, values) in &snap.kv_all {
+            self.caches.kv_all[*l]
+                .index(*row..*row + values.len())
+                .copy_from(values)
+                .map_err(cuda_err)?;
+        }
+        for (l, row, values) in &snap.kv_swa {
+            self.caches.kv_swa[*l]
+                .index(*row..*row + values.len())
+                .copy_from(values)
+                .map_err(cuda_err)?;
+        }
+        for (l, row, values) in &snap.idx_records {
+            self.caches.idx_records[*l]
+                .index(*row..*row + values.len())
+                .copy_from(values)
+                .map_err(cuda_err)?;
+        }
+        for (dst, src) in self.caches.index_k.iter_mut().zip(&snap.index_k) {
+            dst.copy_from(src).map_err(cuda_err)?;
+        }
+        for (dst, src) in self.caches.comp_kv.iter_mut().flatten().zip(&snap.comp_kv) {
+            dst.copy_from(src).map_err(cuda_err)?;
+        }
+        for (dst, src) in self
+            .caches
+            .comp_score
+            .iter_mut()
+            .flatten()
+            .zip(&snap.comp_score)
+        {
+            dst.copy_from(src).map_err(cuda_err)?;
+        }
+        self.main_hiddens.clear();
+        for src in &snap.main_hiddens {
+            let mut dst = unsafe { DeviceBuffer::uninitialized(src.len()) }.map_err(cuda_err)?;
+            dst.copy_from(src).map_err(cuda_err)?;
+            self.main_hiddens.push(dst);
+        }
+        self.run = snap.run.clone();
+        self.eng_cache.clone_from(&snap.eng_cache);
+        self.pos = snap.pos;
         Ok(())
     }
 
@@ -2927,6 +3073,7 @@ impl<'a> GpuModel<'a> {
                 capture_y: None,
             },
             pos: 0,
+            spec_accept: 0,
             max_seq,
             sharding: *sh,
             comm: None,
@@ -3480,6 +3627,7 @@ fn attention_step(
             528,
             cfg.original_seq_len as usize + 1,
             segments,
+            1,
         );
     }
     let gdim = heads * hd / og;
@@ -4002,7 +4150,7 @@ fn moe_step(
 
 // ---------------------------------------------------------------------------
 // M-batch decode (teacher-forced): one engine pass over m known tokens.
-// Batched: embedding, hc, norms, rope, projections, sparse_attn, gate.
+// Batched: embedding, hc, norms, rope, projections, sparse-MLA, gate.
 // Sequential per position: ring writes, the CSA compressor state machine,
 // indexer key append + selection, engram hashing — the position-dependent
 // state, evolved in order so the post-pass state equals m sequential
@@ -4052,6 +4200,13 @@ struct ScratchM {
     win_idxs: D<i32>,
     shared_idxs: D<i32>,
     pos_q: D<i32>,
+    q_bf16: D<u16>,
+    attn_part: D<f32>,
+    attn_stats: D<f32>,
+    pos_i64: D<i64>,
+    swa_len: D<i32>,
+    idx_len: D<i32>,
+    page_table: D<i32>,
     logits: D<f32>,
     /// Per-position candidate blocks (host): the cand_src layer computes
     /// them for all m positions in its sequential loop; uses_cand layers
@@ -4125,8 +4280,24 @@ impl ScratchM {
             qidx: alloc(m * inh * ihd)?,
             widx: alloc(m * inh)?,
             win_idxs: alloc_i(m * win)?,
-            shared_idxs: alloc_i(m * (win + cfg.index_topk as usize))?,
+            shared_idxs: alloc_i(m * SPARSE_MLA_IDX_WIDTH)?,
             pos_q: alloc_i(m * heads)?,
+            q_bf16: DeviceBuffer::zeroed(m * heads * hd).map_err(cuda_err)?,
+            // sparse_mla_decode.cu uses fixed 17-segment row strides
+            // (17 * 8192 partials and 17 * 32 stats), independent of
+            // the runtime segment count passed to the merge launch.
+            attn_part: alloc(17 * m * heads * hd)?,
+            attn_stats: alloc(17 * m * heads * 2)?,
+            pos_i64: DeviceBuffer::from_slice(&vec![0i64; m]).map_err(cuda_err)?,
+            swa_len: alloc_i(m)?,
+            idx_len: alloc_i(m)?,
+            page_table: {
+                let pages = cfg.original_seq_len as usize / 64 + 1;
+                let host: Vec<i32> = (0..m)
+                    .flat_map(|_| (0..pages as i32).collect::<Vec<_>>())
+                    .collect();
+                DeviceBuffer::from_slice(&host).map_err(cuda_err)?
+            },
             logits: alloc(m * vocab)?,
             candidates_m: vec![Vec::new(); m],
         })
@@ -4137,7 +4308,7 @@ impl<'a> GpuModel<'a> {
     /// Teacher-forced M-batch decode: one engine pass over `tokens`,
     /// positions [self.pos, self.pos + m). Returns m logit rows. Batched
     /// where the math allows (embedding, hc, norms, rope, every GEMM,
-    /// sparse_attn, gate); position-dependent state (ring writes, CSA
+    /// sparse-MLA, gate); position-dependent state (ring writes, CSA
     /// compressor, indexer, engram hashes) evolves sequentially per
     /// position, so the post-pass model state equals m sequential
     /// `decode` calls. v1 bounds: upload mode (TP1 or TP4), and the batch
@@ -4852,22 +5023,60 @@ impl<'a> GpuModel<'a> {
         position: u64,
         anchor: u32,
     ) -> io::Result<(Vec<u32>, u64, Vec<f32>)> {
-        let mut logits = self.decode(anchor, position)?;
+        let initial = self.decode(anchor, position)?;
+        let drafts = self.drafter_step(anchor, position)?;
+        let win = self.cfg.window_size as usize;
+        let batch_len = if std::env::var_os("FERROSEEK_SEQ_SPEC").is_some() {
+            0
+        } else if self.spec_accept >= 5 {
+            5
+        } else {
+            0
+        };
+        let batch_len = batch_len.min(drafts.len());
+        let batch_ok = batch_len >= 2 && (self.pos as usize % win) + batch_len <= win;
+        if batch_ok {
+            let batch = &drafts[..batch_len];
+            let snapshot = self.spec_snapshot(batch_len)?;
+            let rows = self.decode_m(batch)?;
+            let mut accepted = vec![anchor];
+            let mut last = initial.clone();
+            let mut n = 0usize;
+            for (i, &draft) in batch.iter().enumerate() {
+                if ferroseek_ref::sample::argmax(&last) != draft {
+                    break;
+                }
+                accepted.push(draft);
+                last = rows[i].clone();
+                n += 1;
+            }
+            if n < batch.len() {
+                self.spec_restore(&snapshot)?;
+                last = initial;
+                for &draft in &batch[..n] {
+                    last = self.decode(draft, self.pos)?;
+                }
+            }
+            self.spec_accept = accepted.len();
+            return Ok((accepted, self.pos, last));
+        }
+        let mut logits = initial;
         let mut accepted = vec![anchor];
-        for draft in self.drafter_step(anchor, position)? {
+        for draft in drafts {
             if ferroseek_ref::sample::argmax(&logits) != draft {
                 break;
             }
             logits = self.decode(draft, self.pos)?;
             accepted.push(draft);
         }
+        self.spec_accept = accepted.len();
         Ok((accepted, self.pos, logits))
     }
 }
 
 /// The M-batch attention sublayer: batched q/kv projections and rope,
 /// sequential per-position cache writes + CSA compressor + indexer,
-/// one sparse_attn per position, in causal order.
+/// one fused sparse-MLA launch per main layer on the real shape (scalar fallback otherwise).
 #[allow(clippy::too_many_arguments)]
 fn attention_step_m(
     c: &Cuda,
@@ -4899,6 +5108,13 @@ fn attention_step_m(
     let inh = cfg.index_n_heads as usize / world;
     let ihd = cfg.index_head_dim as usize;
     let ratio = layer.ratio as u64;
+    let use_sparse_mla = std::env::var_os("FERROSEEK_SPARSE_FP32").is_none()
+        && heads == 16
+        && hd == 512
+        && layer.layer < cfg.n_layers;
+    let mut filled_rows = Vec::with_capacity(m);
+    let mut idx_len_rows = Vec::with_capacity(m);
+    let mut segments_max = 1usize;
     let kv_x = kv_x.unwrap_or(&sm.x);
 
     // q path: emit8 -> wq_a -> q_norm -> emit8 -> wq_b -> rope(buf)
@@ -5052,7 +5268,7 @@ fn attention_step_m(
         let list: Vec<i32> = (0..filled as i32)
             .chain((win as i32)..(win + m) as i32)
             .collect();
-        let stride = win + cfg.index_topk as usize;
+        let stride = SPARSE_MLA_IDX_WIDTH;
         for i in 0..m {
             sm.shared_idxs
                 .index(i * stride..i * stride + list.len())
@@ -5095,6 +5311,8 @@ fn attention_step_m(
         for i in 0..m {
             let pos = pos0 + i as u64;
             let slot = (pos % win as u64) as usize;
+            filled_rows.push(((pos + 1).min(win as u64)) as i32);
+            let mut row_idx_len = 0i32;
             let ring = k::row(&caches.kv_all[l], slot * hd, hd);
             k::rmsnorm(
                 c,
@@ -5330,20 +5548,22 @@ fn attention_step_m(
                             list[win + j] = v;
                         }
                         if i + 1 == m {
-                            let n_sel = win + cmp.len();
-                            run.shared_n_sel = n_sel;
+                            run.shared_n_sel = selected_len;
                             s1.shared_idxs
-                                .index(0..n_sel)
-                                .copy_from(&list[..n_sel])
+                                .index(0..selected_len)
+                                .copy_from(&list[..selected_len])
                                 .map_err(cuda_err)?;
                         }
                     }
                     sm.shared_idxs
-                        .index(i * (win + topk_max)..(i + 1) * (win + topk_max))
+                        .index(i * SPARSE_MLA_IDX_WIDTH..i * SPARSE_MLA_IDX_WIDTH + list.len())
                         .copy_from(&list)
                         .map_err(cuda_err)?;
                 }
 
+                if selected_len > win {
+                    row_idx_len = compress_len as i32;
+                }
                 // latent tail: rope + fp4 snap + fan-out
                 if latent_ready {
                     if let Some(src) = layer.kv_src {
@@ -5386,13 +5606,13 @@ fn attention_step_m(
                     }
                 }
             }
-            // The list is -1-padded to win + topk_max; only the valid prefix
-            // needs attention. This matters for short M-batch verification.
+            // The indexed list has a 2048-wide row stride; only its valid
+            // prefix participates in attention. This matters for short M-batch verification.
             let topk_max = cfg.index_topk as usize;
             let (idxs, n_sel) = if layer.ratio > 0 {
                 (
                     sm.shared_idxs
-                        .index(i * (win + topk_max)..(i + 1) * (win + topk_max))
+                        .index(i * SPARSE_MLA_IDX_WIDTH..(i + 1) * SPARSE_MLA_IDX_WIDTH)
                         .as_device_ptr(),
                     selected_len,
                 )
@@ -5402,17 +5622,78 @@ fn attention_step_m(
                     win,
                 )
             };
-            k::sparse_attn(
+            if !use_sparse_mla {
+                k::sparse_attn(
+                    c,
+                    k::row(&sm.q, i * heads * hd, heads * hd),
+                    k::base(&caches.kv_all[l]),
+                    idxs,
+                    k::base(&layer.attn_sink),
+                    k::row(&sm.o, i * heads * hd, heads * hd),
+                    heads,
+                    hd,
+                    n_sel,
+                    (hd as f32).sqrt().recip(),
+                );
+            }
+            idx_len_rows.push(row_idx_len);
+            let row_segments =
+                ((filled_rows[i] as usize + row_idx_len as usize).div_ceil(128)).max(1);
+            segments_max = segments_max.max(row_segments);
+        }
+        if use_sparse_mla {
+            let positions: Vec<i64> = (0..m).map(|i| (pos0 + i as u64) as i64).collect();
+            sm.pos_i64.copy_from(&positions).map_err(cuda_err)?;
+            sm.swa_len.copy_from(&filled_rows).map_err(cuda_err)?;
+            sm.idx_len.copy_from(&idx_len_rows).map_err(cuda_err)?;
+            k::f32_to_bf16(c, k::base(&sm.q), k::base(&sm.q_bf16), m * heads * hd);
+            let idx_pool = if ratio > 0 {
+                ((cfg.original_seq_len as u64 / ratio + 63) / 64) as usize
+            } else {
+                1
+            };
+            let (swa_idxs, idx_idxs) = if ratio > 0 {
+                (
+                    k::base(&sm.shared_idxs),
+                    k::I32::from_raw(sm.shared_idxs.as_device_ptr().as_raw() + (win * 4) as u64),
+                )
+            } else {
+                (
+                    k::base(&sm.win_idxs),
+                    k::I32::from_raw(sm.win_idxs.as_device_ptr().as_raw() + (win * 4) as u64),
+                )
+            };
+            let idx_records = if ratio > 0 {
+                caches.idx_records[l].as_device_ptr()
+            } else {
+                caches.idx_records[0].as_device_ptr()
+            };
+            k::sparse_mla_decode(
                 c,
-                k::row(&sm.q, i * heads * hd, heads * hd),
-                k::base(&caches.kv_all[l]),
-                idxs,
+                k::base(&sm.q_bf16),
+                k::base(&caches.kv_swa[l]),
+                swa_idxs,
+                k::base(&sm.swa_len),
+                idx_records,
+                idx_idxs,
+                k::base(&sm.idx_len),
+                k::base(&sm.page_table),
                 k::base(&layer.attn_sink),
-                k::row(&sm.o, i * heads * hd, heads * hd),
+                k::base(&sm.pos_i64),
+                k::base(&rope_cos[layer.freq]),
+                k::base(&rope_sin[layer.freq]),
+                k::base(&sm.attn_part),
+                k::base(&sm.attn_stats),
+                k::base(&sm.o),
                 heads,
-                hd,
-                n_sel,
-                (hd as f32).sqrt().recip(),
+                idx_pool,
+                idx_pool,
+                64 * 288,
+                win,
+                528,
+                cfg.original_seq_len as usize + 1,
+                segments_max,
+                m,
             );
         }
     }

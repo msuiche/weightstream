@@ -6,9 +6,9 @@ cache, cluster transport and serving layer are Rust; the tensor-core kernels
 are CUDA, reused from proven stacks first and rewritten only where profiling
 says so.
 
-Status: **TP4 upload mode, ~15 tok/s without speculation.** Real 4-rank
-decode of the 1017 checkpoint on the drained ring (2026-11-07): a greedy
-story decode runs at 65–67 ms/token in lockstep. Grouped TileLang MoE,
+Status: **TP4 upload mode, ~17 tok/s without speculation.** Real 4-rank
+decode of the 1017 checkpoint on the drained ring (2026-11-07): the measured
+64-token C1 story runs at 57.7 ms/token in lockstep. Grouped TileLang MoE,
 active routing tiles, fused quantized sparse-MLA attention, and cached TMA
 maps are landed; the GPU gates and four-rank output-identity checks pass.
 What works today:
@@ -39,9 +39,10 @@ What works today:
   132-token A/B was 9.625 s vs 12.964 s sequential (25.8% faster).
 - **DSpark speculative decode** — three MTP blocks, target-hidden capture,
   non-causal draft attention, Markov-biased proposals and greedy target
-  verification; full-draft acceptance and `--no-spec` output identity verified
-  on TP4. C1 is 8.97 tok/s versus 10.24 without speculation (0.876×);
-  verification is currently sequential, so no speedup is claimed.
+  verification. Quantized M=1 decode is 13.29 tok/s on the C1 story;
+  no-spec is faster at 17.33 tok/s, so serving keeps speculation disabled.
+  High-acceptance streaks use targeted-checkpoint M=5 verification; ordinary
+  calls remain sequential (`FERROSEEK_SEQ_SPEC=1` forces that fallback).
 - **Serving** — `ferroseek serve --tp4 --ring ...`: OpenAI-compatible
   endpoint on the head rank, SSE streaming, `temperature`/`top_p`/`seed`
   broadcast with `Phase::Next` so all ranks draw identically

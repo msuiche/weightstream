@@ -27,14 +27,14 @@ DSpark speculative decoding, thermal cap on. Measured by
 
 | metric | GLP-27 lane | ferroseek upload TP4 (2026-11-07, no-spec) |
 |---|---|---|
-| decode t/s, single stream (C1) | **58.64** (tpot p50 16.57 ms) | **~15.1** (65–67 ms/token) |
+| decode t/s, single stream (C1) | **58.64** (tpot p50 16.57 ms) | **17.33** (57.7 ms/token) |
 | decode t/s, aggregate (C16) | **215.94** (tpot p50 73.86 ms) | — (single-request lockstep) |
 | cold prefill | **5.3k t/s** (32K / 131K) | not measured at those sizes |
 
 The later LocalArena engine showdown measured the same spark-ds41f
 TileLang + DSpark stack at **85 tok/s single-stream**, **262 tok/s at eight
 users**, and **6,636 tok/s cold prefill**. Against that newer 85 tok/s
-reference, ferroseek's current ~15.1 tok/s is about **5.6× slower**.
+reference, ferroseek's current 17.33 tok/s is about **4.9× slower**.
 
 This is the apples-to-apples bar for ferroseek's upload-TP4 work: same
 hardware, same checkpoint, same DSpark spec-decode, steering armed. The
@@ -128,6 +128,16 @@ driver: `/tmp/tp4-c1-dspark-spark-*.log`.
   restore batched speculation until `decode_m` beats sequential M=1 on the
   same short batch. Separate target/drafter M-scratch and runtime top-k fixes
   remain landed.
+- **Quantized sparse-MLA + adaptive DSpark (2026-11-07).** Fused M=1
+  attention and M-row TileLang verification preserve the four-rank story
+  stream. Full-cache speculative snapshots cost 177–359 ms; targeted
+  checkpoints of only draft-touched rows cost 6–7 ms. M=5 target compute was
+  293 ms, still too expensive when acceptance is low, so batching is gated on
+  a previous four-draft acceptance and ordinary calls stay sequential.
+  Warmup + 64-token story C1: adaptive DSpark **13.29 tok/s** (75.2 ms/token)
+  versus no-spec **17.33 tok/s** (57.7 ms/token). No-spec is the production
+  candidate; `cmd_serve` already disables speculation. Raw logs:
+  `spark-*:/tmp/tp4-c1-adaptive-*` and `spark-*:/tmp/tp4-c1-nospec-*`.
 - **Build note:** `cargo clean -p ferroseek-cuda` without `--release` removed
   nothing useful; use `cargo clean -p ferroseek-cuda --release` when forcing
   a kernel rebuild. Normal builds were otherwise reliable.

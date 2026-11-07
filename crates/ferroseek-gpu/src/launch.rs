@@ -559,6 +559,7 @@ pub fn sparse_mla_decode(
     swa_stride: usize,
     positions_max: usize,
     segments: usize,
+    rows: usize,
 ) {
     let split = c.tl_sparse_mla.get_function("sparse_mla_kernel").unwrap();
     let merge = c.tl_sparse_mla.get_function("sparse_mla_kernel_1").unwrap();
@@ -570,16 +571,16 @@ pub fn sparse_mla_decode(
         );
         assert_eq!(status, cust::sys::CUresult::CUDA_SUCCESS);
         let stream = &c.stream;
-        launch!(split<<<(segments as u32, 1, 1), 256, 101376, stream>>>(
+        launch!(split<<<(segments as u32, 1, rows as u32), 256, 101376, stream>>>(
             idx_idxs, idx_len, page_table, idx_records, partial, stats, q,
             swa_idxs, swa_len, swa_records,
             idx_pages as i32, idx_pool as i32, idx_stride as i32,
             1, swa_pool as i32, swa_stride as i32
         ))
         .unwrap();
-        launch!(merge<<<(n_heads as u32, 1), 128, 2048, stream>>>(
+        launch!(merge<<<(n_heads as u32, rows as u32), 128, 2048, stream>>>(
             cos, sin, out, partial, stats, positions, sinks,
-            positions_max as i32, 1, segments as i32
+            positions_max as i32, rows as i32, segments as i32
         ))
         .unwrap();
     }

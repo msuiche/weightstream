@@ -1938,6 +1938,7 @@ fn sparse_mla_packed_window_prefix() {
         528,
         1,
         1,
+        1,
     );
     c.stream.synchronize().unwrap();
     let mut st = vec![0f32; heads * 2];
