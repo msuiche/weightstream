@@ -68,6 +68,12 @@ no channel setup per step.
 1. done. 2. done (gate 4/4 bit-exact, 100k-iteration soak zero loss,
 ~10.5 µs p50 4 KB; the gate also covers the all-gather: every rank checks
 the rank-ordered concatenation bit-exactly).
+2026-11-08: CQ polling no longer allocates a completion vector per poll, and
+the collective no longer allocates a QP-key vector per call. A 2,000-iteration
+20,480-byte all-reduce soak measured 23.0–23.3 µs p50 and 33.35 µs worst-rank
+p99, with the bit-exact gate and zero packet loss. In-decode collectives are
+slower because they also wait for rank arrival skew; the isolated figure is
+not a per-token collective budget.
 3. done. `ferroseek decode --engine gpu --tp4 --rank N --ring
 nodes-ring4.local.json` (upload mode, the production path since the
 DEVICEMAP registration ceiling was measured — see below) loads rank

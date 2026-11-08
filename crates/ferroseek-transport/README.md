@@ -58,7 +58,7 @@ Consequences worth knowing:
 ```
 ferroseek-transport bench --ring nodes-ring4.local.json [--port 29871] \
     [--ping-iters 2000] [--soak-iters 100000] [--gate-rounds 8] \
-    [--verify-every 1000] [--wait-ms 100]
+    [--verify-every 1000] [--wait-ms 100] [--elems 1024]
 ```
 
 Any node can launch it; rank 0 (head) listens on the management net and

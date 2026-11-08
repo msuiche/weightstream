@@ -367,7 +367,12 @@ impl Ring {
         }
         let my_slot = self.slot_addr(bank, me as u8);
 
-        for key in self.qps.keys().cloned().collect::<Vec<_>>() {
+        for key in [
+            (succ as u8, 0),
+            (succ as u8, 1),
+            (pred as u8, 0),
+            (pred as u8, 1),
+        ] {
             self.ensure_recv(key)?;
         }
 
@@ -456,8 +461,9 @@ impl Ring {
         let n = self.verbs.devices.len();
         for d in 0..n {
             let cq = self.verbs.devices[d].cq_ptr();
-            for ev in batch.poll(cq).map_err(wrap_verbs)? {
-                self.handle_event(ev)?;
+            let n = batch.poll(cq).map_err(wrap_verbs)?;
+            for i in 0..n {
+                self.handle_event(batch.event(i))?;
             }
         }
         Ok(())
@@ -525,7 +531,9 @@ impl Ring {
                 let n = ring.verbs.devices.len();
                 for d in 0..n {
                     let cq = ring.verbs.devices[d].cq_ptr();
-                    for ev in batch.poll(cq).map_err(wrap_verbs)? {
+                    let n = batch.poll(cq).map_err(wrap_verbs)?;
+                    for i in 0..n {
+                        let ev = batch.event(i);
                         let k = *ring.qpn_map.get(&ev.qp_num).ok_or("unknown qpn")?;
                         match ev.kind {
                             PollKind::Send => {

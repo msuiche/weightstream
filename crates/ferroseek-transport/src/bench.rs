@@ -49,7 +49,8 @@ impl Default for BenchArgs {
 pub fn usage() -> String {
     "usage: ferroseek-transport bench --ring <nodes-ring4.local.json> \
      [--port 29871] [--rank N] [--wait-ms 100] [--ping-iters 2000] \
-     [--soak-iters 100000] [--gate-rounds 8] [--verify-every 1000]"
+     [--soak-iters 100000] [--gate-rounds 8] [--verify-every 1000] \
+     [--elems 1024]"
         .into()
 }
 
@@ -96,6 +97,10 @@ pub fn parse_args(args: &[String]) -> Result<BenchArgs, String> {
             "--verify-every" => {
                 i += 1;
                 a.verify_every = num(args, i, "--verify-every")?;
+            }
+            "--elems" => {
+                i += 1;
+                a.elems = num(args, i, "--elems")?;
             }
             _ => return Err(format!("unknown argument {:?}\n{}", args[i], usage())),
         }
@@ -463,8 +468,9 @@ fn run_head(
 
     // ---- gate: bit-exact all-reduce
     println!(
-        "\nBit-exactness gate ({} rounds, 4 KB, denormals + f32::MAX extremes):",
-        args.gate_rounds
+        "\nBit-exactness gate ({} rounds, {} B, denormals + f32::MAX extremes):",
+        args.gate_rounds,
+        args.elems * 4
     );
     head.send_go(
         Phase::Gate,
@@ -515,8 +521,12 @@ fn run_head(
 
     // ---- soak
     println!(
-        "\nSoak: {} iterations of a 4 KB ({} x fp32) all-reduce, verify every {}, fail-stop {} ms:",
-        args.soak_iters, args.elems, args.verify_every, args.wait_ms
+        "\nSoak: {} iterations of a {} B ({} x fp32) all-reduce, verify every {}, fail-stop {} ms:",
+        args.soak_iters,
+        args.elems * 4,
+        args.elems,
+        args.verify_every,
+        args.wait_ms
     );
     head.send_go(
         Phase::Soak,

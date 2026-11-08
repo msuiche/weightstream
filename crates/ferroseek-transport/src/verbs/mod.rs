@@ -9,18 +9,17 @@
 mod ffi;
 
 pub use ffi::{
-    ibv_ah_attr, ibv_gid, ibv_global_route, ibv_qp_attr, ibv_qp_init_attr, ibv_send_wr, ibv_sge,
     IBV_ACCESS_LOCAL_WRITE, IBV_ACCESS_REMOTE_WRITE, IBV_LINK_LAYER_ETHERNET, IBV_MTU_4096,
-    IBV_PORT_ACTIVE, IBV_QPS_INIT, IBV_QPS_RTR, IBV_QPS_RTS, IBV_QPT_RC, IBV_QP_ACCESS_FLAGS,
-    IBV_QP_AV, IBV_QP_DEST_QPN, IBV_QP_MAX_DEST_RD_ATOMIC, IBV_QP_MAX_QP_RD_ATOMIC,
-    IBV_QP_MIN_RNR_TIMER, IBV_QP_PATH_MTU, IBV_QP_PKEY_INDEX, IBV_QP_PORT, IBV_QP_RETRY_CNT,
-    IBV_QP_RNR_RETRY, IBV_QP_RQ_PSN, IBV_QP_SQ_PSN, IBV_QP_STATE, IBV_QP_TIMEOUT,
-    IBV_SEND_SIGNALED, IBV_WC_RECV, IBV_WC_RECV_RDMA_WITH_IMM, IBV_WC_SEND, IBV_WC_WITH_IMM,
-    IBV_WR_RDMA_WRITE_WITH_IMM,
+    IBV_PORT_ACTIVE, IBV_QP_ACCESS_FLAGS, IBV_QP_AV, IBV_QP_DEST_QPN, IBV_QP_MAX_DEST_RD_ATOMIC,
+    IBV_QP_MAX_QP_RD_ATOMIC, IBV_QP_MIN_RNR_TIMER, IBV_QP_PATH_MTU, IBV_QP_PKEY_INDEX, IBV_QP_PORT,
+    IBV_QP_RETRY_CNT, IBV_QP_RNR_RETRY, IBV_QP_RQ_PSN, IBV_QP_SQ_PSN, IBV_QP_STATE, IBV_QP_TIMEOUT,
+    IBV_QPS_INIT, IBV_QPS_RTR, IBV_QPS_RTS, IBV_QPT_RC, IBV_SEND_SIGNALED, IBV_WC_RECV,
+    IBV_WC_RECV_RDMA_WITH_IMM, IBV_WC_SEND, IBV_WC_WITH_IMM, IBV_WR_RDMA_WRITE_WITH_IMM,
+    ibv_ah_attr, ibv_gid, ibv_global_route, ibv_qp_attr, ibv_qp_init_attr, ibv_send_wr, ibv_sge,
 };
 
 use std::collections::BTreeMap;
-use std::ffi::{c_int, CStr};
+use std::ffi::{CStr, c_int};
 use std::os::raw::c_void;
 
 #[derive(Debug)]
@@ -482,13 +481,14 @@ impl Drop for DeviceCtx {
     }
 }
 
-/// One CQ poll batch.
+/// One CQ poll batch, including inline completion storage.
 pub struct PollBatch {
     wcs: [ffi::ibv_wc; 16],
+    events: [PollEvent; 16],
 }
 
 impl PollBatch {
-    pub fn poll(&mut self, cq: *mut ffi::ibv_cq) -> VerbsResult<Vec<PollEvent>> {
+    pub fn poll(&mut self, cq: *mut ffi::ibv_cq) -> VerbsResult<usize> {
         unsafe {
             // rdma-core 50: ibv_poll_cq is an inline wrapper over the
             // context ops table
@@ -500,8 +500,7 @@ impl PollBatch {
             if n < 0 {
                 return err("ibv_poll_cq");
             }
-            let mut out = Vec::with_capacity(n as usize);
-            for wc in &self.wcs[..n as usize] {
+            for (event, wc) in self.events.iter_mut().zip(&self.wcs[..n as usize]) {
                 if wc.status != 0 {
                     return Err(VerbsError(format!(
                         "CQE error: {} (vendor {})",
@@ -509,20 +508,21 @@ impl PollBatch {
                         wc.vendor_err
                     )));
                 }
-                let kind = if wc.opcode & IBV_WC_RECV != 0 {
+                event.kind = if wc.opcode & IBV_WC_RECV != 0 {
                     PollKind::Recv {
                         imm: u32::from_be(wc.imm_data),
                     }
                 } else {
                     PollKind::Send
                 };
-                out.push(PollEvent {
-                    kind,
-                    qp_num: wc.qp_num,
-                });
+                event.qp_num = wc.qp_num;
             }
-            Ok(out)
+            Ok(n as usize)
         }
+    }
+
+    pub fn event(&self, index: usize) -> PollEvent {
+        self.events[index]
     }
 }
 
@@ -530,6 +530,10 @@ impl Default for PollBatch {
     fn default() -> Self {
         PollBatch {
             wcs: unsafe { [std::mem::zeroed::<ffi::ibv_wc>(); 16] },
+            events: [PollEvent {
+                kind: PollKind::Send,
+                qp_num: 0,
+            }; 16],
         }
     }
 }
