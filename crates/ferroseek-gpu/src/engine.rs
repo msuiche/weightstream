@@ -462,8 +462,10 @@ pub struct Q4 {
 struct GpuCompressor {
     /// compressor wkv dequantized to f32 (bf16 for ratio 1, f32/bf16 for
     /// ratio 2 — the ref's dense path decodes the same way)
-    wkv: D<f32>,
-    wgate: Option<D<f32>>,
+    wkv: D<u16>,
+    wgate: Option<D<u16>>,
+    wkv_f32: Option<D<f32>>,
+    wgate_f32: Option<D<f32>>,
     norm_w: D<f32>,
 }
 
@@ -721,7 +723,7 @@ pub struct GpuModel<'a> {
     rope_cos: [D<f32>; 2],
     rope_sin: [D<f32>; 2],
     emb: Option<D<f32>>,
-    head: D<f32>,
+    head: D<u16>,
     final_norm: D<f32>,
     scratch: Scratch,
     /// M-row scratch for `decode_m`, grown on first use (None until then).
@@ -779,6 +781,16 @@ fn up_f32(_c: &Cuda, host: &[f32]) -> io::Result<D<f32>> {
     DeviceBuffer::from_slice(host).map_err(cuda_err)
 }
 
+fn view_bf16(store: &mut dyn WeightStore, name: &str) -> io::Result<Vec<u16>> {
+    let v = store.get(name)?;
+    if v.dtype != DType::Bf16 {
+        return ioerr(format!("{name}: expected bf16, got {:?}", v.dtype));
+    }
+    Ok(v.bytes
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect())
+}
 fn up_u16(_c: &Cuda, host: &[u16]) -> io::Result<D<u16>> {
     DeviceBuffer::from_slice(host).map_err(cuda_err)
 }
@@ -835,7 +847,6 @@ pub(crate) fn tile_major_expert(bytes: &[u8], experts: usize, n: usize, k: usize
     }
     out
 }
-
 fn load_q8(
     store: &mut dyn WeightStore,
     c: &Cuda,
@@ -908,7 +919,6 @@ fn load_q4(
 /// wo_a: bf16 dense (converted export, spec §11) or fp8+scale (raw HF
 /// export) — dequantize host-side to f32 either way, like the ref's dense
 /// path. TP4 loads the rank's contiguous o-group block: rows
-/// `[row_start, row_start+row_len)` of `[o_groups*o_lora, gdim]`.
 fn load_wo_a(
     store: &mut dyn WeightStore,
     c: &Cuda,
@@ -1082,21 +1092,30 @@ fn upload_layer(
 
     let compressor = match kv_src {
         Some(_) => {
-            let wkv = up_f32(
-                c,
-                &view_f32(store, &format!("{p}.attn.compressor.wkv.weight"))?,
-            )?;
-            let wgate = if ratio > 1 {
-                Some(up_f32(
-                    c,
-                    &view_f32(store, &format!("{p}.attn.compressor.wgate.weight"))?,
-                )?)
+            let wkv_name = format!("{p}.attn.compressor.wkv.weight");
+            let (wkv, wkv_f32) = if store.get(&wkv_name)?.dtype == DType::Bf16 {
+                (up_u16(c, &view_bf16(store, &wkv_name)?)?, None)
             } else {
-                None
+                (
+                    DeviceBuffer::zeroed(0).map_err(cuda_err)?,
+                    Some(up_f32(c, &view_f32(store, &wkv_name)?)?),
+                )
+            };
+            let wgate_name = format!("{p}.attn.compressor.wgate.weight");
+            let (wgate, wgate_f32) = if ratio > 1 {
+                if store.get(&wgate_name)?.dtype == DType::Bf16 {
+                    (Some(up_u16(c, &view_bf16(store, &wgate_name)?)?), None)
+                } else {
+                    (None, Some(up_f32(c, &view_f32(store, &wgate_name)?)?))
+                }
+            } else {
+                (None, None)
             };
             Some(GpuCompressor {
                 wkv,
                 wgate,
+                wkv_f32,
+                wgate_f32,
                 norm_w: up_f32(
                     c,
                     &view_f32(store, &format!("{p}.attn.compressor.norm.weight"))?,
@@ -1372,8 +1391,8 @@ fn upload_layer(
         ffn_norm_w,
         hc_attn_fn,
         hc_ffn_fn,
-        hc_attn_base,
         hc_ffn_base,
+        hc_attn_base,
         hc_attn_scale,
         hc_ffn_scale,
         wq_a,
@@ -2255,7 +2274,7 @@ impl<'a> GpuModel<'a> {
             );
 
             let t_att = Instant::now();
-            attention_step(
+            let attn_out = attention_step(
                 c,
                 cfg,
                 layer,
@@ -2275,7 +2294,7 @@ impl<'a> GpuModel<'a> {
                 let h_next = 1 - h_cur;
                 k::hc_post(
                     c,
-                    k::base(&s.attn_out),
+                    attn_out,
                     k::base(&s.h[h_cur]),
                     k::base(&s.post),
                     k::base(&s.comb),
@@ -2396,7 +2415,7 @@ impl<'a> GpuModel<'a> {
         // every rank samples identically (no token broadcast needed)
         let t_head = Instant::now();
         let vocab_l = cfg.vocab as usize / world;
-        k::f32_gemv(
+        k::bf16_gemv(
             c,
             k::base(head),
             k::base(&s.x),
@@ -2853,12 +2872,12 @@ impl<'a> GpuModel<'a> {
             if r0 * row_bytes + vl * row_bytes > v.bytes.len() {
                 return ioerr("head.weight: vocab shard out of range".into());
             }
-            let host: Vec<f32> = v.bytes[r0 * row_bytes..(r0 + vl) * row_bytes]
+            let host: Vec<u16> = v.bytes[r0 * row_bytes..(r0 + vl) * row_bytes]
                 .chunks_exact(2)
-                .map(|b| ferroseek_core::quant::bf16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
                 .collect();
             drop(v);
-            up_f32(c, &host)?
+            up_u16(c, &host)?
         };
         let final_norm = up_f32(c, &view_f32(store, "norm.weight")?)?;
         eprintln!("build: embed/head/norm in {:?}", t_head.elapsed());
@@ -3086,6 +3105,22 @@ impl<'a> GpuModel<'a> {
         })
     }
 }
+fn compressor_gemv(
+    c: &Cuda,
+    w: &D<u16>,
+    wf: Option<&D<f32>>,
+    x: k::F32,
+    y: k::F32,
+    rows: usize,
+    cols: usize,
+) {
+    if let Some(wf) = wf {
+        k::f32_gemv(c, k::base(wf), x, y, rows, cols);
+    } else {
+        k::bf16_gemv(c, k::base(w), x, y, rows, cols);
+    }
+}
+
 fn gemm_q8(c: &Cuda, q: &Q8, a: k::U8, sa: k::U8, out: k::F32, m: usize, n: usize, k: usize) {
     let kind = match (n, k) {
         (1280, 5120) => Some(k::TlGemm::Qa),
@@ -3129,7 +3164,7 @@ fn attention_step(
     pos: u64,
     sh: Sharding,
     mut comm: Option<&mut (dyn Collectives + 'static)>,
-) -> io::Result<()> {
+) -> io::Result<k::F32> {
     let dim = cfg.dim as usize;
     let hd = cfg.head_dim as usize;
     let rd = cfg.rope_dim as usize;
@@ -3279,9 +3314,10 @@ fn attention_step(
             run.index_k_src = src;
             let comp = layer.compressor.as_ref().unwrap();
             if ratio == 1 {
-                k::f32_gemv(
+                compressor_gemv(
                     c,
-                    k::base(&comp.wkv),
+                    &comp.wkv,
+                    comp.wkv_f32.as_ref(),
                     k::base(&s.x),
                     k::base(&s.latent),
                     hd,
@@ -3300,17 +3336,19 @@ fn attention_step(
                 let slot_i = (pos % ratio) as usize;
                 let kv_state = caches.comp_kv[src].as_ref().unwrap();
                 let score_state = caches.comp_score[src].as_mut().unwrap();
-                k::f32_gemv(
+                compressor_gemv(
                     c,
-                    k::base(&comp.wkv),
+                    &comp.wkv,
+                    comp.wkv_f32.as_ref(),
                     k::base(&s.x),
                     k::row(kv_state, slot_i * hd, hd),
                     hd,
                     dim,
                 );
-                k::f32_gemv(
+                compressor_gemv(
                     c,
-                    k::base(comp.wgate.as_ref().unwrap()),
+                    comp.wgate.as_ref().unwrap_or(&comp.wkv),
+                    comp.wgate_f32.as_ref(),
                     k::base(&s.x),
                     k::row(score_state, slot_i * hd, hd),
                     hd,
@@ -3380,43 +3418,46 @@ fn attention_step(
                 );
                 k::fp4_snap(c, krow_dst, ihd, 32, false);
             }
-            // query side: wq_b(qr) at pos, fp4(32, e8m0) snap
-            gemm_q8(
-                c,
-                &layer.indexer.as_ref().unwrap().wq_b,
-                k::base(&s.act_qr),
-                k::base(&s.act_qr_s),
-                k::base(&s.qidx),
-                1,
-                inh * ihd,
-                cfg.q_lora as usize,
-            );
-            k::rope_uniform_pos(
-                c,
-                k::base(&s.qidx),
-                k::base(&rope_cos[layer.freq]),
-                k::base(&rope_sin[layer.freq]),
-                inh,
-                ihd,
-                rd,
-                pos,
-                false,
-            );
-            k::fp4_snap(c, k::base(&s.qidx), inh * ihd, 32, false);
-            // per-head weights from weights_proj (scale folded at load)
-            k::f32_gemv(
-                c,
-                k::base(&layer.indexer.as_ref().unwrap().weights_proj),
-                k::base(&s.x),
-                k::base(&s.widx),
-                inh,
-                dim,
-            );
+            if compress_len > cfg.index_topk as usize {
+                // query side: wq_b(qr) at pos, fp4(32, e8m0) snap
+                gemm_q8(
+                    c,
+                    &layer.indexer.as_ref().unwrap().wq_b,
+                    k::base(&s.act_qr),
+                    k::base(&s.act_qr_s),
+                    k::base(&s.qidx),
+                    1,
+                    inh * ihd,
+                    cfg.q_lora as usize,
+                );
+                k::rope_uniform_pos(
+                    c,
+                    k::base(&s.qidx),
+                    k::base(&rope_cos[layer.freq]),
+                    k::base(&rope_sin[layer.freq]),
+                    inh,
+                    ihd,
+                    rd,
+                    pos,
+                    false,
+                );
+                k::fp4_snap(c, k::base(&s.qidx), inh * ihd, 32, false);
+                // per-head weights from weights_proj (scale folded at load)
+                k::f32_gemv(
+                    c,
+                    k::base(&layer.indexer.as_ref().unwrap().weights_proj),
+                    k::base(&s.x),
+                    k::base(&s.widx),
+                    inh,
+                    dim,
+                );
+            }
 
             // score + selection
-            let mut idxs_host;
-            if compress_len == 0 {
-                idxs_host = packed_window_idxs(win, pos);
+            let mut idxs_host = packed_window_idxs(win, pos);
+            if compress_len <= cfg.index_topk as usize {
+                // topk >= every score: selection is always position order,
+                idxs_host.extend((win as i32)..(win + compress_len) as i32);
             } else {
                 k::indexer_score(
                     c,
@@ -3439,8 +3480,6 @@ fn attention_step(
                     s.coll_stage.sync(stream)?;
                     score.copy_from_slice(&s.coll_stage.as_f32()[..compress_len]);
                 }
-                // index_score all-reduce (model.py:559-560): each rank
-                // scored only its 8 index heads
                 if let Some(comm) = comm.as_deref_mut() {
                     score = comm.allreduce(&score)?;
                 }
@@ -3457,9 +3496,7 @@ fn attention_step(
                         }
                     }
                 }
-                let topk = (cfg.index_topk as usize).min(compress_len);
-                let cmp = select_topk(&score, topk, compress_len, win as i32);
-                idxs_host = packed_window_idxs(win, pos);
+                let cmp = select_topk(&score, cfg.index_topk as usize, compress_len, win as i32);
                 idxs_host.extend(cmp);
             }
             // partial upload: the buffer is sized for the worst case, the
@@ -3657,12 +3694,17 @@ fn attention_step(
         (og * ol) / 32,
         format!("d_pos{pos}_actflS{l}.u8"),
     );
+    let out = if world > 1 {
+        k::F32::from_raw(s.coll_stage.device_ptr())
+    } else {
+        k::base(&s.attn_out)
+    };
     gemm_q8(
         c,
         &layer.wo_b,
         k::base(&s.act_fl),
         k::base(&s.act_fl_s),
-        k::base(&s.attn_out),
+        out,
         1,
         dim,
         og * ol,
@@ -3670,14 +3712,24 @@ fn attention_step(
     // wo_b is row-parallel: fp32 partial-sum all-reduce (spec §3)
     if let Some(comm) = comm.as_deref_mut() {
         let stream = c.stream.as_inner();
-        s.coll_stage
-            .dtoh(s.attn_out.as_device_ptr().as_raw() as u64, dim * 4, stream)?;
         s.coll_stage.sync(stream)?;
         let red = comm.allreduce(&s.coll_stage.as_f32()[..dim])?;
-        s.attn_out.copy_from(&red).map_err(cuda_err)?;
+        s.coll_stage.as_f32()[..dim].copy_from_slice(&red);
+    }
+    let out = if world > 1 {
+        let stream = c.stream.as_inner();
+        s.coll_stage
+            .htod(s.attn_out.as_device_ptr().as_raw() as u64, dim * 4, stream)?;
+        k::base(&s.attn_out)
+    } else {
+        out
+    };
+    if world > 1 && std::env::var_os("FERROSEEK_DUMP_GPU").is_some() {
+        let host = s.coll_stage.as_f32();
+        s.attn_out.copy_from(&host[..dim]).map_err(cuda_err)?;
     }
     dump_dev(c, &s.attn_out, dim, format!("d_pos{pos}_attnout{l}.f32"));
-    Ok(())
+    Ok(out)
 }
 
 /// Env-gated device->host dump of `n` u8 from `buf` (gate bisection).
@@ -4794,7 +4846,7 @@ impl<'a> GpuModel<'a> {
             eps,
         );
         for i in 0..m {
-            k::f32_gemv(
+            k::bf16_gemv(
                 c,
                 k::base(head),
                 k::row(&sm.x, i * dim, dim),
@@ -5347,9 +5399,10 @@ fn attention_step_m(
                     run.index_k_src = src;
                     let comp = layer.compressor.as_ref().unwrap();
                     if ratio == 1 {
-                        k::f32_gemv(
+                        compressor_gemv(
                             c,
-                            k::base(&comp.wkv),
+                            &comp.wkv,
+                            comp.wkv_f32.as_ref(),
                             k::row(&sm.x, i * dim, dim),
                             k::base(&s1.latent),
                             hd,
@@ -5368,17 +5421,19 @@ fn attention_step_m(
                         let slot_i = (pos % ratio) as usize;
                         let kv_state = caches.comp_kv[src].as_ref().unwrap();
                         let score_state = caches.comp_score[src].as_mut().unwrap();
-                        k::f32_gemv(
+                        compressor_gemv(
                             c,
-                            k::base(&comp.wkv),
+                            &comp.wkv,
+                            comp.wkv_f32.as_ref(),
                             k::row(&sm.x, i * dim, dim),
                             k::row(kv_state, slot_i * hd, hd),
                             hd,
                             dim,
                         );
-                        k::f32_gemv(
+                        compressor_gemv(
                             c,
-                            k::base(comp.wgate.as_ref().unwrap()),
+                            comp.wgate.as_ref().unwrap_or(&comp.wkv),
+                            comp.wgate_f32.as_ref(),
                             k::row(&sm.x, i * dim, dim),
                             k::row(score_state, slot_i * hd, hd),
                             hd,

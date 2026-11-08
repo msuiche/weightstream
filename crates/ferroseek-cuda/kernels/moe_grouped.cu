@@ -246,6 +246,10 @@ extern "C" __global__ void moe_swiglu_route(
     int row = blockIdx.y;
     int n = blockIdx.x * blockDim.x + threadIdx.x;
     if (n >= inter) return;
+    if (layout_weights[row] == 0.0f) {
+        out[(size_t)row * inter + n] = 0.0f;
+        return;
+    }
     float g = fminf(gate[(size_t)row * inter + n], 10.0f);
     float u = fminf(fmaxf(up[(size_t)row * inter + n], -10.0f), 10.0f);
     float silu = g * (1.0f / (1.0f + expf(-g)));

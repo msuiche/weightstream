@@ -113,7 +113,6 @@ extern "C" __global__ void hc_finalize(
         for (int k = 0; k < 16; k++) out_comb[(size_t)tok * 16 + k] = comb[k];
     }
 }
-
 // hc_block: the original single-kernel form (kept for the TP1/synthetic
 // path and as the bit-exact reference for the split kernels).
 extern "C" __global__ void hc_block(

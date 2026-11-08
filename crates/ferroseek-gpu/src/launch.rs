@@ -5,6 +5,25 @@
 use cust::memory::{AsyncCopyDestination, DeviceBuffer, DeviceSlice};
 use cust::prelude::*;
 use ferroseek_cuda::gpu::Cuda;
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
+
+static FUNC_ATTRS: LazyLock<Mutex<HashSet<(usize, i32)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn shared_attr_once(f: &cust::function::Function, bytes: i32) {
+    let mut attrs = FUNC_ATTRS.lock().unwrap();
+    if attrs.insert((f.to_raw() as usize, bytes)) {
+        let status = unsafe {
+            cust::sys::cuFuncSetAttribute(
+                f.to_raw(),
+                cust::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                bytes,
+            )
+        };
+        assert_eq!(status, cust::sys::CUresult::CUDA_SUCCESS);
+    }
+}
 
 pub type F32 = DevicePointer<f32>;
 pub type U8 = DevicePointer<u8>;
@@ -324,12 +343,7 @@ pub fn fp8_gemm_tl(c: &Cuda, kind: TlGemm, a: U8, sa: U32, b: U8, sb: U32, out: 
     };
     let f = module.get_function("gemm_mxfp8_kernel").unwrap();
     unsafe {
-        let status = cust::sys::cuFuncSetAttribute(
-            f.to_raw(),
-            cust::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            shared as i32,
-        );
-        assert_eq!(status, cust::sys::CUresult::CUDA_SUCCESS);
+        shared_attr_once(&f, shared as i32);
         let stream = &c.stream;
         launch!(f<<<(grid_x, (m + 15) as u32 / 16), 128, shared, stream>>>(
             a, b, out, sa, sb, m as i32, m as i32
@@ -494,12 +508,7 @@ pub fn moe_grouped_tl_cached(
         .get_function("moe_grouped_fp8_fp4_gemm_kernel")
         .unwrap();
     unsafe {
-        let status = cust::sys::cuFuncSetAttribute(
-            f.to_raw(),
-            cust::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            64000,
-        );
-        assert_eq!(status, cust::sys::CUresult::CUDA_SUCCESS);
+        shared_attr_once(&f, 64000);
         let stream = &c.stream;
         match kind {
             TlMoe::GateUp => launch!(f<<<(n_tiles, tiles as u32), 128, 64000, stream>>>(
@@ -564,12 +573,7 @@ pub fn sparse_mla_decode(
     let split = c.tl_sparse_mla.get_function("sparse_mla_kernel").unwrap();
     let merge = c.tl_sparse_mla.get_function("sparse_mla_kernel_1").unwrap();
     unsafe {
-        let status = cust::sys::cuFuncSetAttribute(
-            split.to_raw(),
-            cust::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            101376,
-        );
-        assert_eq!(status, cust::sys::CUresult::CUDA_SUCCESS);
+        shared_attr_once(&split, 101376);
         let stream = &c.stream;
         launch!(split<<<(segments as u32, 1, rows as u32), 256, 101376, stream>>>(
             idx_idxs, idx_len, page_table, idx_records, partial, stats, q,

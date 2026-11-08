@@ -18,9 +18,9 @@
 //! both ways.
 
 use cust::sys::{
-    cuGetErrorString, cuMemFreeHost, cuMemHostAlloc, cuMemHostGetDevicePointer_v2,
-    cuMemHostRegister_v2, cuMemHostUnregister, cuMemcpyDtoHAsync_v2, cuMemcpyHtoDAsync_v2,
-    cuStreamSynchronize, cudaError_enum, CUstream, CU_MEMHOSTREGISTER_DEVICEMAP,
+    CU_MEMHOSTREGISTER_DEVICEMAP, CUstream, cuGetErrorString, cuMemFreeHost, cuMemHostAlloc,
+    cuMemHostGetDevicePointer_v2, cuMemHostRegister_v2, cuMemHostUnregister, cuMemcpyDtoHAsync_v2,
+    cuMemcpyHtoDAsync_v2, cuStreamSynchronize, cudaError_enum,
 };
 use std::io;
 use std::sync::Mutex;
@@ -205,12 +205,17 @@ impl HostArena {
                 }
                 Err(e) => {
                     failed += 1;
-                    eprintln!("streaming: shard {i} ({:.1} GB) not registered ({e}); its big tensors stage per use", len as f64 / (1u64 << 30) as f64);
+                    eprintln!(
+                        "streaming: shard {i} ({:.1} GB) not registered ({e}); its big tensors stage per use",
+                        len as f64 / (1u64 << 30) as f64
+                    );
                 }
             }
         }
         if failed > 0 {
-            eprintln!("streaming: {failed} shard(s) unregistered — routed experts stage per use, engram gathers host-side, small tensors upload");
+            eprintln!(
+                "streaming: {failed} shard(s) unregistered — routed experts stage per use, engram gathers host-side, small tensors upload"
+            );
         }
         Ok(HostArena {
             registrations,
@@ -256,6 +261,7 @@ impl HostArena {
 pub struct PinnedBuf {
     ptr: *mut u8,
     len: usize,
+    dev: u64,
 }
 
 // SAFETY: the pointer is used only from the owning thread (the decode
@@ -273,7 +279,13 @@ impl PinnedBuf {
         Ok(PinnedBuf {
             ptr: p as *mut u8,
             len,
+            dev: device_pointer(p as *const u8)?,
         })
+    }
+
+    /// Device-mapped address of this pinned host buffer.
+    pub fn device_ptr(&self) -> u64 {
+        self.dev
     }
 
     pub fn as_slice_mut(&mut self) -> &mut [u8] {

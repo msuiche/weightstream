@@ -27,14 +27,14 @@ DSpark speculative decoding, thermal cap on. Measured by
 
 | metric | GLP-27 lane | ferroseek upload TP4 (2026-11-07, no-spec) |
 |---|---|---|
-| decode t/s, single stream (C1) | **58.64** (tpot p50 16.57 ms) | **17.33** (57.7 ms/token) |
+| decode t/s, single stream (C1) | **58.64** (tpot p50 16.57 ms) | **17.93** (55.8 ms/token) |
 | decode t/s, aggregate (C16) | **215.94** (tpot p50 73.86 ms) | — (single-request lockstep) |
 | cold prefill | **5.3k t/s** (32K / 131K) | not measured at those sizes |
 
 The later LocalArena engine showdown measured the same spark-ds41f
 TileLang + DSpark stack at **85 tok/s single-stream**, **262 tok/s at eight
 users**, and **6,636 tok/s cold prefill**. Against that newer 85 tok/s
-reference, ferroseek's current 17.33 tok/s is about **4.9× slower**.
+reference, ferroseek's current 17.93 tok/s is about **4.7× slower**.
 
 This is the apples-to-apples bar for ferroseek's upload-TP4 work: same
 hardware, same checkpoint, same DSpark spec-decode, steering armed. The
@@ -138,6 +138,15 @@ driver: `/tmp/tp4-c1-dspark-spark-*.log`.
   versus no-spec **17.33 tok/s** (57.7 ms/token). No-spec is the production
   candidate; `cmd_serve` already disables speculation. Raw logs:
   `spark-*:/tmp/tp4-c1-adaptive-*` and `spark-*:/tmp/tp4-c1-nospec-*`.
+- **Projection, collective, and launch fixes (2026-11-08).** Short-context
+  top-k skips only provably dead score work (compressed indices remain
+  `win..win+compress_len`), WO-B uses mapped pinned staging before the RoCE
+  reduction, head/compressor GEMVs keep BF16 weights with an exact F32
+  fallback for synthetic weights, padded MoE SwiGLU rows are skipped, and
+  TileLang function attributes are initialized once. The final four-rank
+  story stream is identical and measured **17.93 tok/s** (55.8 ms/token).
+  Rejected experiments: FP8 WO-A conversion, direct GPU Engram gathers,
+  Engram row cache, HC vectorization, and parallel Sinkhorn normalization.
 - **Build note:** `cargo clean -p ferroseek-cuda` without `--release` removed
   nothing useful; use `cargo clean -p ferroseek-cuda --release` when forcing
   a kernel rebuild. Normal builds were otherwise reliable.
