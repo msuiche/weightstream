@@ -171,6 +171,11 @@ driver: `/tmp/tp4-c1-dspark-spark-*.log`.
   needs materially higher draft acceptance or a different target-verification
   design, not fewer collective calls under the present policy. Raw logs:
   `/tmp/tp4-c1-dspark-current-*` and `/tmp/tp4-c1-dspark-packed-*`.
+- **DSpark failure backoff (2026-11-08).** Anchor-only rounds now skip the
+  next four draft probes; multi-token acceptance cancels the skip. This
+  preserves the four-rank stream and improves the same C1 trace from 13.85 to
+  14.16 tok/s. No-spec remains faster, so serving policy is unchanged. Full
+  GPU suite: 30/30. Raw logs: `/tmp/tp4-c1-dspark-backoff-*`.
 - **Build note:** `cargo clean -p ferroseek-cuda` without `--release` removed
   nothing useful; use `cargo clean -p ferroseek-cuda --release` when forcing
   a kernel rebuild. Normal builds were otherwise reliable.

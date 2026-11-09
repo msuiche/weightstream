@@ -40,7 +40,7 @@ What works today:
   132-token A/B was 9.625 s vs 12.964 s sequential (25.8% faster).
 - **DSpark speculative decode** — three MTP blocks, target-hidden capture,
   non-causal draft attention, Markov-biased proposals and greedy target
-  verification. Quantized M=1 decode is 13.29 tok/s on the C1 story;
+  verification. Failure-backoff DSpark decode is 14.16 tok/s on the C1 story;
   no-spec is faster at 17.93 tok/s, so serving keeps speculation disabled.
   High-acceptance streaks use targeted-checkpoint M=5 verification; ordinary
   calls remain sequential (`FERROSEEK_SEQ_SPEC=1` forces that fallback).

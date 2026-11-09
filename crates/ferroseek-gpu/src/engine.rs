@@ -766,6 +766,8 @@ pub struct GpuModel<'a> {
     run: RunState,
     pos: u64,
     spec_accept: usize,
+    /// Draft-free rounds remaining after an anchor-only probe.
+    spec_skip: u8,
     max_seq: u64,
     /// TP hook (see [`Sharding`]); TP1 for now.
     pub sharding: Sharding,
@@ -1589,6 +1591,7 @@ impl<'a> GpuModel<'a> {
         };
         self.pos = 0;
         self.spec_accept = 0;
+        self.spec_skip = 0;
         Ok(())
     }
 
@@ -3167,6 +3170,7 @@ impl<'a> GpuModel<'a> {
             },
             pos: 0,
             spec_accept: 0,
+            spec_skip: 0,
             max_seq,
             sharding: *sh,
             comm: None,
@@ -5144,12 +5148,25 @@ impl<'a> GpuModel<'a> {
         self.main_hiddens.clear();
     }
 
+    fn record_spec_acceptance(&mut self, accepted: usize) {
+        self.spec_accept = accepted;
+        // One-token rounds pay the full target step plus the five-row
+        // drafter. Probe again after four cheap target-only rounds; any
+        // multi-token acceptance returns to drafting immediately.
+        self.spec_skip = if accepted == 1 { 4 } else { 0 };
+    }
+
     pub fn speculate(
         &mut self,
         position: u64,
         anchor: u32,
     ) -> io::Result<(Vec<u32>, u64, Vec<f32>)> {
         let initial = self.decode(anchor, position)?;
+        if self.spec_skip > 0 {
+            self.spec_skip -= 1;
+            self.spec_accept = 1;
+            return Ok((vec![anchor], self.pos, initial));
+        }
         let drafts = self.drafter_step(anchor, position)?;
         let win = self.cfg.window_size as usize;
         let batch_len = if std::env::var_os("FERROSEEK_SEQ_SPEC").is_some() {
@@ -5183,7 +5200,7 @@ impl<'a> GpuModel<'a> {
                     last = self.decode(draft, self.pos)?;
                 }
             }
-            self.spec_accept = accepted.len();
+            self.record_spec_acceptance(accepted.len());
             return Ok((accepted, self.pos, last));
         }
         let mut logits = initial;
@@ -5195,7 +5212,7 @@ impl<'a> GpuModel<'a> {
             logits = self.decode(draft, self.pos)?;
             accepted.push(draft);
         }
-        self.spec_accept = accepted.len();
+        self.record_spec_acceptance(accepted.len());
         Ok((accepted, self.pos, logits))
     }
 }
