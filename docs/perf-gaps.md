@@ -147,6 +147,21 @@ driver: `/tmp/tp4-c1-dspark-spark-*.log`.
   story stream is identical and measured **17.93 tok/s** (55.8 ms/token).
   Rejected experiments: FP8 WO-A conversion, direct GPU Engram gathers,
   Engram row cache, HC vectorization, and parallel Sinkhorn normalization.
+- **Asynchronous Engram host gathers (2026-11-08).** Both host-mmapped
+  tables now start their random FP8 row reads on scoped-lifetime worker
+  threads at step start; a join-on-drop guard covers early returns, and each
+  layer joins only its own rows. The four-rank story stream is unchanged and
+  the full GPU suite passes 30/30. Profiled Engram time fell from 6.6 to
+  3.6 ms/token. Two final C1 runs measured 57.35 and 60.47 ms/token
+  (17.44 and 16.54 tok/s), versus 61.56 ms in the pre-prefetch profile run;
+  variance remains high, so the earlier 55.8 ms / 17.93 tok/s result stays
+  the best absolute record. Raw logs: `/tmp/tp4-c1-final-*` and
+  `/tmp/tp4-c1-final-repeat-*`.
+- **Rejected HC and GEMM experiments (2026-11-08).** The reference-style
+  40×7 tiled HC reduction changed the greedy stream. An exact-arithmetic
+  variant that overlapped the norm used 256 threads per dot CTA and regressed
+  to about 60 ms/token. Fused Q-A/WKV and combined shared gate/up projections
+  preserved the stream but were performance-neutral. All three were reverted.
 - **Build note:** `cargo clean -p ferroseek-cuda` without `--release` removed
   nothing useful; use `cargo clean -p ferroseek-cuda --release` when forcing
   a kernel rebuild. Normal builds were otherwise reliable.

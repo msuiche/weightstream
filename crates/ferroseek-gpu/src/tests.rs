@@ -1390,6 +1390,41 @@ fn hc_block_matches_cpu_mirror() {
     assert!(dpre < 1e-5, "hc_block pre diff {dpre:.3e}");
     assert!(dpost < 1e-5, "hc_block post diff {dpost:.3e}");
     assert!(dcomb < 1e-5, "hc_block comb diff {dcomb:.3e}");
+
+    let d_dots = DeviceBuffer::from_slice(&vec![0f32; mix_hc]).unwrap();
+    crate::launch::hc_mixes(
+        c,
+        d_h.as_device_ptr(),
+        d_fn.as_device_ptr(),
+        d_dots.as_device_ptr(),
+        1,
+        hc_dim,
+        mix_hc,
+    );
+    crate::launch::hc_finalize(
+        c,
+        d_h.as_device_ptr(),
+        d_dots.as_device_ptr(),
+        d_base.as_device_ptr(),
+        d_scale.as_device_ptr(),
+        d_pre.as_device_ptr(),
+        d_post.as_device_ptr(),
+        d_comb.as_device_ptr(),
+        1,
+        hc_dim,
+        mix_hc,
+        1e-4,
+    );
+    c.stream.synchronize().unwrap();
+    let mut split_pre = vec![0f32; 4];
+    let mut split_post = vec![0f32; 4];
+    let mut split_comb = vec![0f32; 16];
+    d_pre.copy_to(&mut split_pre).unwrap();
+    d_post.copy_to(&mut split_post).unwrap();
+    d_comb.copy_to(&mut split_comb).unwrap();
+    assert_eq!(split_pre, pre, "split HC changed pre bits");
+    assert_eq!(split_post, post, "split HC changed post bits");
+    assert_eq!(split_comb, comb, "split HC changed comb bits");
 }
 
 #[test]

@@ -9,8 +9,9 @@ says so.
 Status: **TP4 upload mode, ~18 tok/s without speculation.** Real 4-rank
 decode of the 1017 checkpoint on the drained ring (2026-11-08): the measured
 64-token C1 story runs at 55.8 ms/token in lockstep. Grouped TileLang MoE,
-active routing tiles, fused quantized sparse-MLA attention, and cached TMA
-maps are landed; the GPU gates and four-rank output-identity checks pass.
+active routing tiles, fused quantized sparse-MLA attention, cached TMA maps,
+and asynchronous Engram gathers are landed; the GPU gates and four-rank
+output-identity checks pass.
 What works today:
 
 - **CPU reference engine** (`ferroseek-ref`) — full DS4.1F decode on the real

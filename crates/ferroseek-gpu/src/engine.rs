@@ -561,6 +561,37 @@ struct GpuDrafter {
     norm: D<f32>,
 }
 
+struct EngramHostGather {
+    ids: Vec<i64>,
+    flat: Vec<f32>,
+    weights: usize,
+    weights_len: usize,
+    scales: usize,
+    scales_len: usize,
+}
+
+/// Owns every prefetch thread until its rows are consumed. Early returns
+/// join the remaining workers before the weight store's mmap can be dropped.
+struct EngramGatherWorkers(Vec<Option<std::thread::JoinHandle<EngramHostGather>>>);
+
+impl EngramGatherWorkers {
+    fn take(&mut self, index: usize) -> io::Result<EngramHostGather> {
+        self.0[index]
+            .take()
+            .expect("engram gather consumed twice")
+            .join()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "engram gather worker panicked"))
+    }
+}
+
+impl Drop for EngramGatherWorkers {
+    fn drop(&mut self) {
+        for worker in self.0.iter_mut().filter_map(Option::take) {
+            let _ = worker.join();
+        }
+    }
+}
+
 /// Per-step scratch, allocated once at build.
 struct Scratch {
     h: [D<f32>; 2],
@@ -2043,6 +2074,70 @@ impl<'a> GpuModel<'a> {
             s.win_idxs.copy_from(&widxs).map_err(cuda_err)?;
         }
 
+        // Start both Engram tables' independent random-row reads together.
+        // Layer 14's gather otherwise sits idle until layer 1's gather and
+        // thirteen decoder layers have completed. Only host-mmapped tables
+        // participate; device-resident synthetic tables keep the GPU gather.
+        let ncols = engram.n_hash_cols;
+        let ehd = engram.head_dim;
+        let engram_gathers: Vec<Option<EngramHostGather>> = (0..hashes.len())
+            .map(|ei| {
+                let layer = layers.iter().find(|layer| layer.engram == Some(ei))?;
+                let e = layer.engram_w.as_ref()?;
+                match (e.embed_w.host(), e.embed_s.host()) {
+                    (Some((wp, wlen)), Some((sp, slen))) => Some(EngramHostGather {
+                        ids: hashes[ei].iter().map(|&h| h as i64).collect(),
+                        flat: vec![0.0; ncols * ehd],
+                        weights: wp as usize,
+                        weights_len: wlen,
+                        scales: sp as usize,
+                        scales_len: slen,
+                    }),
+                    _ => None,
+                }
+            })
+            .collect();
+        let mut engram_gathers = EngramGatherWorkers(
+            engram_gathers
+                .into_iter()
+                .map(|gather| {
+                    gather.map(|mut gather| {
+                        std::thread::spawn(move || {
+                            // SAFETY: these alias the weight store's mmap.
+                            // EngramGatherWorkers joins on every return path.
+                            let (wt, st) = unsafe {
+                                (
+                                    std::slice::from_raw_parts(
+                                        gather.weights as *const u8,
+                                        gather.weights_len,
+                                    ),
+                                    std::slice::from_raw_parts(
+                                        gather.scales as *const u8,
+                                        gather.scales_len,
+                                    ),
+                                )
+                            };
+                            gather
+                                .flat
+                                .par_chunks_mut(ehd)
+                                .zip(gather.ids.par_iter())
+                                .for_each(|(chunk, &id)| {
+                                    let row = id as usize;
+                                    if row * ehd + ehd > wt.len() {
+                                        chunk.fill(f32::NAN);
+                                        return;
+                                    }
+                                    chunk.copy_from_slice(&ferroseek_ref::store::fp8_row_scaled(
+                                        wt, st, row, ehd,
+                                    ));
+                                });
+                            gather
+                        })
+                    })
+                })
+                .collect(),
+        );
+
         let mut h_cur = 0usize;
         for li in 0..layers.len() {
             let layer = &layers[li];
@@ -2054,7 +2149,6 @@ impl<'a> GpuModel<'a> {
             let t_eng = Instant::now();
             if let Some(ei) = layer.engram {
                 let e = layer.engram_w.as_ref().unwrap();
-                let hash = &hashes[ei];
                 let ncols = engram.n_hash_cols;
                 let ehd = engram.head_dim;
                 // the real checkpoint's engram embed table is a 98 GB fp8
@@ -2062,7 +2156,6 @@ impl<'a> GpuModel<'a> {
                 // n_hash_cols rows host-side with the ref engine's own
                 // fp8_row_scaled (bit-identical dequant, model.py:328-365).
                 // Registered tables (synthetic gate) keep the device gather.
-                let ids: Vec<i64> = hash.iter().map(|&h| h as i64).collect();
                 match (e.embed_w.host(), e.embed_s.host()) {
                     (Some((wp, wlen)), Some((sp, slen))) => {
                         // SAFETY: both alias the weight store's mmap, owned
@@ -2073,39 +2166,20 @@ impl<'a> GpuModel<'a> {
                                 std::slice::from_raw_parts(sp, slen),
                             )
                         };
-                        // Rows are gathered in parallel: each row starts a
-                        // distinct page of the 98 GB slab, and with ~80 GB
-                        // of device allocations in the same unified RAM the
-                        // slab is mostly cold — a serial gather pays one
-                        // NVMe fault per row (~650 us each, 31 ms of a
-                        // 125 ms step). Chunked rayon (par_chunks) faults
-                        // 24 pages concurrently through the page cache.
-                        // Row values are written to disjoint slices, so
-                        // the fp32 results are identical to the serial
-                        // gather.
-                        let rows: Vec<usize> =
-                            ids.iter().take(ncols).map(|&id| id as usize).collect();
-                        let mut flat = vec![0.0f32; rows.len() * ehd];
-                        flat.par_chunks_mut(ehd)
-                            .zip(rows.par_iter())
-                            .for_each(|(chunk, &r)| {
-                                if r * ehd + ehd > wt.len() {
-                                    // out-of-range rows are a hard error;
-                                    // record and fail after the join (rayon
-                                    // closures must be closure-safe)
-                                    chunk.fill(f32::NAN);
-                                    return;
-                                }
-                                let row = ferroseek_ref::store::fp8_row_scaled(wt, st, r, ehd);
-                                chunk.copy_from_slice(&row);
-                            });
+                        let gather = engram_gathers.take(ei)?;
+                        let ids = &gather.ids;
+                        let flat = &gather.flat;
                         if flat.iter().any(|v| v.is_nan()) {
                             // distinguish: a row id beyond the table (fill
                             // branch) vs NaN inside a dequantized valid row
-                            let bad_row = rows.iter().find(|&&r| r * ehd + ehd > wt.len()).copied();
+                            let bad_row = ids
+                                .iter()
+                                .take(ncols)
+                                .map(|&id| id as usize)
+                                .find(|&row| row * ehd + ehd > wt.len());
                             let nan_idx = flat.iter().position(|v| v.is_nan()).unwrap();
                             let nan_row = nan_idx / ehd;
-                            let rid = rows.get(nan_row).copied().unwrap_or(usize::MAX);
+                            let rid = ids.get(nan_row).copied().unwrap_or(i64::MAX) as usize;
                             let s_cols = ehd.div_ceil(32);
                             let sbyte = st.get(rid * s_cols).copied().unwrap_or(u8::MAX);
                             let wbytes: Vec<u8> = wt
