@@ -162,6 +162,15 @@ driver: `/tmp/tp4-c1-dspark-spark-*.log`.
   variant that overlapped the norm used 256 threads per dot CTA and regressed
   to about 60 ms/token. Fused Q-A/WKV and combined shared gate/up projections
   preserved the stream but were performance-neutral. All three were reverted.
+- **DSpark acceptance and packed collectives (2026-11-08).** The current
+  drafter produced only the anchor in 25 of 42 measured rounds; the 67-token
+  run averaged 13.85 tok/s despite output identity with no-spec. Packing each
+  M-row verification layer's attention and MoE reductions into one collective
+  removed 1,008 ring calls, but the four-token batch took 253 ms versus 249 ms
+  and end-to-end throughput did not improve. Reverted. Reaching 30–50 tok/s
+  needs materially higher draft acceptance or a different target-verification
+  design, not fewer collective calls under the present policy. Raw logs:
+  `/tmp/tp4-c1-dspark-current-*` and `/tmp/tp4-c1-dspark-packed-*`.
 - **Build note:** `cargo clean -p ferroseek-cuda` without `--release` removed
   nothing useful; use `cargo clean -p ferroseek-cuda --release` when forcing
   a kernel rebuild. Normal builds were otherwise reliable.
