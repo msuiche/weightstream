@@ -85,9 +85,9 @@ extern "C" __global__ void pack_scale_words(
     int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n / 128) return;
-    dst[i] = (uint32_t)src[i * 4]
-        | ((uint32_t)src[i * 4 + 1] << 8)
-        | ((uint32_t)src[i * 4 + 2] << 16)
-        | ((uint32_t)src[i * 4 + 3] << 24);
+    if (i >= (n + 127) / 128) return;
+    dst[i] = 0;
+    for (int j = 0; j < 4; j++) {
+        if (i * 4 + j < n / 32) dst[i] |= (uint32_t)src[i * 4 + j] << (8 * j);
+    }
 }

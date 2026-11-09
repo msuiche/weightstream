@@ -29,8 +29,15 @@ const TL_WO_A_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/wo_a.ptx"));
 const TL_WO_B_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/wo_b.ptx"));
 const TL_SHARED_W13_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/shared_w13.ptx"));
 const TL_SHARED_W2_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/shared_w2.ptx"));
+const TL_SHARED_GATE_UP_TP4_PTX: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/shared_gate_up_tp4.ptx"));
+const TL_SHARED_DOWN_TP4_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/shared_down_tp4.ptx"));
 const TL_ENGRAM_WKV_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/engram_wkv.ptx"));
-const TL_DRAFTER_MAIN_PROJ_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/drafter_main_proj.ptx"));
+const MHC_PROJECT_POST_PRE_PTX: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/mhc_project_post_pre.ptx"));
+const MHC_FINALIZE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/mhc_finalize.ptx"));
+const TL_DRAFTER_MAIN_PROJ_PTX: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/drafter_main_proj.ptx"));
 const TL_MOE_GATE_UP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_gate_up.ptx"));
 const TL_MOE_DOWN_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_down.ptx"));
 const TL_MOE_DISPATCH_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_dispatch.ptx"));
@@ -65,6 +72,10 @@ pub struct Cuda {
     pub tl_wo_b: Module,
     pub tl_shared_w13: Module,
     pub tl_shared_w2: Module,
+    pub tl_shared_gate_up_tp4: Module,
+    pub tl_shared_down_tp4: Module,
+    pub mhc_project_post_pre: Module,
+    pub mhc_finalize: Module,
     pub tl_engram_wkv: Module,
     pub tl_drafter_main_proj: Module,
     pub tl_moe_gate_up: Module,
@@ -118,14 +129,30 @@ impl Cuda {
             let tl_wkv = Module::from_ptx(TL_WKV_PTX, &[]).expect("tilelang wkv module");
             let tl_wo_a = Module::from_ptx(TL_WO_A_PTX, &[]).expect("tilelang wo_a module");
             let tl_wo_b = Module::from_ptx(TL_WO_B_PTX, &[]).expect("tilelang wo_b module");
-            let tl_shared_w13 = Module::from_ptx(TL_SHARED_W13_PTX, &[]).expect("tilelang shared_w13 module");
-            let tl_shared_w2 = Module::from_ptx(TL_SHARED_W2_PTX, &[]).expect("tilelang shared_w2 module");
-            let tl_engram_wkv = Module::from_ptx(TL_ENGRAM_WKV_PTX, &[]).expect("tilelang engram_wkv module");
-            let tl_drafter_main_proj = Module::from_ptx(TL_DRAFTER_MAIN_PROJ_PTX, &[]).expect("tilelang main_proj module");
-            let tl_moe_gate_up = Module::from_ptx(TL_MOE_GATE_UP_PTX, &[]).expect("tilelang moe_gate_up module");
-            let tl_moe_down = Module::from_ptx(TL_MOE_DOWN_PTX, &[]).expect("tilelang moe_down module");
-            let tl_moe_dispatch = Module::from_ptx(TL_MOE_DISPATCH_PTX, &[]).expect("tilelang moe_dispatch module");
-            let tl_sparse_mla = Module::from_ptx(TL_SPARSE_MLA_PTX, &[]).expect("tilelang sparse_mla module");
+            let tl_shared_w13 =
+                Module::from_ptx(TL_SHARED_W13_PTX, &[]).expect("tilelang shared_w13 module");
+            let tl_shared_w2 =
+                Module::from_ptx(TL_SHARED_W2_PTX, &[]).expect("tilelang shared_w2 module");
+            let tl_shared_gate_up_tp4 = Module::from_ptx(TL_SHARED_GATE_UP_TP4_PTX, &[])
+                .expect("tilelang TP4 shared gate/up module");
+            let tl_shared_down_tp4 = Module::from_ptx(TL_SHARED_DOWN_TP4_PTX, &[])
+                .expect("tilelang TP4 shared down module");
+            let mhc_project_post_pre = Module::from_ptx(MHC_PROJECT_POST_PRE_PTX, &[])
+                .expect("tilelang mHC post/pre module");
+            let mhc_finalize =
+                Module::from_ptx(MHC_FINALIZE_PTX, &[]).expect("tilelang mHC finalize module");
+            let tl_engram_wkv =
+                Module::from_ptx(TL_ENGRAM_WKV_PTX, &[]).expect("tilelang engram_wkv module");
+            let tl_drafter_main_proj =
+                Module::from_ptx(TL_DRAFTER_MAIN_PROJ_PTX, &[]).expect("tilelang main_proj module");
+            let tl_moe_gate_up =
+                Module::from_ptx(TL_MOE_GATE_UP_PTX, &[]).expect("tilelang moe_gate_up module");
+            let tl_moe_down =
+                Module::from_ptx(TL_MOE_DOWN_PTX, &[]).expect("tilelang moe_down module");
+            let tl_moe_dispatch =
+                Module::from_ptx(TL_MOE_DISPATCH_PTX, &[]).expect("tilelang moe_dispatch module");
+            let tl_sparse_mla =
+                Module::from_ptx(TL_SPARSE_MLA_PTX, &[]).expect("tilelang sparse_mla module");
             *guard = Some(Cuda {
                 context,
                 device,
@@ -155,6 +182,10 @@ impl Cuda {
                 tl_wo_b,
                 tl_shared_w13,
                 tl_shared_w2,
+                tl_shared_gate_up_tp4,
+                tl_shared_down_tp4,
+                mhc_project_post_pre,
+                mhc_finalize,
                 tl_engram_wkv,
                 tl_drafter_main_proj,
                 tl_moe_gate_up,
@@ -401,11 +432,7 @@ mod tests {
                 (1.0 + mant as f32 / 8.0) * 2f32.powi(e - 7)
             }
         };
-        if sign {
-            -val
-        } else {
-            val
-        }
+        if sign { -val } else { val }
     }
 
     #[test]
@@ -572,11 +599,7 @@ mod tests {
             }
         }
         let r = GRID[best];
-        if sign {
-            -r
-        } else {
-            r
-        }
+        if sign { -r } else { r }
     }
 
     #[test]
@@ -1251,6 +1274,61 @@ mod tests {
                 .map(|(g, e)| (g - e).abs())
                 .fold(0.0, f32::max);
             assert!(e < 1e-4, "bf16_gemv max err {e}");
+        }
+    }
+
+    #[test]
+    fn bf16_gemm_m5_matches_independent_gemvs() {
+        let guard = Cuda::global();
+        let cuda = guard.as_ref().unwrap();
+        let (m, rows, cols) = (5usize, 64usize, 2048usize);
+        let (x_stride, y_stride) = (cols + 16, rows + 8);
+        let w: Vec<u16> = rand_vec(rows * cols, 5101)
+            .iter()
+            .map(|&v| f32_to_bf16_bits(v))
+            .collect();
+        let x = rand_vec(m * x_stride, 5102);
+        let d_w = DeviceBuffer::from_slice(&w).unwrap();
+        let d_x = DeviceBuffer::from_slice(&x).unwrap();
+        let d_y = DeviceBuffer::<f32>::from_slice(&vec![0.0f32; m * y_stride]).unwrap();
+        let d_ref = DeviceBuffer::<f32>::from_slice(&vec![0.0f32; m * y_stride]).unwrap();
+        let batched = cuda.gemv.get_function("bf16_gemm_m5").unwrap();
+        let scalar = cuda.gemv.get_function("bf16_gemv").unwrap();
+        let stream = &cuda.stream;
+        unsafe {
+            launch!(batched<<<rows as u32, 256, 0, stream>>>(
+                d_w.as_device_ptr(),
+                d_x.as_device_ptr(),
+                d_y.as_device_ptr(),
+                m as i32,
+                rows as i32,
+                cols as i32,
+                x_stride as i32,
+                y_stride as i32
+            ))
+            .unwrap();
+            for i in 0..m {
+                launch!(scalar<<<rows as u32, 256, 0, stream>>>(
+                    d_w.as_device_ptr(),
+                    d_x.index(i * x_stride..(i + 1) * x_stride).as_device_ptr(),
+                    d_ref.index(i * y_stride..i * y_stride + rows).as_device_ptr(),
+                    rows as i32,
+                    cols as i32
+                ))
+                .unwrap();
+            }
+            stream.synchronize().unwrap();
+        }
+        let mut got = vec![0.0f32; m * y_stride];
+        let mut expected = vec![0.0f32; m * y_stride];
+        d_y.copy_to(&mut got).unwrap();
+        d_ref.copy_to(&mut expected).unwrap();
+        for i in 0..m {
+            assert_eq!(
+                &got[i * y_stride..i * y_stride + rows],
+                &expected[i * y_stride..i * y_stride + rows],
+                "batched BF16 changed reduction bits in row {i}"
+            );
         }
     }
 

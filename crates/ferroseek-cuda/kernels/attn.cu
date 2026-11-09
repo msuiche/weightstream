@@ -277,6 +277,16 @@ extern "C" __global__ void f32_to_bf16(
     if (i < n) y[i] = __float2bfloat16(x[i]);
 }
 
+extern "C" __global__ void bf16_to_f32(
+    const __nv_bfloat16* __restrict__ x,
+    float* __restrict__ y,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    y[i] = __bfloat162float(x[i]);
+}
+
 extern "C" __global__ void copy_u8(
     const uint8_t* __restrict__ x,
     uint8_t* __restrict__ y,

@@ -309,7 +309,7 @@ pub fn emit8(c: &Cuda, x: F32, q: U8, s: U8, n: usize) {
 pub fn pack_scales(c: &Cuda, src: U8, dst: U32, n: usize) {
     let f = c.actquant.get_function("pack_scale_words").unwrap();
     let stream = &c.stream;
-    let words = n / 128;
+    let words = n.div_ceil(128);
     unsafe { launch!(f<<<gx(words, 256), 256, 0, stream>>>(src, dst, n as i32)).unwrap() }
 }
 
@@ -322,6 +322,8 @@ pub enum TlGemm {
     WoB,
     SharedW13,
     SharedW2,
+    SharedGateUpTp4,
+    SharedDownTp4,
     EngramWkv,
     DrafterMainProj,
 }
@@ -338,14 +340,20 @@ pub fn fp8_gemm_tl(c: &Cuda, kind: TlGemm, a: U8, sa: U32, b: U8, sb: U32, out: 
         TlGemm::WoB => (&c.tl_wo_b, 40, 57_024),
         TlGemm::SharedW13 => (&c.tl_shared_w13, 36, 31_680),
         TlGemm::SharedW2 => (&c.tl_shared_w2, 80, 31_680),
+        TlGemm::SharedGateUpTp4 => (&c.tl_shared_gate_up_tp4, 36, 57_024),
+        TlGemm::SharedDownTp4 => (&c.tl_shared_down_tp4, 40, 31_680),
         TlGemm::EngramWkv => (&c.tl_engram_wkv, 400, 31_680),
         TlGemm::DrafterMainProj => (&c.tl_drafter_main_proj, 20, 31_680),
+    };
+    let threads = match kind {
+        TlGemm::SharedDownTp4 => 64,
+        _ => 128,
     };
     let f = module.get_function("gemm_mxfp8_kernel").unwrap();
     unsafe {
         shared_attr_once(&f, shared as i32);
         let stream = &c.stream;
-        launch!(f<<<(grid_x, (m + 15) as u32 / 16), 128, shared, stream>>>(
+        launch!(f<<<(grid_x, (m + 15) as u32 / 16), threads, shared, stream>>>(
             a, b, out, sa, sb, m as i32, m as i32
         ))
         .unwrap()
@@ -532,6 +540,13 @@ pub fn fp4_emit(c: &Cuda, x: F32, packed: U8, scales: U8, n: usize, block: usize
 
 pub fn f32_to_bf16(c: &Cuda, x: F32, y: U16, n: usize) {
     let f = c.attn.get_function("f32_to_bf16").unwrap();
+    let stream = &c.stream;
+    unsafe { launch!(f<<<gx(n, 256), 256, 0, stream>>>(x, y, n as i32)).unwrap() }
+}
+
+/// `bf16_to_f32` (attn.cu): unpack BF16 values into FP32.
+pub fn bf16_to_f32(c: &Cuda, x: U16, y: F32, n: usize) {
+    let f = c.attn.get_function("bf16_to_f32").unwrap();
     let stream = &c.stream;
     unsafe { launch!(f<<<gx(n, 256), 256, 0, stream>>>(x, y, n as i32)).unwrap() }
 }
@@ -723,6 +738,68 @@ pub fn fp4_gemm_tile(
 
 /// `hc_mixes` (hc.cu): one warp per dot row, grid (mix_hc, n_tokens) —
 /// the dots spread across SMs instead of 8 warps of one block.
+/// Production fused mHC post/pre projection (H=5120).
+#[allow(clippy::too_many_arguments)]
+pub fn mhc_post_pre(
+    c: &Cuda,
+    collapse: U16,
+    fnc: F32,
+    partials: F32,
+    q: F32,
+    residual: U16,
+    residual_out: U16,
+    sumsq: F32,
+    previous: U16,
+    comb: F32,
+    post: F32,
+    pre_in: F32,
+    tokens: usize,
+    hidden: usize,
+) {
+    let f = c
+        .mhc_project_post_pre
+        .get_function("mhc_project_streams_kernel")
+        .unwrap();
+    shared_attr_once(&f, 57_344);
+    let stream = &c.stream;
+    let splits = (hidden / 128) as u32;
+    unsafe {
+        launch!(f<<<(splits, tokens.div_ceil(16) as u32), 128, 57_344, stream>>>(
+            collapse, fnc, partials, q, residual, residual_out, sumsq,
+            previous, comb, post, pre_in, tokens as i32
+        ))
+        .unwrap()
+    }
+}
+
+/// Production mHC partial reduction, mix split, Sinkhorn and collapse norm.
+#[allow(clippy::too_many_arguments)]
+pub fn mhc_finalize(
+    c: &Cuda,
+    collapse: U16,
+    partials: F32,
+    q: F32,
+    sumsq: F32,
+    base: F32,
+    comb: F32,
+    post: F32,
+    pre_out: F32,
+    scale: F32,
+    weight: U16,
+    y: U16,
+    tokens: usize,
+) {
+    let f = c.mhc_finalize.get_function("mhc_finalize_kernel").unwrap();
+    let stream = &c.stream;
+    unsafe {
+        launch!(f<<<tokens as u32, 128, 1024, stream>>>(
+            collapse, partials, q, sumsq, base, comb, post, pre_out, scale, weight, y,
+            tokens as i32
+        ))
+        .unwrap()
+    }
+}
+
 pub fn hc_mixes(
     c: &Cuda,
     xf: F32,
@@ -732,8 +809,8 @@ pub fn hc_mixes(
     hc_dim: usize,
     mix_hc: usize,
 ) {
-    let f = c.hc.get_function("hc_mixes").unwrap();
     let stream = &c.stream;
+    let f = c.hc.get_function("hc_mixes").unwrap();
     unsafe {
         launch!(
             f<<<(mix_hc as u32, n_tokens as u32), 32, 0, stream>>>(
@@ -761,8 +838,8 @@ pub fn hc_finalize(
     mix_hc: usize,
     eps: f32,
 ) {
-    let f = c.hc.get_function("hc_finalize").unwrap();
     let stream = &c.stream;
+    let f = c.hc.get_function("hc_finalize").unwrap();
     unsafe {
         launch!(
             f<<<n_tokens as u32, 256, 0, stream>>>(
@@ -1069,6 +1146,31 @@ pub fn bf16_gemv(c: &Cuda, w: U16, x: F32, y: F32, rows: usize, cols: usize) {
     let stream = &c.stream;
     unsafe {
         launch!(f<<<rows as u32, 256, 0, stream>>>(w, x, y, rows as i32, cols as i32)).unwrap()
+    }
+}
+
+/// `bf16_gemm_m5` (gemv.cu): one weight pass for up to five input rows.
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_gemm_m5(
+    c: &Cuda,
+    w: U16,
+    x: F32,
+    y: F32,
+    m: usize,
+    rows: usize,
+    cols: usize,
+    x_stride: usize,
+    y_stride: usize,
+) {
+    assert!((1..=5).contains(&m));
+    let f = c.gemv.get_function("bf16_gemm_m5").unwrap();
+    let stream = &c.stream;
+    unsafe {
+        launch!(f<<<rows as u32, 256, 0, stream>>>(
+            w, x, y, m as i32, rows as i32, cols as i32,
+            x_stride as i32, y_stride as i32
+        ))
+        .unwrap()
     }
 }
 

@@ -179,6 +179,15 @@ driver: `/tmp/tp4-c1-dspark-spark-*.log`.
 - **Build note:** `cargo clean -p ferroseek-cuda` without `--release` removed
   nothing useful; use `cargo clean -p ferroseek-cuda --release` when forcing
   a kernel rebuild. Normal builds were otherwise reliable.
+- **Production mHC and shared-expert TP4 (2026-11-09).** The decoder now
+  uses the production TF32 `project_streams` and mHC finalizer for 38 layers,
+  with layer 0 and Engram layers retaining the original path. Shared experts
+  are fused and sharded to 576 rows/rank, with a single routed+shared
+  reduction. The new gate covers updated streams, TF32 projection, collapse,
+  final norm, shared TP4 GEMMs and BF16 row batching. Full suite: 31/31.
+  Corrected C1 is **34.56 tok/s** (28.94 ms/token); collective average fell
+  from 258 to 115 µs. DSpark currently accepts no drafts on this trace and is
+  not a throughput improvement. Raw log: `/tmp/tp4-c1-mhc-direct-*`.
 
 TP4 M-batch prefill measured separately on the same checkpoint: a
 132-token window-crossing prompt took 9.625 s versus 12.964 s with
