@@ -6,13 +6,14 @@ cache, cluster transport and serving layer are Rust; the tensor-core kernels
 are CUDA, reused from proven stacks first and rewritten only where profiling
 says so.
 
-Status: **TP4 upload mode, ~18 tok/s without speculation.** Real 4-rank
-decode of the 1017 checkpoint on the drained ring (2026-11-08): the measured
-64-token C1 story runs at 55.8 ms/token in lockstep. Grouped TileLang MoE,
+Status: **TP4 upload mode, ~19 tok/s without speculation.** Real 4-rank
+decode of the 1017 checkpoint on the drained ring (2026-11-10): the measured
+C1 story runs at about 52 ms/token in lockstep. Grouped TileLang MoE,
 active routing tiles, fused quantized sparse-MLA attention, cached TMA maps,
 and asynchronous Engram gathers are landed; the GPU gates and four-rank
 output-identity checks pass.
-What works today:
+
+## What works today
 
 - **CPU reference engine** (`ferroseek-ref`) — full DS4.1F decode on the real
   475 GB checkpoint, **gate-passed against the production vLLM TP4 stack**
@@ -41,14 +42,20 @@ What works today:
 - **DSpark speculative decode** — three MTP blocks, target-hidden capture,
   non-causal draft attention, Markov-biased proposals and greedy target
   verification. Quantized M=1 decode is 13.29 tok/s on the C1 story;
-  no-spec is faster at 17.93 tok/s, so serving keeps speculation disabled.
+  no-spec is faster at about 19 tok/s, so serving keeps speculation disabled.
   High-acceptance streaks use targeted-checkpoint M=5 verification; ordinary
   calls remain sequential (`FERROSEEK_SEQ_SPEC=1` forces that fallback).
+- **GLP-27 fold-site steering** — set `WEIGHTLESS_STEER_PATH` to a spec-v3
+  `.pt` or `.gguf` vector, optionally `WEIGHTLESS_STEER_ALPHA`,
+  `WEIGHTLESS_STEER_LAYERS`, and `WEIGHTLESS_STEER_HOOK=hc_fold_pre_engram`.
+  CPU and TP4 GPU decode apply the same fold and companion attention-writer
+  projection. Unset path disables steering.
 - **Serving** — `ferroseek serve --tp4 --ring ...`: OpenAI-compatible
   endpoint on the head rank, SSE streaming, `temperature`/`top_p`/`seed`
   broadcast with `Phase::Next` so all ranks draw identically
 
-Remaining: multi-request batching on the serving path. See
+Remaining: multi-request batching on the serving path and further C1 decode
+optimization; the 50 tok/s target has not been reached. See
 [`docs/architecture.md`](docs/architecture.md),
 [`docs/model-spec.md`](docs/model-spec.md), [`docs/streaming.md`](docs/streaming.md),
 [`docs/transport.md`](docs/transport.md).
@@ -77,18 +84,33 @@ rewriting mature matmul kernels.
 | `docs/` | model-spec, architecture, kernels, streaming, transport |
 | `scripts/gate.py` | teacher-forced logit gate vs the serving stack |
 
+## Requirements
+
+- Rust and CUDA 13 on NVIDIA DGX Spark (GB10, `sm_121`) for GPU decode.
+- The DeepSeek-V4.1-Flash-1017 safetensors checkpoint available locally.
+- Four Spark nodes with the switchless RoCE ring configured for TP4; CPU and
+  single-node GPU decode do not require the ring.
+
 ## Build
 
 ```sh
 cargo build
 cargo test                                  # host-only suite
+
 # on a DGX Spark:
-cargo test -p ferroseek-cuda --features cuda
-cargo test -p ferroseek-gpu --features cuda
+cargo build --release --features cuda
+cargo test --release -p ferroseek-cuda --features cuda
+cargo test --release -p ferroseek-gpu --features cuda -- --test-threads=1
+
 ./target/release/ferroseek decode /path/to/DeepSeek-V4.1-Flash-1017 \
     "The capital of France is" 6                 # CPU reference engine
 ./target/release/ferroseek decode /path/to/DeepSeek-V4.1-Flash-1017 \
     "The capital of France is" 6 --engine gpu --stream
+
+# TP4: run on each node, replacing N with its rank (0, 1, 2, or 3):
+./target/release/ferroseek decode /path/to/DeepSeek-V4.1-Flash-1017 \
+    "The capital of France is" 6 --engine gpu --tp4 --rank N \
+    --ring nodes-ring4.local.json --no-spec
 ```
 
 ## Credits
