@@ -1,4 +1,4 @@
-# ferroseek TP4 transport
+# weightstream TP4 transport
 
 The collectives layer for the 4-node switchless ring. Design follows the
 reference stack's rules (sparknet, via docs/model-spec.md §3 and the
@@ -83,7 +83,7 @@ transport's all-reduce at the three spec reduction points plus the
 logits all-gather (added to `ring.rs`: same QPs, same two-hop schedule,
 rank-ordered concatenation). Real 4-rank decode of the 1017 checkpoint:
 'The capital of France is' → ' Paris.', all four ranks' raw logits
-bit-identical. On the drained box (ferroseek as the sole tenant):
+bit-identical. On the drained box (weightstream as the sole tenant):
 94 ms/token lockstep = 10.6 tok/s single-stream (2026-10-26; was
 1.2 s/token under the vLLM co-tenant with per-use expert staging).
 2026-10-31: worker control reads now use the head's 600 s barrier budget

@@ -1,4 +1,4 @@
-# ferroseek architecture
+# weightstream architecture
 
 Target: DeepSeek-V4.1-Flash-1017, NVFP4/FP8/BF16 native weights, on a
 switchless DGX Spark fabric — TP4 ring (four nodes, 1M context, 16
@@ -32,7 +32,7 @@ spark-ds41f is the bar. Its production shape, distilled:
 
 An engine that cannot match the correctness gate does not get benchmarked;
 an engine that cannot match the repeatability does not get promoted. Those
-two rules are ferroseek's too.
+two rules are weightstream's too.
 
 ## Where Rust wins, where it doesn't
 

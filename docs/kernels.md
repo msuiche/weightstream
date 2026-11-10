@@ -1,4 +1,4 @@
-# ferroseek kernel plan
+# weightstream kernel plan
 
 Every kernel lands with the same gate: output compared against the pure-Rust
 CPU reference (`ferroseek-ref`) on identical inputs, tolerance policy per

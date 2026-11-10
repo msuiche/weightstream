@@ -1,4 +1,4 @@
-# Performance gap: ferroseek vs the spark-ds41f reference stack
+# Performance gap: weightstream vs the spark-ds41f reference stack
 
 Handoff for the agent picking up performance work. Everything here is
 measured on the same hardware; sources are cited per claim. Repo state:
@@ -25,7 +25,7 @@ The dsv41f lane with GLP-27 fold-site steering armed (α=3.5), TP4 ring,
 DSpark speculative decoding, thermal cap on. Measured by
 `bin/spark bench` on the four-node ring, zero foreign requests:
 
-| metric | GLP-27 lane | ferroseek upload TP4 (2026-11-07, no-spec) |
+| metric | GLP-27 lane | weightstream upload TP4 (2026-11-07, no-spec) |
 |---|---|---|
 | decode t/s, single stream (C1) | **58.64** (tpot p50 16.57 ms) | **19.24** (52.0 ms/token, 2026-11-10) |
 | decode t/s, aggregate (C16) | **215.94** (tpot p50 73.86 ms) | — (single-request lockstep) |
@@ -34,9 +34,9 @@ DSpark speculative decoding, thermal cap on. Measured by
 The later LocalArena engine showdown measured the same spark-ds41f
 TileLang + DSpark stack at **85 tok/s single-stream**, **262 tok/s at eight
 users**, and **6,636 tok/s cold prefill**. Against that newer 85 tok/s
-reference, ferroseek's current 19.24 tok/s is about **4.4× slower**.
+reference, weightstream's current 19.24 tok/s is about **4.4× slower**.
 
-This is the apples-to-apples bar for ferroseek's upload-TP4 work: same
+This is the apples-to-apples bar for weightstream's upload-TP4 work: same
 hardware, same checkpoint, same DSpark spec-decode, steering armed. The
 2026-10-17 reference below is the UNSTEERED stock 1022 lane (a different
 graph); the GLP-27 numbers include the fold materialization + companion
@@ -52,7 +52,7 @@ measurement and is about 3.9× faster at the current 65–67 ms. The current
 story decode used `Write a long story about a dragon` to avoid an immediate
 EOS and produced the same 20-token stream with and without DSpark. This is
 a steady-state C1 data point, not a prompt-matched GLP rerun.
-ferroseek serving serializes requests. No 32K/131K prefill comparison
+weightstream serving serializes requests. No 32K/131K prefill comparison
 was run. Raw logs: `spark-*:/tmp/tp4-upload-rank{0..3}.log` (validation)
 and `spark-*:/tmp/tp4-bench-rank{0..3}.log` (benchmark).
 
@@ -240,7 +240,7 @@ TP4 M-batch prefill measured separately on the same checkpoint: a
 (M-batch) and `spark-*:/tmp/tp4-shortseq-rank{0..3}.log` (sequential).
 
 ## Measured numbers (same hardware, same model)
-| | spark-ds41f TP4 ring (2026-10-17) | ferroseek (best measured) |
+| | spark-ds41f TP4 ring (2026-10-17) | weightstream (best measured) |
 |---|---|---|
 | decode step | 36.7–39.1 ms | — |
 | decode t/s, per stream | C1 **98.2**, C8 49.1, C16 35.6 | ~0.5 single-node stream |
@@ -248,7 +248,7 @@ TP4 M-batch prefill measured separately on the same checkpoint: a
 | cold prefill | 4.5–6.2k t/s (3.5k–109k tokens) | ~0.6 t/s (8.3 s / 5 tokens) |
 | weights | resident: 119 GB/rank as cudaMalloc @ 226 GB/s | streamed/staged @ ≤163 GB/s |
 
-ferroseek data points:
+weightstream data points:
 
 - 2026-10-30, `spark-4687`, single-node `--engine gpu --stream`,
   `FERROSEEK_STREAM_BUDGET_GB=24`, clocks locked 2418 MHz (diagnostic):
@@ -265,14 +265,14 @@ ferroseek data points:
 Multiplicative, ordered by impact:
 
 1. **Weight residency / bandwidth regime.** Original: slices resident
-   as ordinary cudaMalloc, 226 GB/s. ferroseek streaming: registered
+   as ordinary cudaMalloc, 226 GB/s. weightstream streaming: registered
    page-cache mmaps, 163 GB/s ceiling (0.72×), and below the
    registration budget most expert bytes are per-use staged HtoD copies
    — far under that. Traffic ~6 GB/token (4.3 GB fp4 experts + 1.6 GB
-   fp8 attention). ferroseek's own doc floor for streaming is
+   fp8 attention). weightstream's own doc floor for streaming is
    ~40 ms/token warm; measured is 1.5–2.3 s.
 2. **MoE dispatch.** Original: grouped-expert GEMM, routing consumed
-   on-device. ferroseek streaming: host-dispatch loop — gate readback
+   on-device. weightstream streaming: host-dispatch loop — gate readback
    + pipeline sync per layer, then top-6 experts × 3 GEMMs serially
    (documented ~150 ms/token at 40 layers before staging; ~240 kernel
    launches+syncs per token). The fused path (`moe_grouped.cu`,

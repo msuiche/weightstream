@@ -1,4 +1,4 @@
-# ferroseek
+# weightstream
 
 A DGX Spark-native inference engine for DeepSeek V4.1 Flash, written in
 Rust. One model, one hardware target, no generality tax: the scheduler, KV
