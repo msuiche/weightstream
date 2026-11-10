@@ -9,9 +9,9 @@ use crate::hc;
 use crate::moe;
 use crate::num;
 use crate::rope::Freqs;
-use crate::store::{bf16_row, CkptStore, DenseLru, SyntheticWeights, WeightStore};
-use ferroseek_core::loader::Checkpoint;
+use crate::store::{CkptStore, DenseLru, SyntheticWeights, WeightStore, bf16_row};
 use ferroseek_core::ModelConfig;
+use ferroseek_core::loader::Checkpoint;
 use std::io;
 
 /// Per-layer static wiring derived from the config (spec §0/§3-§5).
@@ -106,6 +106,7 @@ pub struct RefModel<'a> {
     layers: Vec<LayerInfo>,
     engram: EngramLayout,
     rt: Runtime,
+    glp: Option<ferroseek_core::glp::GlpVector>,
 }
 
 /// Default budget for dequantized dense (bf16/f32) tensors. The full model is
@@ -118,7 +119,8 @@ impl<'a> RefModel<'a> {
     /// outside the model (mmap is kept); tensors are dequantized on demand.
     pub fn from_checkpoint(ckpt: &'a mut Checkpoint) -> io::Result<Self> {
         let cfg = RefConfig::from_model_config(&ckpt.config)?;
-        let mut model = Self::build(cfg, Box::new(CkptStore::new(ckpt)))?;
+        let hint = ckpt.dir.to_str().map(str::to_owned);
+        let mut model = Self::build(cfg, Box::new(CkptStore::new(ckpt)), hint.as_deref())?;
         model.validate_layout()?;
         Ok(model)
     }
@@ -129,12 +131,21 @@ impl<'a> RefModel<'a> {
         weights: SyntheticWeights,
     ) -> io::Result<RefModel<'static>> {
         let rcfg = RefConfig::from_model_config(&cfg)?;
-        let model = RefModel::build(rcfg, Box::new(weights))?;
+        let model = RefModel::build(rcfg, Box::new(weights), None)?;
         Ok(model)
     }
 
-    fn build(cfg: RefConfig, store: Box<dyn WeightStore + 'a>) -> io::Result<Self> {
+    fn build(
+        cfg: RefConfig,
+        store: Box<dyn WeightStore + 'a>,
+        base_hint: Option<&str>,
+    ) -> io::Result<Self> {
         Self::validate_dims(&cfg)?;
+        let glp = ferroseek_core::glp::GlpVector::from_env(
+            cfg.n_layers as usize,
+            cfg.dim as usize,
+            base_hint,
+        )?;
         let engram = EngramLayout::build(&cfg)?;
         // table rows must cover every (offset + prime) range (spec §12.5)
         for (i, need) in engram.required_rows().iter().enumerate() {
@@ -214,6 +225,7 @@ impl<'a> RefModel<'a> {
             layers,
             engram,
             rt,
+            glp,
         })
     }
 
@@ -351,6 +363,7 @@ impl<'a> RefModel<'a> {
             layers,
             engram,
             rt,
+            glp,
         } = self;
         let mut ctx = Ctx {
             store: &mut **store,
@@ -411,6 +424,12 @@ impl<'a> RefModel<'a> {
 
         for li in layers.iter() {
             let l = li.layer;
+            if let Some(g) = glp {
+                if let Some(d) = g.fold_dir(l as usize) {
+                    ferroseek_core::glp::fold_project_cpu(&mut h, d, g.alpha, hc);
+                    snap_bf16(&mut h);
+                }
+            }
             dump(format!("pos{position}_pre{l}.f32"), &h);
             // engram writes into the stream before the block (model.py:1264-1266)
             if let Some(ei) = li.engram_idx {
@@ -452,6 +471,11 @@ impl<'a> RefModel<'a> {
                 x
             };
             let mut x = crate::attn::attention(cfg, li, &mut ctx, rt, &x, position)?;
+            if let Some(g) = glp {
+                if let Some(d) = g.writer_dir(l as usize) {
+                    ferroseek_core::glp::writer_project_cpu(&mut x, d, g.alpha);
+                }
+            }
             dump(format!("pos{position}_attn{l}.f32"), &x);
             snap_bf16(&mut x);
             let mut h2 = hc::hc_post(&x, &h, &a_post, &a_comb, hc, dim);
@@ -499,6 +523,12 @@ impl<'a> RefModel<'a> {
             snap_bf16(&mut h2);
             h = h2;
             pre_mix = f_pre;
+        }
+        if let Some(g) = glp {
+            if let Some(d) = g.fold_dir(cfg.n_layers as usize - 1) {
+                ferroseek_core::glp::fold_project_cpu(&mut h, d, g.alpha, hc);
+                snap_bf16(&mut h);
+            }
         }
 
         // collapse, final norm, head (model.py:1271-1272, spec §1)

@@ -505,8 +505,6 @@ pub struct GpuLayer {
     freq: usize,
     attn_norm_w: D<f32>,
     ffn_norm_w: D<f32>,
-    attn_norm_bf16: D<u16>,
-    ffn_norm_bf16: D<u16>,
     hc_attn_fn: D<f32>,
     hc_ffn_fn: D<f32>,
     hc_attn_base: D<f32>,
@@ -521,6 +519,7 @@ pub struct GpuLayer {
     attn_sink: D<f32>,
     /// Host-dequantized f32 (spec §11).
     wo_a: D<u16>,
+    wo_a_fp8: Option<WoAFP8>,
     wo_b: Q8,
     gate_w: D<u16>,
     gate_bias: D<f32>,
@@ -655,14 +654,6 @@ struct Scratch {
     pre_ffn: D<f32>,
     post: D<f32>,
     comb: D<f32>,
-    mhc_r: D<u16>,
-    mhc_r_out: D<u16>,
-    mhc_x: D<u16>,
-    mhc_c: D<u16>,
-    mhc_y: D<u16>,
-    mhc_p: D<f32>,
-    mhc_s: D<f32>,
-    mhc_q: D<f32>,
     zeros_h: D<f32>,
     ones_hc: D<f32>,
     comb_zero: D<f32>,
@@ -768,6 +759,8 @@ pub struct GpuModel<'a> {
     emb: Option<D<f32>>,
     head: D<u16>,
     final_norm: D<f32>,
+    glp_dirs: Vec<Option<D<f32>>>,
+    glp_alpha: f32,
     scratch: Scratch,
     /// M-row scratch for `decode_m`, grown on first use (None until then).
     scratch_m: Option<ScratchM>,
@@ -778,8 +771,6 @@ pub struct GpuModel<'a> {
     run: RunState,
     pos: u64,
     spec_accept: usize,
-    /// Draft-free rounds remaining after an anchor-only probe.
-    spec_skip: u8,
     max_seq: u64,
     /// TP hook (see [`Sharding`]); TP1 for now.
     pub sharding: Sharding,
@@ -850,15 +841,12 @@ fn up_zero_f32(_c: &Cuda, n: usize) -> io::Result<D<f32>> {
 
 pub(crate) fn pack_weight_scales(bytes: &[u8], n: usize, k: usize) -> Vec<u32> {
     let kb = k / 32;
-    let words = k.div_ceil(128);
+    let words = k / 128;
     let mut out = vec![0u32; n * words];
     for row in 0..n {
         for w in 0..words {
             for j in 0..4 {
-                let index = (row / 32) * kb + w * 4 + j;
-                if index < (row / 32 + 1) * kb {
-                    out[row * words + w] |= (bytes[index] as u32) << (8 * j);
-                }
+                out[row * words + w] |= (bytes[(row / 32) * kb + w * 4 + j] as u32) << (8 * j);
             }
         }
     }
@@ -929,7 +917,7 @@ fn load_q8(
             let v = store.get(sname)?;
             shard_scale(v.bytes, &v.shape, shard)?.as_slice().to_vec()
         };
-        let packed = (k % 32 == 0).then(|| pack_weight_scales(&sb, n, k));
+        let packed = (k % 128 == 0).then(|| pack_weight_scales(&sb, n, k));
         Ok(Q8 {
             w: W8::device(up_u8(c, &wb)?),
             s: W8::device(up_u8(c, &sb)?),
@@ -969,10 +957,7 @@ fn load_q8_combined_rows(
     let (w1, s1, n1, k1) = load(store, wa, sa)?;
     let (w3, s3, n3, k3) = load(store, wb, sb)?;
     if k1 != k3 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "combined Q8 projections have different K dimensions",
-        ));
+        return ioerr("combined Q8 projections have different K dimensions".into());
     }
     let (n, k) = (n1 + n3, k1);
     let w = [w1, w3].concat();
@@ -1009,10 +994,17 @@ fn load_q4(
     }
 }
 
+pub(crate) struct WoAFP8 {
+    pub w: D<u8>,
+    pub s: D<u8>,
+    pub block: usize,
+    pub scale_cols: usize,
+}
+
 /// wo_a: bf16 dense (converted export, spec §11) or fp8+scale (raw HF
 /// export) — dequantize host-side to f32 either way, like the ref's dense
 /// path. TP4 loads the rank's contiguous o-group block: rows
-fn load_wo_a(
+pub(crate) fn load_wo_a(
     store: &mut dyn WeightStore,
     c: &Cuda,
     name: &str,
@@ -1089,6 +1081,53 @@ fn load_wo_a(
         }
         d => ioerr(format!("{name}: unexpected wo_a dtype {d:?}")),
     }
+}
+
+pub(crate) fn load_wo_a_fp8(
+    store: &mut dyn WeightStore,
+    c: &Cuda,
+    name: &str,
+    rows: usize,
+    cols: usize,
+    row_start: usize,
+    row_len: usize,
+) -> io::Result<Option<WoAFP8>> {
+    let v = store.get(name)?;
+    if v.dtype != DType::Fp8E4m3 {
+        return Ok(None);
+    }
+    let full_rows = rows;
+    let bytes = v.bytes[row_start * cols..(row_start + row_len) * cols].to_vec();
+    drop(v);
+    let sname = format!("{}.scale", name.trim_end_matches(".weight"));
+    let sview = store.get(&sname)?;
+    let sshape = sview.shape.clone();
+    let sbytes_full = sview.bytes.to_vec();
+    drop(sview);
+    if sshape.len() != 2 {
+        return ioerr(format!("{sname}: bad scale shape {sshape:?}"));
+    }
+    let block = full_rows / sshape[0];
+    if block == 0 || block != cols / sshape[1] {
+        return ioerr(format!(
+            "{sname}: scale shape {sshape:?} does not tile [{full_rows}, {cols}]"
+        ));
+    }
+    if row_start % block != 0 || row_len % block != 0 {
+        return ioerr(format!(
+            "{sname}: wo_a shard [{row_start}, +{row_len}) not {block}-aligned"
+        ));
+    }
+    let scale_cols = sshape[1];
+    let s0 = row_start / block;
+    let s1 = s0 + row_len / block;
+    let scales = sbytes_full[s0 * scale_cols..s1 * scale_cols].to_vec();
+    Ok(Some(WoAFP8 {
+        w: up_u8(c, &bytes)?,
+        s: up_u8(c, &scales)?,
+        block,
+        scale_cols,
+    }))
 }
 
 /// fp8 [rows, cols] dequant with ue8m0 scales per `b x b` block
@@ -1369,24 +1408,6 @@ fn upload_layer(
     // per-field loads (the struct literal binds them in order)
     let attn_norm_w = up_f32(c, &view_f32(store, &format!("{p}.attn_norm.weight"))?)?;
     let ffn_norm_w = up_f32(c, &view_f32(store, &format!("{p}.ffn_norm.weight"))?)?;
-    let attn_norm_bf16 = up_u16(
-        c,
-        &store
-            .get(&format!("{p}.attn_norm.weight"))?
-            .bytes
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-            .collect::<Vec<_>>(),
-    )?;
-    let ffn_norm_bf16 = up_u16(
-        c,
-        &store
-            .get(&format!("{p}.ffn_norm.weight"))?
-            .bytes
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-            .collect::<Vec<_>>(),
-    )?;
     let hc_attn_fn = up_f32(c, &view_f32(store, &format!("{p}.hc_attn_fn"))?)?;
     let hc_ffn_fn = up_f32(c, &view_f32(store, &format!("{p}.hc_ffn_fn"))?)?;
     let hc_attn_base = up_f32(c, &view_f32(store, &format!("{p}.hc_attn_base"))?)?;
@@ -1437,6 +1458,15 @@ fn upload_layer(
         rank * og_l * cfg.o_lora as usize,
         og_l * cfg.o_lora as usize,
     )?;
+    let wo_a_fp8 = load_wo_a_fp8(
+        store,
+        c,
+        &format!("{p}.attn.wo_a.weight"),
+        cfg.o_groups as usize * cfg.o_lora as usize,
+        cfg.n_heads as usize * hd / cfg.o_groups as usize,
+        rank * og_l * cfg.o_lora as usize,
+        og_l * cfg.o_lora as usize,
+    )?;
     let wo_b = load_q8(
         store,
         c,
@@ -1461,23 +1491,6 @@ fn upload_layer(
             .collect::<Vec<u16>>()
     })?;
     let gate_bias = up_f32(c, &view_f32(store, &format!("{p}.ffn.gate.bias"))?)?;
-    let shared_inter = cfg.inter_dim as usize / world;
-    let shared_rows = if world > 1 && arena.is_none() {
-        WShard::Rows {
-            start: rank * shared_inter,
-            len: shared_inter,
-        }
-    } else {
-        WShard::All
-    };
-    let shared_cols = if world > 1 && arena.is_none() {
-        WShard::Cols {
-            start: rank * shared_inter,
-            len: shared_inter,
-        }
-    } else {
-        WShard::All
-    };
     let shared_experts = [
         load_q8(
             store,
@@ -1485,7 +1498,7 @@ fn upload_layer(
             arena,
             &format!("{p}.ffn.shared_experts.w1.weight"),
             &format!("{p}.ffn.shared_experts.w1.scale"),
-            shared_rows,
+            WShard::All,
         )?,
         load_q8(
             store,
@@ -1493,7 +1506,7 @@ fn upload_layer(
             arena,
             &format!("{p}.ffn.shared_experts.w2.weight"),
             &format!("{p}.ffn.shared_experts.w2.scale"),
-            shared_cols,
+            WShard::All,
         )?,
         load_q8(
             store,
@@ -1501,10 +1514,10 @@ fn upload_layer(
             arena,
             &format!("{p}.ffn.shared_experts.w3.weight"),
             &format!("{p}.ffn.shared_experts.w3.scale"),
-            shared_rows,
+            WShard::All,
         )?,
     ];
-    let shared_w13 = if world > 1 && arena.is_none() {
+    let shared_w13 = if arena.is_none() {
         Some(load_q8_combined_rows(
             store,
             c,
@@ -1512,7 +1525,7 @@ fn upload_layer(
             &format!("{p}.ffn.shared_experts.w1.scale"),
             &format!("{p}.ffn.shared_experts.w3.weight"),
             &format!("{p}.ffn.shared_experts.w3.scale"),
-            shared_rows,
+            WShard::All,
         )?)
     } else {
         None
@@ -1530,8 +1543,6 @@ fn upload_layer(
         freq: if ratio > 0 { 1 } else { 0 },
         attn_norm_w,
         ffn_norm_w,
-        attn_norm_bf16,
-        ffn_norm_bf16,
         hc_attn_fn,
         hc_ffn_fn,
         hc_ffn_base,
@@ -1545,6 +1556,7 @@ fn upload_layer(
         kv_norm_w,
         attn_sink,
         wo_a,
+        wo_a_fp8,
         wo_b,
         gate_w,
         gate_bias,
@@ -1702,7 +1714,6 @@ impl<'a> GpuModel<'a> {
         };
         self.pos = 0;
         self.spec_accept = 0;
-        self.spec_skip = 0;
         Ok(())
     }
 
@@ -2126,6 +2137,8 @@ impl<'a> GpuModel<'a> {
             emb,
             head,
             final_norm,
+            glp_dirs,
+            glp_alpha,
             bands,
             run,
             engram,
@@ -2255,8 +2268,18 @@ impl<'a> GpuModel<'a> {
         let mut h_cur = 0usize;
         for li in 0..layers.len() {
             let layer = &layers[li];
-            let production_mhc = world > 1 && layer.layer > 0 && layer.engram.is_none();
-            if capture_drafter && !production_mhc {
+            if let Some(d) = &glp_dirs[layer.layer as usize] {
+                k::glp_project(
+                    c,
+                    k::base(&s.h[h_cur]),
+                    k::base(d),
+                    k::base(&s.h[h_cur]),
+                    *glp_alpha,
+                    hc,
+                    dim,
+                );
+            }
+            if capture_drafter {
                 Self::capture_main_hidden(main_hiddens, c, cfg, &s.h[h_cur], 0, layer.layer)?;
             }
 
@@ -2368,7 +2391,7 @@ impl<'a> GpuModel<'a> {
                         );
                     }
                 }
-                k::emit8(
+                k::emit8_packed(
                     c,
                     k::base(&s.eflat),
                     k::base(&s.act_e),
@@ -2403,14 +2426,7 @@ impl<'a> GpuModel<'a> {
             // attention sublayer wiring (spec §2, model.py:970-996)
             let hc_dim = hc * dim;
             let mix_hc = cfg.mix_hc();
-            if production_mhc {
-                let h_next = 1 - h_cur;
-                mhc_post_pre_step(c, cfg, layer, s, h_cur, h_next, k::base(&s.y_moe), true)?;
-                h_cur = h_next;
-                if capture_drafter {
-                    Self::capture_main_hidden(main_hiddens, c, cfg, &s.h[h_cur], 0, layer.layer)?;
-                }
-            } else if world > 1 {
+            if world > 1 {
                 // split hc (TP4): the 24 dot rows run on 24 SMs; identical
                 // per-lane order and shuffle tree as hc_block (gate-verified)
                 k::hc_mixes(
@@ -2452,24 +2468,22 @@ impl<'a> GpuModel<'a> {
                     cfg.hc_eps,
                 );
             }
-            if !production_mhc {
-                k::hc_pre(
-                    c,
-                    k::base(&s.h[h_cur]),
-                    k::base(&s.pre_ffn),
-                    k::base(&s.x),
-                    1,
-                    dim,
-                );
-                k::rmsnorm(
-                    c,
-                    k::base(&s.x),
-                    k::base(&layer.attn_norm_w),
-                    k::base(&s.x),
-                    dim,
-                    eps,
-                );
-            }
+            k::hc_pre(
+                c,
+                k::base(&s.h[h_cur]),
+                k::base(&s.pre_ffn),
+                k::base(&s.x),
+                1,
+                dim,
+            );
+            k::rmsnorm(
+                c,
+                k::base(&s.x),
+                k::base(&layer.attn_norm_w),
+                k::base(&s.x),
+                dim,
+                eps,
+            );
 
             let t_att = Instant::now();
             let attn_out = attention_step(
@@ -2486,9 +2500,15 @@ impl<'a> GpuModel<'a> {
                 sharding,
                 comm_opt.as_deref_mut(),
             )?;
+            if let Some(d) = glp_dirs
+                .get(layer.layer as usize + 1)
+                .and_then(|d| d.as_ref())
+            {
+                k::glp_project(c, attn_out, k::base(d), attn_out, *glp_alpha, 1, dim);
+            }
             prof.add_us(0, t_att);
 
-            if !production_mhc {
+            {
                 let h_next = 1 - h_cur;
                 k::hc_post(
                     c,
@@ -2503,13 +2523,8 @@ impl<'a> GpuModel<'a> {
                 h_cur = h_next;
             }
 
-            let t_moe = Instant::now();
             // ffn sublayer: its pre feeds the next block's attention
-            if production_mhc {
-                let h_next = 1 - h_cur;
-                mhc_post_pre_step(c, cfg, layer, s, h_cur, h_next, attn_out, false)?;
-                h_cur = h_next;
-            } else if world > 1 {
+            if world > 1 {
                 k::hc_mixes(
                     c,
                     k::base(&s.h[h_cur]),
@@ -2549,41 +2564,38 @@ impl<'a> GpuModel<'a> {
                     cfg.hc_eps,
                 );
             }
-            if !production_mhc {
-                k::hc_pre(
-                    c,
-                    k::base(&s.h[h_cur]),
-                    k::base(&s.pre_attn),
-                    k::base(&s.x),
-                    1,
-                    dim,
-                );
-                k::rmsnorm(
-                    c,
-                    k::base(&s.x),
-                    k::base(&layer.ffn_norm_w),
-                    k::base(&s.x),
-                    dim,
-                    eps,
-                );
-            }
+            k::hc_pre(
+                c,
+                k::base(&s.h[h_cur]),
+                k::base(&s.pre_attn),
+                k::base(&s.x),
+                1,
+                dim,
+            );
+            k::rmsnorm(
+                c,
+                k::base(&s.x),
+                k::base(&layer.ffn_norm_w),
+                k::base(&s.x),
+                dim,
+                eps,
+            );
 
-            if !production_mhc {
-                moe_step(
-                    c,
-                    cfg,
-                    layer,
-                    s,
-                    arena_opt,
-                    sharding,
-                    comm_opt.as_deref_mut(),
-                    prof,
-                    Some(run),
-                )?;
-            }
+            let t_moe = Instant::now();
+            moe_step(
+                c,
+                cfg,
+                layer,
+                s,
+                arena_opt,
+                sharding,
+                comm_opt.as_deref_mut(),
+                prof,
+                Some(run),
+            )?;
             prof.add_us(1, t_moe);
 
-            if !production_mhc {
+            {
                 let h_next = 1 - h_cur;
                 k::hc_post(
                     c,
@@ -2597,6 +2609,17 @@ impl<'a> GpuModel<'a> {
                 );
                 h_cur = h_next;
             }
+        }
+        if let Some(d) = &glp_dirs[layers.len() - 1] {
+            k::glp_project(
+                c,
+                k::base(&s.h[h_cur]),
+                k::base(d),
+                k::base(&s.h[h_cur]),
+                *glp_alpha,
+                hc,
+                dim,
+            );
         }
 
         // collapse with the last layer's ffn pre, final norm, head
@@ -2907,6 +2930,17 @@ impl<'a> GpuModel<'a> {
         let win = cfg.window_size as usize;
         let n_layers = cfg.n_layers as usize;
 
+        let glp = ferroseek_core::glp::GlpVector::from_env(n_layers, dim, None)?;
+        let glp_alpha = glp.as_ref().map(|g| g.alpha).unwrap_or(0.0);
+        let glp_dirs = (0..n_layers)
+            .map(|layer| {
+                glp.as_ref()
+                    .and_then(|g| g.dirs.get(&(layer as u32)))
+                    .map(|v| up_f32(c, v))
+                    .transpose()
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+
         // kv-source wiring + publish bands (mirror of the ref's shared slots)
         let mut kv_src_of = vec![None::<usize>; n_layers];
         for (ord, &s) in cfg.kv_sources.iter().enumerate() {
@@ -3153,9 +3187,11 @@ impl<'a> GpuModel<'a> {
         let eflat_len = engram.n_hash_cols * engram.head_dim;
         let act = |n: usize| -> io::Result<(D<u8>, D<u8>)> {
             assert!(n % 32 == 0 && n > 0);
+            let raw = n / 32;
+            let packed_offset = raw.next_multiple_of(16);
             Ok((
                 DeviceBuffer::zeroed(n).map_err(cuda_err)?,
-                DeviceBuffer::zeroed(n / 16).map_err(cuda_err)?,
+                DeviceBuffer::zeroed(packed_offset + raw).map_err(cuda_err)?,
             ))
         };
         let (act_x, act_x_s) = act(dim)?;
@@ -3224,8 +3260,11 @@ impl<'a> GpuModel<'a> {
             route_h: up_zero_f32(c, dispatch_tiles * 32 * cfg.inter_dim as usize)?,
             route_q: DeviceBuffer::zeroed(dispatch_tiles * 32 * cfg.inter_dim as usize)
                 .map_err(cuda_err)?,
-            route_q_s: DeviceBuffer::zeroed(dispatch_tiles * 32 * cfg.inter_dim as usize / 16)
-                .map_err(cuda_err)?,
+            route_q_s: DeviceBuffer::zeroed(
+                (dispatch_tiles * cfg.inter_dim as usize).next_multiple_of(16)
+                    + dispatch_tiles * cfg.inter_dim as usize,
+            )
+            .map_err(cuda_err)?,
             route_y: up_zero_f32(c, dispatch_tiles * 32 * dim)?,
             act_x,
             act_x_s,
@@ -3239,7 +3278,7 @@ impl<'a> GpuModel<'a> {
             act_e_s,
             gate_w_out: up_zero_f32(c, 16 * cfg.n_activated as usize)?,
             gate_scores: up_zero_f32(c, cfg.n_routed as usize)?,
-            hc_dots: up_zero_f32(c, 16 * cfg.mix_hc() as usize)?,
+            hc_dots: up_zero_f32(c, cfg.mix_hc() as usize)?,
             gate_i_out: DeviceBuffer::zeroed(16 * cfg.n_activated as usize).map_err(cuda_err)?,
             win_idxs: DeviceBuffer::zeroed(win).map_err(cuda_err)?,
             shared_idxs: DeviceBuffer::zeroed(win + cfg.index_topk as usize).map_err(cuda_err)?,
@@ -3247,14 +3286,6 @@ impl<'a> GpuModel<'a> {
             pre_ffn: up_zero_f32(c, hc)?,
             post: up_zero_f32(c, hc)?,
             comb: up_zero_f32(c, hc * hc)?,
-            mhc_r: DeviceBuffer::zeroed(hc * dim).map_err(cuda_err)?,
-            mhc_r_out: DeviceBuffer::zeroed(hc * dim).map_err(cuda_err)?,
-            mhc_x: DeviceBuffer::zeroed(dim).map_err(cuda_err)?,
-            mhc_c: DeviceBuffer::zeroed(dim).map_err(cuda_err)?,
-            mhc_y: DeviceBuffer::zeroed(dim).map_err(cuda_err)?,
-            mhc_p: up_zero_f32(c, 40 * cfg.mix_hc() as usize)?,
-            mhc_s: up_zero_f32(c, 40)?,
-            mhc_q: up_zero_f32(c, 40)?,
             zeros_h: up_zero_f32(c, hc * dim)?,
             ones_hc: up_f32(c, &vec![1.0f32; hc])?,
             comb_zero: up_zero_f32(c, hc * hc)?,
@@ -3294,6 +3325,8 @@ impl<'a> GpuModel<'a> {
             emb,
             head,
             final_norm,
+            glp_dirs,
+            glp_alpha,
             scratch,
             scratch_m: None,
             drafter_scratch_m: None,
@@ -3308,7 +3341,6 @@ impl<'a> GpuModel<'a> {
             },
             pos: 0,
             spec_accept: 0,
-            spec_skip: 0,
             max_seq,
             sharding: *sh,
             comm: None,
@@ -3337,44 +3369,29 @@ fn compressor_gemv(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn bf16_gemv_rows(
-    c: &Cuda,
-    w: k::U16,
-    x: k::F32,
-    y: k::F32,
-    m: usize,
-    rows: usize,
-    cols: usize,
-    x_stride: usize,
-    y_stride: usize,
-) {
-    if m <= 5 {
-        k::bf16_gemm_m5(c, w, x, y, m, rows, cols, x_stride, y_stride);
-    } else {
-        for i in 0..m {
-            k::bf16_gemv(
-                c,
-                w,
-                k::F32::from_raw(x.as_raw() + (i * x_stride * 4) as u64),
-                k::F32::from_raw(y.as_raw() + (i * y_stride * 4) as u64),
-                rows,
-                cols,
-            );
-        }
-    }
+fn gemm_q8(c: &Cuda, q: &Q8, a: k::U8, sa: k::U8, out: k::F32, m: usize, n: usize, k: usize) {
+    gemm_q8_on(c, q, a, sa, out, m, n, k, &c.stream)
 }
 
-fn gemm_q8(c: &Cuda, q: &Q8, a: k::U8, sa: k::U8, out: k::F32, m: usize, n: usize, k: usize) {
+fn gemm_q8_on(
+    c: &Cuda,
+    q: &Q8,
+    a: k::U8,
+    sa: k::U8,
+    out: k::F32,
+    m: usize,
+    n: usize,
+    k: usize,
+    stream: &Stream,
+) {
     let kind = match (n, k) {
         (1280, 5120) => Some(k::TlGemm::Qa),
         (8192, 1280) => Some(k::TlGemm::Qb),
         (512, 5120) => Some(k::TlGemm::Wkv),
         (5120, 2048) => Some(k::TlGemm::WoB),
         (2304, 5120) => Some(k::TlGemm::SharedW13),
+        (4608, 5120) => Some(k::TlGemm::SharedW13Fused),
         (5120, 2304) => Some(k::TlGemm::SharedW2),
-        (1152, 5120) => Some(k::TlGemm::SharedGateUpTp4),
-        (5120, 576) => Some(k::TlGemm::SharedDownTp4),
         (25600, 5120) => Some(k::TlGemm::EngramWkv),
         (1280, 15360) => Some(k::TlGemm::DrafterMainProj),
         _ => None,
@@ -3384,83 +3401,24 @@ fn gemm_q8(c: &Cuda, q: &Q8, a: k::U8, sa: k::U8, out: k::F32, m: usize, n: usiz
             let raw_scales = m * k / 32;
             let packed_offset = raw_scales.next_multiple_of(16);
             let packed_a = k::U32::from_raw(sa.as_raw() + packed_offset as u64);
-            k::pack_scales(c, sa, packed_a, m * k);
-            k::fp8_gemm_tl(c, kind, a, packed_a, q.w.ptr(), k::base(packed), out, m);
+            k::fp8_gemm_tl_on(
+                c,
+                kind,
+                a,
+                packed_a,
+                q.w.ptr(),
+                k::base(packed),
+                out,
+                m,
+                stream,
+            );
             return;
         }
     }
-    k::fp8_gemm(c, a, sa, q.w.ptr(), q.s.ptr(), out, m, n, k);
+    k::fp8_gemm_on(c, a, sa, q.w.ptr(), q.s.ptr(), out, m, n, k, stream);
 }
 
 // ---------------------------------------------------------------------------
-#[allow(clippy::too_many_arguments)]
-fn mhc_post_pre_step(
-    c: &Cuda,
-    cfg: &RefConfig,
-    layer: &GpuLayer,
-    s: &mut Scratch,
-    h_cur: usize,
-    h_next: usize,
-    previous: k::F32,
-    attention: bool,
-) -> io::Result<()> {
-    let dim = cfg.dim as usize;
-    let hc = cfg.hc_mult as usize;
-    let (fnc, base, scale, norm, pre_in) = if attention {
-        (
-            &layer.hc_attn_fn,
-            &layer.hc_attn_base,
-            &layer.hc_attn_scale,
-            &layer.attn_norm_bf16,
-            &s.pre_attn,
-        )
-    } else {
-        (
-            &layer.hc_ffn_fn,
-            &layer.hc_ffn_base,
-            &layer.hc_ffn_scale,
-            &layer.ffn_norm_bf16,
-            &s.pre_ffn,
-        )
-    };
-    k::f32_to_bf16(c, k::base(&s.h[h_cur]), k::base(&s.mhc_r), hc * dim);
-    k::f32_to_bf16(c, previous, k::base(&s.mhc_x), dim);
-    k::mhc_post_pre(
-        c,
-        k::base(&s.mhc_c),
-        k::base(fnc),
-        k::base(&s.mhc_p),
-        k::base(&s.mhc_q),
-        k::base(&s.mhc_r),
-        k::base(&s.mhc_r_out),
-        k::base(&s.mhc_s),
-        k::base(&s.mhc_x),
-        k::base(&s.comb),
-        k::base(&s.post),
-        k::base(pre_in),
-        1,
-        dim,
-    );
-    k::bf16_to_f32(c, k::base(&s.mhc_r_out), k::base(&s.h[h_next]), hc * dim);
-    k::mhc_finalize(
-        c,
-        k::base(&s.mhc_c),
-        k::base(&s.mhc_p),
-        k::base(&s.mhc_q),
-        k::base(&s.mhc_s),
-        k::base(base),
-        k::base(&s.comb),
-        k::base(&s.post),
-        k::base(pre_in),
-        k::base(scale),
-        k::base(norm),
-        k::base(&s.mhc_y),
-        1,
-    );
-    k::bf16_to_f32(c, k::base(&s.mhc_y), k::base(&s.x), dim);
-    Ok(())
-}
-
 // decode sublayers
 
 /// The attention sublayer (spec §3-§5, model.py:614-791): q path, window KV
@@ -3505,7 +3463,7 @@ fn attention_step(
     }
 
     // q path: wq_a -> q_norm -> wq_b -> rope (model.py:771-773)
-    k::emit8(
+    k::emit8_packed(
         c,
         k::base(&s.x),
         k::base(&s.act_x),
@@ -3524,6 +3482,27 @@ fn attention_step(
         cfg.q_lora as usize,
         dim,
     );
+    let activation_event = cust::event::Event::new(cust::event::EventFlags::DEFAULT).unwrap();
+    activation_event.record(&c.stream).unwrap();
+    c.aux_stream
+        .wait_event(
+            activation_event,
+            cust::stream::StreamWaitEventFlags::DEFAULT,
+        )
+        .unwrap();
+    let wkv_event = cust::event::Event::new(cust::event::EventFlags::DEFAULT).unwrap();
+    gemm_q8_on(
+        c,
+        &layer.wkv,
+        k::base(&s.act_x),
+        k::base(&s.act_x_s),
+        k::base(&s.kvrow),
+        1,
+        hd,
+        dim,
+        &c.aux_stream,
+    );
+    wkv_event.record(&c.aux_stream).unwrap();
     k::rmsnorm(
         c,
         k::base(&s.qr),
@@ -3532,7 +3511,7 @@ fn attention_step(
         cfg.q_lora as usize,
         eps,
     );
-    k::emit8(
+    k::emit8_packed(
         c,
         k::base(&s.qr),
         k::base(&s.act_qr),
@@ -3581,16 +3560,9 @@ fn attention_step(
     dump_dev(c, &s.q, heads * hd, format!("d_pos{pos}_q{l}.f32"));
 
     // window KV: one shared latent, rope tail, fp8 snap, ring write
-    gemm_q8(
-        c,
-        &layer.wkv,
-        k::base(&s.act_x),
-        k::base(&s.act_x_s),
-        k::base(&s.kvrow),
-        1,
-        hd,
-        dim,
-    );
+    c.stream
+        .wait_event(wkv_event, cust::stream::StreamWaitEventFlags::DEFAULT)
+        .unwrap();
     let slot = (pos % win as u64) as usize;
     let ring = k::row(&caches.kv_all[l], slot * hd, hd);
     k::rmsnorm(
@@ -3986,16 +3958,34 @@ fn attention_step(
     let gdim = heads * hd / og;
     dump_dev(c, &s.o, heads * hd, format!("d_pos{pos}_osnap{l}.f32"));
     for g in 0..og {
-        k::bf16_gemv(
-            c,
-            k::row16(&layer.wo_a, g * ol * gdim, ol * gdim),
-            k::row(&s.o, g * gdim, gdim),
-            k::row(&s.fl, g * ol, ol),
-            ol,
-            gdim,
-        );
+        if let Some(w8) = &layer.wo_a_fp8 {
+            k::fp8_wo_a_gemv(
+                c,
+                k::row_u8(&w8.w, g * ol * gdim, ol * gdim),
+                k::row_u8(
+                    &w8.s,
+                    g * (ol / w8.block) * w8.scale_cols,
+                    (ol / w8.block) * w8.scale_cols,
+                ),
+                k::row(&s.o, g * gdim, gdim),
+                k::row(&s.fl, g * ol, ol),
+                ol,
+                gdim,
+                w8.block,
+                w8.scale_cols,
+            );
+        } else {
+            k::bf16_gemv(
+                c,
+                k::row16(&layer.wo_a, g * ol * gdim, ol * gdim),
+                k::row(&s.o, g * gdim, gdim),
+                k::row(&s.fl, g * ol, ol),
+                ol,
+                gdim,
+            );
+        }
     }
-    k::emit8(
+    k::emit8_packed(
         c,
         k::base(&s.fl),
         k::base(&s.act_fl),
@@ -4070,6 +4060,185 @@ fn dump_dev(c: &Cuda, buf: &D<f32>, n: usize, name: String) {
     crate::dump::f32s(name, &v);
 }
 
+fn moe_shared_step(c: &Cuda, cfg: &RefConfig, layer: &GpuLayer, s: &mut Scratch) {
+    let dim = cfg.dim as usize;
+    let inter = cfg.inter_dim as usize;
+    let [w1, w2, w3] = &layer.shared_experts;
+    let (gate, up) = if let Some(fused) = &layer.shared_w13 {
+        gemm_q8(
+            c,
+            fused,
+            k::base(&s.act_x),
+            k::base(&s.act_x_s),
+            k::base(&s.shared_out),
+            1,
+            2 * inter,
+            dim,
+        );
+        (
+            k::row(&s.shared_out, 0, inter),
+            k::row(&s.shared_out, inter, inter),
+        )
+    } else {
+        gemm_q8(
+            c,
+            w1,
+            k::base(&s.act_x),
+            k::base(&s.act_x_s),
+            k::base(&s.gate_buf),
+            1,
+            inter,
+            dim,
+        );
+        gemm_q8(
+            c,
+            w3,
+            k::base(&s.act_x),
+            k::base(&s.act_x_s),
+            k::base(&s.up_buf),
+            1,
+            inter,
+            dim,
+        );
+        (k::base(&s.gate_buf), k::base(&s.up_buf))
+    };
+    k::swiglu(c, gate, up, k::base(&s.h_e), inter, 1.0);
+    k::emit8_packed(
+        c,
+        k::base(&s.h_e),
+        k::base(&s.act_h),
+        k::base(&s.act_h_s),
+        inter,
+    );
+    gemm_q8(
+        c,
+        w2,
+        k::base(&s.act_h),
+        k::base(&s.act_h_s),
+        k::base(&s.expert_y),
+        1,
+        dim,
+        inter,
+    );
+}
+
+fn moe_grouped_tl_step(c: &Cuda, cfg: &RefConfig, layer: &GpuLayer, s: &mut Scratch, sh: Sharding) {
+    let dim = cfg.dim as usize;
+    let inter = cfg.inter_dim as usize;
+    let top_k = cfg.n_activated as usize;
+    let e_start = sh.rank as usize * cfg.n_routed as usize / sh.world_size as usize;
+    let e_len = cfg.n_routed as usize / sh.world_size as usize;
+    let tiles = (top_k + 31) / 32 + top_k.min(e_len);
+    let packed_a = k::U32::from_raw(
+        s.act_x_s.as_device_ptr().as_raw() + (dim / 32).next_multiple_of(16) as u64,
+    );
+    k::moe_dispatch_ids(
+        c,
+        k::base(&s.gate_i_out),
+        k::base(&s.dispatch_idx),
+        top_k,
+        e_start,
+        e_len,
+    );
+    k::moe_dispatch_tl(
+        c,
+        k::base(&s.dispatch_idx),
+        k::base(&s.gate_w_out),
+        k::base(&s.order),
+        k::base(&s.layout_weights),
+        k::base(&s.route_pos),
+        k::base(&s.tile_expert),
+        k::base(&s.expert_count),
+        k::base(&s.expert_offset),
+        k::base(&s.expert_psum),
+        k::base(&s.num_tiles),
+        1,
+        top_k,
+        tiles,
+    );
+    let dispatch_event = cust::event::Event::new(cust::event::EventFlags::DEFAULT).unwrap();
+    dispatch_event.record(&c.stream).unwrap();
+    c.aux_stream
+        .wait_event(dispatch_event, cust::stream::StreamWaitEventFlags::DEFAULT)
+        .unwrap();
+    k::moe_grouped_tl_cached(
+        c,
+        k::TlMoe::GateUp,
+        k::base(&s.act_x),
+        packed_a,
+        layer.w1_map.unwrap(),
+        k::base(layer.w1s_tl.as_ref().unwrap()),
+        k::base(&s.order),
+        k::base(&s.tile_expert),
+        k::base(&s.route_h),
+        tiles,
+        1,
+        top_k,
+    );
+    k::moe_grouped_tl_cached_on(
+        c,
+        k::TlMoe::GateUp,
+        k::base(&s.act_x),
+        packed_a,
+        layer.w3_map.unwrap(),
+        k::base(layer.w3s_tl.as_ref().unwrap()),
+        k::base(&s.order),
+        k::base(&s.tile_expert),
+        k::base(&s.route_y),
+        tiles,
+        1,
+        top_k,
+        &c.aux_stream,
+    );
+    let event = cust::event::Event::new(cust::event::EventFlags::DEFAULT).unwrap();
+    event.record(&c.aux_stream).unwrap();
+    c.stream
+        .wait_event(event, cust::stream::StreamWaitEventFlags::DEFAULT)
+        .unwrap();
+    k::moe_swiglu_route(
+        c,
+        k::base(&s.route_h),
+        k::base(&s.route_y),
+        k::base(&s.layout_weights),
+        k::base(&s.route_h),
+        inter,
+        tiles * 32,
+    );
+    k::emit8_packed(
+        c,
+        k::base(&s.route_h),
+        k::base(&s.route_q),
+        k::base(&s.route_q_s),
+        tiles * 32 * inter,
+    );
+    let packed_route = k::U32::from_raw(
+        s.route_q_s.as_device_ptr().as_raw() + (tiles * inter).next_multiple_of(16) as u64,
+    );
+    k::moe_grouped_tl_cached(
+        c,
+        k::TlMoe::Down,
+        k::base(&s.route_q),
+        packed_route,
+        layer.w2_map.unwrap(),
+        k::base(layer.w2s_tl.as_ref().unwrap()),
+        k::base(&s.order),
+        k::base(&s.tile_expert),
+        k::base(&s.route_y),
+        tiles,
+        1,
+        top_k,
+    );
+    k::moe_combine_f32(
+        c,
+        k::base(&s.route_y),
+        k::base(&s.route_pos),
+        k::base(&s.y_moe),
+        dim,
+        top_k,
+        1,
+    );
+}
+
 /// The MoE sublayer (spec §6, model.py:794-906): device-side routing, then
 /// selected experts in ascending expert-id order (matching the CPU
 /// accumulation order), then the shared expert.
@@ -4087,11 +4256,6 @@ fn moe_step(
     let l = layer.layer;
     let dim = cfg.dim as usize;
     let inter = cfg.inter_dim as usize;
-    let shared_inter = if layer.shared_w13.is_some() {
-        inter / sh.world_size as usize
-    } else {
-        inter
-    };
     let n_experts = cfg.n_routed as usize;
     let top_k = cfg.n_activated as usize;
     // expert-index shard: rank r owns experts [96r, 96r+96) of every
@@ -4147,7 +4311,7 @@ fn moe_step(
     let _ = s.y_moe.set_zero();
     // the activation is quantized once and reused by every expert and the
     // shared expert (identical to the ref's per-gemv quantization of x)
-    k::emit8(
+    k::emit8_packed(
         c,
         k::base(&s.x),
         k::base(&s.act_x),
@@ -4169,104 +4333,7 @@ fn moe_step(
     prof.add_us(2, t_gate);
 
     if layer.w1_tl.is_some() {
-        let tiles = (top_k + 31) / 32 + top_k.min(e_len);
-        let packed_a = k::U32::from_raw(s.act_x_s.as_device_ptr().as_raw() + (dim / 32) as u64);
-        k::pack_scales(c, k::base(&s.act_x_s), packed_a, dim);
-        k::moe_dispatch_ids(
-            c,
-            k::base(&s.gate_i_out),
-            k::base(&s.dispatch_idx),
-            top_k,
-            e_start,
-            e_len,
-        );
-        k::moe_dispatch_tl(
-            c,
-            k::base(&s.dispatch_idx),
-            k::base(&s.gate_w_out),
-            k::base(&s.order),
-            k::base(&s.layout_weights),
-            k::base(&s.route_pos),
-            k::base(&s.tile_expert),
-            k::base(&s.expert_count),
-            k::base(&s.expert_offset),
-            k::base(&s.expert_psum),
-            k::base(&s.num_tiles),
-            1,
-            top_k,
-            tiles,
-        );
-        k::moe_grouped_tl_cached(
-            c,
-            k::TlMoe::GateUp,
-            k::base(&s.act_x),
-            packed_a,
-            layer.w1_map.unwrap(),
-            k::base(layer.w1s_tl.as_ref().unwrap()),
-            k::base(&s.order),
-            k::base(&s.tile_expert),
-            k::base(&s.route_h),
-            tiles,
-            1,
-            top_k,
-        );
-        k::moe_grouped_tl_cached(
-            c,
-            k::TlMoe::GateUp,
-            k::base(&s.act_x),
-            packed_a,
-            layer.w3_map.unwrap(),
-            k::base(layer.w3s_tl.as_ref().unwrap()),
-            k::base(&s.order),
-            k::base(&s.tile_expert),
-            k::base(&s.route_y),
-            tiles,
-            1,
-            top_k,
-        );
-        k::moe_swiglu_route(
-            c,
-            k::base(&s.route_h),
-            k::base(&s.route_y),
-            k::base(&s.layout_weights),
-            k::base(&s.route_h),
-            inter,
-            tiles * 32,
-        );
-        k::emit8(
-            c,
-            k::base(&s.route_h),
-            k::base(&s.route_q),
-            k::base(&s.route_q_s),
-            tiles * 32 * inter,
-        );
-        let packed_route = k::U32::from_raw(
-            s.route_q_s.as_device_ptr().as_raw() + (tiles * 32 * inter / 32) as u64,
-        );
-        k::pack_scales(c, k::base(&s.route_q_s), packed_route, tiles * 32 * inter);
-        k::moe_grouped_tl_cached(
-            c,
-            k::TlMoe::Down,
-            k::base(&s.route_q),
-            packed_route,
-            layer.w2_map.unwrap(),
-            k::base(layer.w2s_tl.as_ref().unwrap()),
-            k::base(&s.order),
-            k::base(&s.tile_expert),
-            k::base(&s.route_y),
-            tiles,
-            1,
-            top_k,
-        );
-        k::moe_combine_f32(
-            c,
-            k::base(&s.route_y),
-            k::base(&s.route_pos),
-            k::base(&s.y_moe),
-            dim,
-            top_k,
-            1,
-        );
+        moe_grouped_tl_step(c, cfg, layer, s, sh);
     } else if layer.w1_all.is_some() {
         // Fused grouped-expert path (moe_grouped.cu): the gate's top-6 is
         // consumed on the device — no D2H readback, no host expert loop
@@ -4415,7 +4482,7 @@ fn moe_step(
                 inter,
                 w,
             );
-            k::emit8(
+            k::emit8_packed(
                 c,
                 k::base(&s.h_e),
                 k::base(&s.act_h),
@@ -4440,17 +4507,21 @@ fn moe_step(
         }
     }
 
-    // Replicated fallback reduces routed partials before adding the shared
-    // expert. The fused TP4 path reduces routed + shared partials together.
-    if layer.shared_w13.is_none() {
-        if let Some(comm) = comm.as_deref_mut() {
-            let stream = c.stream.as_inner();
-            s.coll_stage
-                .dtoh(s.y_moe.as_device_ptr().as_raw() as u64, dim * 4, stream)?;
-            s.coll_stage.sync(stream)?;
-            let red = comm.allreduce(&s.coll_stage.as_f32()[..dim])?;
-            s.y_moe.copy_from(&red).map_err(cuda_err)?;
-        }
+    // Copy routed partials, then launch the independent shared expert while
+    // the host performs the ring reduction. The shared result is still added
+    // after the reduction, preserving model.py:905 and rank-identical bits.
+    if let Some(comm) = comm.as_deref_mut() {
+        let stream = c.stream.as_inner();
+        s.coll_stage
+            .dtoh(s.y_moe.as_device_ptr().as_raw() as u64, dim * 4, stream)?;
+        s.coll_stage.sync(stream)?;
+        moe_shared_step(c, cfg, layer, s);
+        let red = comm.allreduce(&s.coll_stage.as_f32()[..dim])?;
+        s.coll_stage.as_f32()[..dim].copy_from_slice(&red);
+        s.coll_stage
+            .htod(s.y_moe.as_device_ptr().as_raw() as u64, dim * 4, stream)?;
+    } else {
+        moe_shared_step(c, cfg, layer, s);
     }
     dump_dev(
         c,
@@ -4458,80 +4529,7 @@ fn moe_step(
         dim,
         format!("d_pos{}_yrouted{l}.f32", crate::dump::pos()),
     );
-    let [w1, w2, w3] = &layer.shared_experts;
-    let (gate, up) = if let Some(fused) = &layer.shared_w13 {
-        gemm_q8(
-            c,
-            fused,
-            k::base(&s.act_x),
-            k::base(&s.act_x_s),
-            k::base(&s.shared_out),
-            1,
-            2 * shared_inter,
-            dim,
-        );
-        (
-            k::row(&s.shared_out, 0, shared_inter),
-            k::row(&s.shared_out, shared_inter, shared_inter),
-        )
-    } else {
-        gemm_q8(
-            c,
-            w1,
-            k::base(&s.act_x),
-            k::base(&s.act_x_s),
-            k::base(&s.gate_buf),
-            1,
-            shared_inter,
-            dim,
-        );
-        gemm_q8(
-            c,
-            w3,
-            k::base(&s.act_x),
-            k::base(&s.act_x_s),
-            k::base(&s.up_buf),
-            1,
-            shared_inter,
-            dim,
-        );
-        (k::base(&s.gate_buf), k::base(&s.up_buf))
-    };
-    k::swiglu(c, gate, up, k::base(&s.h_e), shared_inter, 1.0);
-    k::emit8(
-        c,
-        k::base(&s.h_e),
-        k::base(&s.act_h),
-        k::base(&s.act_h_s),
-        shared_inter,
-    );
-    gemm_q8(
-        c,
-        w2,
-        k::base(&s.act_h),
-        k::base(&s.act_h_s),
-        k::base(&s.expert_y),
-        1,
-        dim,
-        shared_inter,
-    );
     k::acc_f32(c, k::base(&s.expert_y), k::base(&s.y_moe), dim);
-    if layer.shared_w13.is_some() {
-        if let Some(comm) = comm.as_deref_mut() {
-            let stream = c.stream.as_inner();
-            s.coll_stage
-                .dtoh(s.y_moe.as_device_ptr().as_raw() as u64, dim * 4, stream)?;
-            s.coll_stage.sync(stream)?;
-            let red = comm.allreduce(&s.coll_stage.as_f32()[..dim])?;
-            s.y_moe.copy_from(&red).map_err(cuda_err)?;
-        }
-    }
-    dump_dev(
-        c,
-        &s.y_moe,
-        dim,
-        format!("d_pos{}_y{l}.f32", crate::dump::pos()),
-    );
     if let Some(run) = run {
         if run.capture_y.is_some() {
             let mut host = vec![0.0f32; dim];
@@ -4567,7 +4565,6 @@ struct ScratchM {
     expert_y: D<f32>,
     gate_buf: D<f32>,
     up_buf: D<f32>,
-    shared_out: D<f32>,
     h_e: D<f32>,
     eflat: D<f32>,
     ekv: D<f32>,
@@ -4635,6 +4632,7 @@ impl ScratchM {
         let alloc_u = |n: usize| -> io::Result<D<u8>> {
             DeviceBuffer::from_slice(&vec![0u8; n.max(1)]).map_err(cuda_err)
         };
+        let scale = |n: usize| (n / 32).next_multiple_of(16) + n / 32;
         Ok(Self {
             m_max: m,
             n_routed: cfg.n_routed as usize,
@@ -4650,7 +4648,6 @@ impl ScratchM {
             expert_y: alloc(m * dim)?,
             gate_buf: alloc(m * inter)?,
             up_buf: alloc(m * inter)?,
-            shared_out: alloc(m * 2 * inter)?,
             h_e: alloc(m * inter)?,
             eflat: alloc(m * ncols * ehd)?,
             ekv: alloc(m * (hc + 1) * dim)?,
@@ -4663,15 +4660,15 @@ impl ScratchM {
             ones_hc: alloc(m * hc)?,
             comb_zero: alloc(m * hc * hc)?,
             act_x: alloc_u(m * dim)?,
-            act_x_s: alloc_u(m * dim / 16)?,
+            act_x_s: alloc_u(scale(m * dim))?,
             act_qr: alloc_u(m * ql)?,
-            act_qr_s: alloc_u(m * ql / 16)?,
+            act_qr_s: alloc_u(scale(m * ql))?,
             act_fl: alloc_u(m * og * ol)?,
-            act_fl_s: alloc_u(m * og * ol / 16)?,
+            act_fl_s: alloc_u(scale(m * og * ol))?,
             act_h: alloc_u(m * inter)?,
-            act_h_s: alloc_u(m * inter / 16)?,
+            act_h_s: alloc_u(scale(m * inter))?,
             act_e: alloc_u(m * ncols * ehd)?,
-            act_e_s: alloc_u(m * ncols * ehd / 16)?,
+            act_e_s: alloc_u(scale(m * ncols * ehd))?,
             gate_scores: alloc(m * cfg.n_routed as usize)?,
             qidx: alloc(m * inh * ihd)?,
             widx: alloc(m * inh)?,
@@ -4946,71 +4943,17 @@ impl<'a> GpuModel<'a> {
                 .map_err(cuda_err)?;
         }
 
-        let engram_count = hashes_m.first().map_or(0, Vec::len);
-        let ncols = engram.n_hash_cols;
-        let ehd = engram.head_dim;
-        let gather_jobs: Vec<Option<EngramHostGather>> = (0..m * engram_count)
-            .map(|job| {
-                let (i, ei) = (job / engram_count, job % engram_count);
-                let layer = layers.iter().find(|layer| layer.engram == Some(ei))?;
-                let e = layer.engram_w.as_ref()?;
-                match (e.embed_w.host(), e.embed_s.host()) {
-                    (Some((wp, wlen)), Some((sp, slen))) => Some(EngramHostGather {
-                        ids: hashes_m[i][ei].iter().map(|&h| h as i64).collect(),
-                        flat: vec![0.0; ncols * ehd],
-                        weights: wp as usize,
-                        weights_len: wlen,
-                        scales: sp as usize,
-                        scales_len: slen,
-                    }),
-                    _ => None,
-                }
-            })
-            .collect();
-        let mut engram_workers = EngramGatherWorkers(
-            gather_jobs
-                .into_iter()
-                .map(|gather| {
-                    gather.map(|mut gather| {
-                        std::thread::spawn(move || {
-                            // SAFETY: the worker guard joins before the mmap
-                            // can be dropped, including error returns.
-                            let (wt, st) = unsafe {
-                                (
-                                    std::slice::from_raw_parts(
-                                        gather.weights as *const u8,
-                                        gather.weights_len,
-                                    ),
-                                    std::slice::from_raw_parts(
-                                        gather.scales as *const u8,
-                                        gather.scales_len,
-                                    ),
-                                )
-                            };
-                            gather
-                                .flat
-                                .par_chunks_mut(ehd)
-                                .zip(gather.ids.par_iter())
-                                .for_each(|(chunk, &id)| {
-                                    let row = id as usize;
-                                    if row * ehd + ehd > wt.len() {
-                                        chunk.fill(f32::NAN);
-                                        return;
-                                    }
-                                    chunk.copy_from_slice(&ferroseek_ref::store::fp8_row_scaled(
-                                        wt, st, row, ehd,
-                                    ));
-                                });
-                            gather
-                        })
-                    })
-                })
-                .collect(),
-        );
-
         let mut h_cur = 0usize;
         for li in 0..layers.len() {
             let layer = &layers[li];
+            if layers_override.is_none() {
+                if let Some(d) = &self.glp_dirs[layer.layer as usize] {
+                    for i in 0..m {
+                        let h = k::row(&sm.h[h_cur], i * hc * dim, hc * dim);
+                        k::glp_project(c, h, k::base(d), h, self.glp_alpha, hc, dim);
+                    }
+                }
+            }
             if capture_drafter && layers_override.is_none() {
                 Self::capture_main_hidden(main_hiddens, c, cfg, &sm.h[h_cur], m - 1, layer.layer)?;
             }
@@ -5024,26 +4967,36 @@ impl<'a> GpuModel<'a> {
                     let hash = &hash_p[ei];
                     let ids: Vec<i64> = hash.iter().map(|&h| h as i64).collect();
                     match (e.embed_w.host(), e.embed_s.host()) {
-                        (Some(_), Some(_)) => {
-                            let gather = engram_workers.take(i * engram_count + ei)?;
-                            let flat = &gather.flat;
+                        (Some((wp, wlen)), Some((sp, slen))) => {
+                            let (wt, st) = unsafe {
+                                (
+                                    std::slice::from_raw_parts(wp, wlen),
+                                    std::slice::from_raw_parts(sp, slen),
+                                )
+                            };
+                            let rows: Vec<usize> =
+                                ids.iter().take(ncols).map(|&id| id as usize).collect();
+                            let mut flat = vec![0.0f32; rows.len() * ehd];
+                            flat.par_chunks_mut(ehd).zip(rows.par_iter()).for_each(
+                                |(chunk, &r)| {
+                                    if r * ehd + ehd > wt.len() {
+                                        chunk.fill(f32::NAN);
+                                        return;
+                                    }
+                                    let row = ferroseek_ref::store::fp8_row_scaled(wt, st, r, ehd);
+                                    chunk.copy_from_slice(&row);
+                                },
+                            );
                             if flat.iter().any(|v| v.is_nan()) {
                                 return Err(io::Error::new(
                                     io::ErrorKind::InvalidInput,
                                     "engram gather NaN (decode_m)",
                                 ));
                             }
-                            let bytes = flat.len() * 4;
-                            s1.small_stage
-                                .write_bytes(0, flat.as_ptr() as *const u8, bytes);
-                            let stream = c.stream.as_inner();
-                            s1.small_stage.htod_at(
-                                k::row(&sm.eflat, i * ncols * ehd, ncols * ehd).as_raw() as u64,
-                                bytes,
-                                0,
-                                stream,
-                            )?;
-                            s1.small_stage.sync(stream)?;
+                            sm.eflat
+                                .index(i * ncols * ehd..(i + 1) * ncols * ehd)
+                                .copy_from(&flat)
+                                .map_err(cuda_err)?;
                         }
                         _ => {
                             s1.hash_ids.copy_from(&ids).map_err(cuda_err)?;
@@ -5059,7 +5012,7 @@ impl<'a> GpuModel<'a> {
                         }
                     }
                 }
-                k::emit8(
+                k::emit8_packed(
                     c,
                     k::base(&sm.eflat),
                     k::base(&sm.act_e),
@@ -5095,46 +5048,20 @@ impl<'a> GpuModel<'a> {
             // attention wiring (hc mix + collapse + norm)
             let hc_dim = hc * dim;
             let mix_hc = cfg.mix_hc();
-            if world > 1 {
-                k::hc_mixes(
-                    c,
-                    k::base(&sm.h[h_cur]),
-                    k::base(&layer.hc_attn_fn),
-                    k::base(&s1.hc_dots),
-                    m,
-                    hc_dim,
-                    mix_hc,
-                );
-                k::hc_finalize(
-                    c,
-                    k::base(&sm.h[h_cur]),
-                    k::base(&s1.hc_dots),
-                    k::base(&layer.hc_attn_base),
-                    k::base(&layer.hc_attn_scale),
-                    k::base(&sm.pre_attn),
-                    k::base(&sm.post),
-                    k::base(&sm.comb),
-                    m,
-                    hc_dim,
-                    mix_hc,
-                    cfg.hc_eps,
-                );
-            } else {
-                k::hc_block(
-                    c,
-                    k::base(&sm.h[h_cur]),
-                    k::base(&layer.hc_attn_fn),
-                    k::base(&layer.hc_attn_base),
-                    k::base(&layer.hc_attn_scale),
-                    k::base(&sm.pre_attn),
-                    k::base(&sm.post),
-                    k::base(&sm.comb),
-                    m,
-                    hc_dim,
-                    mix_hc,
-                    cfg.hc_eps,
-                );
-            }
+            k::hc_block(
+                c,
+                k::base(&sm.h[h_cur]),
+                k::base(&layer.hc_attn_fn),
+                k::base(&layer.hc_attn_base),
+                k::base(&layer.hc_attn_scale),
+                k::base(&sm.pre_attn),
+                k::base(&sm.post),
+                k::base(&sm.comb),
+                m,
+                hc_dim,
+                mix_hc,
+                cfg.hc_eps,
+            );
             k::hc_pre(
                 c,
                 k::base(&sm.h[h_cur]),
@@ -5170,6 +5097,18 @@ impl<'a> GpuModel<'a> {
                 sh,
                 comm_opt.as_deref_mut(),
             )?;
+            if layers_override.is_none() {
+                if let Some(d) = self
+                    .glp_dirs
+                    .get(layer.layer as usize + 1)
+                    .and_then(|d| d.as_ref())
+                {
+                    for i in 0..m {
+                        let out = k::row(&sm.attn_out, i * dim, dim);
+                        k::glp_project(c, out, k::base(d), out, self.glp_alpha, 1, dim);
+                    }
+                }
+            }
 
             {
                 let h_next = 1 - h_cur;
@@ -5187,46 +5126,20 @@ impl<'a> GpuModel<'a> {
             }
 
             // ffn wiring
-            if world > 1 {
-                k::hc_mixes(
-                    c,
-                    k::base(&sm.h[h_cur]),
-                    k::base(&layer.hc_ffn_fn),
-                    k::base(&s1.hc_dots),
-                    m,
-                    hc_dim,
-                    mix_hc,
-                );
-                k::hc_finalize(
-                    c,
-                    k::base(&sm.h[h_cur]),
-                    k::base(&s1.hc_dots),
-                    k::base(&layer.hc_ffn_base),
-                    k::base(&layer.hc_ffn_scale),
-                    k::base(&sm.pre_ffn),
-                    k::base(&sm.post),
-                    k::base(&sm.comb),
-                    m,
-                    hc_dim,
-                    mix_hc,
-                    cfg.hc_eps,
-                );
-            } else {
-                k::hc_block(
-                    c,
-                    k::base(&sm.h[h_cur]),
-                    k::base(&layer.hc_ffn_fn),
-                    k::base(&layer.hc_ffn_base),
-                    k::base(&layer.hc_ffn_scale),
-                    k::base(&sm.pre_ffn),
-                    k::base(&sm.post),
-                    k::base(&sm.comb),
-                    m,
-                    hc_dim,
-                    mix_hc,
-                    cfg.hc_eps,
-                );
-            }
+            k::hc_block(
+                c,
+                k::base(&sm.h[h_cur]),
+                k::base(&layer.hc_ffn_fn),
+                k::base(&layer.hc_ffn_base),
+                k::base(&layer.hc_ffn_scale),
+                k::base(&sm.pre_ffn),
+                k::base(&sm.post),
+                k::base(&sm.comb),
+                m,
+                hc_dim,
+                mix_hc,
+                cfg.hc_eps,
+            );
             k::hc_pre(
                 c,
                 k::base(&sm.h[h_cur]),
@@ -5272,6 +5185,14 @@ impl<'a> GpuModel<'a> {
                 h_cur = h_next;
             }
         }
+        if layers_override.is_none() {
+            if let Some(d) = &self.glp_dirs[layers.len() - 1] {
+                for i in 0..m {
+                    let h = k::row(&sm.h[h_cur], i * hc * dim, hc * dim);
+                    k::glp_project(c, h, k::base(d), h, self.glp_alpha, hc, dim);
+                }
+            }
+        }
 
         let final_norm = final_norm_override.unwrap_or(final_norm);
         // tail: collapse, final norm, local vocab head + TP all-gather per row
@@ -5293,18 +5214,15 @@ impl<'a> GpuModel<'a> {
             dim,
             eps,
         );
-        bf16_gemv_rows(
-            c,
-            k::base(head),
-            k::base(&sm.x),
-            k::base(&sm.logits),
-            m,
-            vocab_l,
-            dim,
-            dim,
-            cfg.vocab as usize,
-        );
         for i in 0..m {
+            k::bf16_gemv(
+                c,
+                k::base(head),
+                k::row(&sm.x, i * dim, dim),
+                k::row(&sm.logits, i * cfg.vocab as usize, cfg.vocab as usize),
+                vocab_l,
+                dim,
+            );
             if let Some(comm) = comm_opt.as_deref_mut() {
                 let stream = c.stream.as_inner();
                 s1.coll_stage.dtoh(
@@ -5352,7 +5270,7 @@ impl<'a> GpuModel<'a> {
         }
         let act = DeviceBuffer::<u8>::zeroed(3 * dim).map_err(cuda_err)?;
         let act_s = DeviceBuffer::<u8>::zeroed(3 * dim / 16).map_err(cuda_err)?;
-        k::emit8(
+        k::emit8_packed(
             c,
             k::base(&main_hidden),
             k::base(&act),
@@ -5394,7 +5312,7 @@ impl<'a> GpuModel<'a> {
             let act = DeviceBuffer::<u8>::zeroed(dim).map_err(cuda_err)?;
             let act_s = DeviceBuffer::<u8>::zeroed(dim / 16).map_err(cuda_err)?;
             let kv = up_zero_f32(c, hd)?;
-            k::emit8(c, k::base(&main_x), k::base(&act), k::base(&act_s), dim);
+            k::emit8_packed(c, k::base(&main_x), k::base(&act), k::base(&act_s), dim);
             for layer in &drafter.layers {
                 gemm_q8(
                     c,
@@ -5521,25 +5439,12 @@ impl<'a> GpuModel<'a> {
         self.main_hiddens.clear();
     }
 
-    fn record_spec_acceptance(&mut self, accepted: usize) {
-        self.spec_accept = accepted;
-        // One-token rounds pay the full target step plus the five-row
-        // drafter. Probe again after four cheap target-only rounds; any
-        // multi-token acceptance returns to drafting immediately.
-        self.spec_skip = if accepted == 1 { 4 } else { 0 };
-    }
-
     pub fn speculate(
         &mut self,
         position: u64,
         anchor: u32,
     ) -> io::Result<(Vec<u32>, u64, Vec<f32>)> {
         let initial = self.decode(anchor, position)?;
-        if self.spec_skip > 0 {
-            self.spec_skip -= 1;
-            self.spec_accept = 1;
-            return Ok((vec![anchor], self.pos, initial));
-        }
         let drafts = self.drafter_step(anchor, position)?;
         let win = self.cfg.window_size as usize;
         let batch_len = if std::env::var_os("FERROSEEK_SEQ_SPEC").is_some() {
@@ -5573,7 +5478,7 @@ impl<'a> GpuModel<'a> {
                     last = self.decode(draft, self.pos)?;
                 }
             }
-            self.record_spec_acceptance(accepted.len());
+            self.spec_accept = accepted.len();
             return Ok((accepted, self.pos, last));
         }
         let mut logits = initial;
@@ -5585,7 +5490,7 @@ impl<'a> GpuModel<'a> {
             logits = self.decode(draft, self.pos)?;
             accepted.push(draft);
         }
-        self.record_spec_acceptance(accepted.len());
+        self.spec_accept = accepted.len();
         Ok((accepted, self.pos, logits))
     }
 }
@@ -5634,7 +5539,7 @@ fn attention_step_m(
     let kv_x = kv_x.unwrap_or(&sm.x);
 
     // q path: emit8 -> wq_a -> q_norm -> emit8 -> wq_b -> rope(buf)
-    k::emit8(
+    k::emit8_packed(
         c,
         k::base(&sm.x),
         k::base(&sm.act_x),
@@ -5660,7 +5565,7 @@ fn attention_step_m(
         cfg.q_lora as usize,
         eps,
     );
-    k::emit8(
+    k::emit8_packed(
         c,
         k::base(&sm.qr),
         k::base(&sm.act_qr),
@@ -5699,7 +5604,7 @@ fn attention_step_m(
         // Target-token KV at p. The ring contains only target tokens; the
         // current slot was already seeded by decode(), so this is the same
         // value rewritten through the shared DSpark forward path.
-        k::emit8(
+        k::emit8_packed(
             c,
             k::base(kv_x),
             k::base(&sm.act_x),
@@ -5740,7 +5645,7 @@ fn attention_step_m(
 
         // Draft KVs are transient rows after the window. Every draft query
         // attends every draft row (non-causal block attention).
-        k::emit8(
+        k::emit8_packed(
             c,
             k::base(&sm.x),
             k::base(&sm.act_x),
@@ -5807,7 +5712,7 @@ fn attention_step_m(
         }
     } else {
         // window KV projection (batched), ring writes (per position)
-        k::emit8(
+        k::emit8_packed(
             c,
             k::base(kv_x),
             k::base(&sm.act_x),
@@ -6231,20 +6136,19 @@ fn attention_step_m(
     );
     k::snap8(c, k::base(&sm.o), m * heads * hd);
     let gdim = heads * hd / og;
-    for g in 0..og {
-        bf16_gemv_rows(
-            c,
-            k::row16(&layer.wo_a, g * ol * gdim, ol * gdim),
-            k::row(&sm.o, g * gdim, gdim),
-            k::row(&sm.fl, g * ol, ol),
-            m,
-            ol,
-            gdim,
-            heads * hd,
-            og * ol,
-        );
+    for i in 0..m {
+        for g in 0..og {
+            k::bf16_gemv(
+                c,
+                k::row16(&layer.wo_a, g * ol * gdim, ol * gdim),
+                k::row(&sm.o, i * heads * hd + g * gdim, gdim),
+                k::row(&sm.fl, i * og * ol + g * ol, ol),
+                ol,
+                gdim,
+            );
+        }
     }
-    k::emit8(
+    k::emit8_packed(
         c,
         k::base(&sm.fl),
         k::base(&sm.act_fl),
@@ -6293,11 +6197,6 @@ fn moe_step_m(
 ) -> io::Result<()> {
     let dim = cfg.dim as usize;
     let inter = cfg.inter_dim as usize;
-    let shared_inter = if layer.shared_w13.is_some() {
-        inter / sh.world_size as usize
-    } else {
-        inter
-    };
     let n_experts = cfg.n_routed as usize;
     let top_k = cfg.n_activated as usize;
     let world = sh.world_size as usize;
@@ -6315,7 +6214,7 @@ fn moe_step_m(
         n_experts,
     );
     let _ = sm.y_moe.set_zero();
-    k::emit8(
+    k::emit8_packed(
         c,
         k::base(&sm.x),
         k::base(&sm.act_x),
@@ -6344,9 +6243,9 @@ fn moe_step_m(
                 cfg.route_scale,
             );
         }
-        let packed_a =
-            k::U32::from_raw(sm.act_x_s.as_device_ptr().as_raw() + (m * dim / 32) as u64);
-        k::pack_scales(c, k::base(&sm.act_x_s), packed_a, m * dim);
+        let packed_a = k::U32::from_raw(
+            sm.act_x_s.as_device_ptr().as_raw() + (m * dim / 32).next_multiple_of(16) as u64,
+        );
         k::moe_dispatch_ids(
             c,
             k::base(&s1.gate_i_out),
@@ -6408,7 +6307,7 @@ fn moe_step_m(
             inter,
             tiles * 32,
         );
-        k::emit8(
+        k::emit8_packed(
             c,
             k::base(&s1.route_h),
             k::base(&s1.route_q),
@@ -6416,9 +6315,8 @@ fn moe_step_m(
             tiles * 32 * inter,
         );
         let packed_route = k::U32::from_raw(
-            s1.route_q_s.as_device_ptr().as_raw() + (tiles * 32 * inter / 32) as u64,
+            s1.route_q_s.as_device_ptr().as_raw() + (tiles * inter).next_multiple_of(16) as u64,
         );
-        k::pack_scales(c, k::base(&s1.route_q_s), packed_route, tiles * 32 * inter);
         k::moe_grouped_tl_cached(
             c,
             k::TlMoe::Down,
@@ -6589,7 +6487,7 @@ fn moe_step_m(
                     inter,
                     w,
                 );
-                k::emit8(
+                k::emit8_packed(
                     c,
                     k::base(&s1.h_e),
                     k::base(&s1.act_h),
@@ -6620,50 +6518,25 @@ fn moe_step_m(
         }
     }
 
-    if layer.shared_w13.is_none() {
-        if let Some(comm) = comm.as_deref_mut() {
-            for i in 0..m {
-                let mut partial = vec![0.0f32; dim];
-                sm.y_moe
-                    .index(i * dim..(i + 1) * dim)
-                    .copy_to(&mut partial)
-                    .map_err(cuda_err)?;
-                let reduced = comm.allreduce(&partial)?;
-                sm.y_moe
-                    .index(i * dim..(i + 1) * dim)
-                    .copy_from(&reduced)
-                    .map_err(cuda_err)?;
-            }
+    if let Some(comm) = comm.as_deref_mut() {
+        for i in 0..m {
+            let mut partial = vec![0.0f32; dim];
+            sm.y_moe
+                .index(i * dim..(i + 1) * dim)
+                .copy_to(&mut partial)
+                .map_err(cuda_err)?;
+            let reduced = comm.allreduce(&partial)?;
+            sm.y_moe
+                .index(i * dim..(i + 1) * dim)
+                .copy_from(&reduced)
+                .map_err(cuda_err)?;
         }
     }
 
+    // shared expert, batched, added last per row
     let [w1, w2, w3] = &layer.shared_experts;
-    if let Some(fused) = &layer.shared_w13 {
-        gemm_q8(
-            c,
-            fused,
-            k::base(&sm.act_x),
-            k::base(&sm.act_x_s),
-            k::base(&sm.shared_out),
-            m,
-            2 * shared_inter,
-            dim,
-        );
-        for i in 0..m {
-            k::swiglu(
-                c,
-                k::row(&sm.shared_out, i * 2 * shared_inter, shared_inter),
-                k::row(
-                    &sm.shared_out,
-                    i * 2 * shared_inter + shared_inter,
-                    shared_inter,
-                ),
-                k::row(&sm.h_e, i * shared_inter, shared_inter),
-                shared_inter,
-                1.0,
-            );
-        }
-    } else {
+    let shared_inter = inter;
+    let (gate, up) = {
         gemm_q8(
             c,
             w1,
@@ -6684,16 +6557,10 @@ fn moe_step_m(
             shared_inter,
             dim,
         );
-        k::swiglu(
-            c,
-            k::base(&sm.gate_buf),
-            k::base(&sm.up_buf),
-            k::base(&sm.h_e),
-            m * shared_inter,
-            1.0,
-        );
-    }
-    k::emit8(
+        (k::base(&sm.gate_buf), k::base(&sm.up_buf))
+    };
+    k::swiglu(c, gate, up, k::base(&sm.h_e), m * shared_inter, 1.0);
+    k::emit8_packed(
         c,
         k::base(&sm.h_e),
         k::base(&sm.act_h),
@@ -6711,22 +6578,6 @@ fn moe_step_m(
         shared_inter,
     );
     k::acc_f32(c, k::base(&sm.expert_y), k::base(&sm.y_moe), m * dim);
-    if layer.shared_w13.is_some() {
-        if let Some(comm) = comm.as_deref_mut() {
-            for i in 0..m {
-                let mut partial = vec![0.0f32; dim];
-                sm.y_moe
-                    .index(i * dim..(i + 1) * dim)
-                    .copy_to(&mut partial)
-                    .map_err(cuda_err)?;
-                let reduced = comm.allreduce(&partial)?;
-                sm.y_moe
-                    .index(i * dim..(i + 1) * dim)
-                    .copy_from(&reduced)
-                    .map_err(cuda_err)?;
-            }
-        }
-    }
 
     Ok(())
 }

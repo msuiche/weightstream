@@ -27,14 +27,14 @@ DSpark speculative decoding, thermal cap on. Measured by
 
 | metric | GLP-27 lane | ferroseek upload TP4 (2026-11-07, no-spec) |
 |---|---|---|
-| decode t/s, single stream (C1) | **58.64** (tpot p50 16.57 ms) | **17.93** (55.8 ms/token) |
+| decode t/s, single stream (C1) | **58.64** (tpot p50 16.57 ms) | **19.24** (52.0 ms/token, 2026-11-10) |
 | decode t/s, aggregate (C16) | **215.94** (tpot p50 73.86 ms) | — (single-request lockstep) |
 | cold prefill | **5.3k t/s** (32K / 131K) | not measured at those sizes |
 
 The later LocalArena engine showdown measured the same spark-ds41f
 TileLang + DSpark stack at **85 tok/s single-stream**, **262 tok/s at eight
 users**, and **6,636 tok/s cold prefill**. Against that newer 85 tok/s
-reference, ferroseek's current 17.93 tok/s is about **4.7× slower**.
+reference, ferroseek's current 19.24 tok/s is about **4.4× slower**.
 
 This is the apples-to-apples bar for ferroseek's upload-TP4 work: same
 hardware, same checkpoint, same DSpark spec-decode, steering armed. The
@@ -65,6 +65,73 @@ Target verification is sequential; no speedup is claimed. Raw logs on the
 driver: `/tmp/tp4-c1-dspark-spark-*.log`.
 
 ## Experiment log (2026-11-01) — do not duplicate blindly
+
+- **Production mHC (`eb15ef9`) is rejected (2026-11-09).** Its
+  `production_mhc` branch skipped `moe_step` on 38/40 TP4 layers. Restoring
+  unconditional MoE did not fix the real story stream (`10.5. E undo
+  Plate...` versus the stable stream) and did not improve latency. The
+  earlier ~35 tok/s claim is therefore invalid; do not restore this path
+  without a real four-rank known-answer gate.
+- **Clean-build discipline is required on the ring.** Mixed lockfiles and
+  stale CUDA artifacts produced `misaligned address` in single-node prefill
+  and divergent TP4 output. A full source/lockfile sync plus
+  `cargo clean --release -p ferroseek-cuda -p ferroseek-gpu -p ferroseek`
+  restored the known-answer single-node stream (` Paris. The Eiffel`) and
+  identical TP4 output. Use `cargo build --release --features cuda --locked`
+  on every rank and never compare binaries from mixed workspace states.
+- **Validated stable baseline (`c5284e1` + GLP, 2026-11-09).** Full GPU
+  suite 32/32; local workspace 68/68. The 16-token dragon story is identical
+  on all four ranks, with steady tokens at 57–58 ms (~17.4 tok/s). Rank 0
+  profile: attention 33.4 ms, MoE 21.1 ms, Engram 4.4 ms, head 1.8 ms,
+  gate 0.5 ms per step. The two-token France probe produces ` Paris.` on
+  every rank but is not a throughput benchmark.
+- **Indexer replication: rejected for short-context C1.** The dragon prompt
+  never exceeds `index_topk`, so the score all-reduce is not executed and
+  the collective count is unchanged (81/step: two output reductions per
+  layer plus head). Replicating all 32 heads only adds work; the story stays
+  identical but latency does not improve. Revisit only with long contexts.
+- **GLP kernel completion barrier.** `glp_project` now ends with
+  `__syncthreads()`; without it, readback could observe only `y[0]` written.
+  The regression test also synchronizes the CUDA stream before host
+  readback. Full suite remains 32/32.
+- **Validated kernel work (2026-11-09).** `#pragma unroll 8` on the HC dot
+  loop preserves the story and cuts `hc_mixes` from 48.5 to 45.0 µs (~0.28
+  ms/token). Fusing shared gate+up weights into one grid-72 TileLang launch
+  preserves the story and saves ~0.44 ms/token. `act_quant_fp8_emit` now
+  writes raw and aligned packed scales in one launch, eliminating all 360
+  `pack_scale_words` launches/token and fixing the aligned-capacity bug
+  (40 raw scale bytes require 88 bytes, not 80). Parallel Sinkhorn was
+  rejected: 34.2 → 35.5 µs due to barrier overhead.
+- **FP8 WO-A and graph verdict.** `fp8_wo_a_gemv` dequantizes each FP8
+  weight to BF16 in-kernel, exactly matching the old BF16 GEMV bit-for-bit
+  while preserving the story. Its 44.6 µs average replaces the old 65 µs
+  WO-A average (roughly one-third less time). Shared and grouped-MoE CUDA
+  graphs passed all tests but were performance-neutral (~54.4 ms with or
+  without them) and were removed.
+- **Shared/routed overlap.** After routed D2H, shared-expert kernels launch
+  before the host all-reduce; reduced values return via stream-ordered async
+  HtoD and shared output accumulates afterward. This preserves the exact
+  story and reduces the no-spec median to about 54 ms/token. DSpark remains
+  slower: acceptance stays below five, so verification is sequential
+  (3-token rounds ~185 ms, 2-token rounds ~129 ms).
+- **Dual-stream grouped MoE.** W1 runs on the main stream and W3 on the
+  auxiliary stream after an explicit main→aux dispatch event; a second event
+  joins them before SwiGLU. This preserves the story and lowers grouped-MoE
+  time from ~21 to ~20 ms/token. Without the dispatch event, W3 races the
+  routing metadata and the stream changes.
+- **Q-A/WKV overlap.** Q-A stays on the main stream; WKV launches on the
+  auxiliary stream after activation quantization and joins before KV
+  normalization. The validated four-rank story remains identical and steady
+  tokens reach **51.96 ms (~19.24 tok/s)**. Full GPU suite: 32/32.
+- **Early shared-expert overlap: rejected.** Launching the complete shared
+  expert on the auxiliary stream before grouped dispatch contends with W3,
+  raises MoE from ~21 to ~26 ms, and does not improve steady token latency
+  (~52.4 ms). The shared expert remains overlapped only with host all-reduce.
+- **Rejected performance variants.** Shared-expert TP4 sharding reached
+  ~50 ms/token but changed the story by changing reduction order and was
+  reverted. L2 next-layer prefetch was neutral/slightly worse and removed.
+  The fused 24-warp HC block was also rejected; split `hc_mixes` +
+  `hc_finalize` remains, with only the unrolled dot loop retained.
 
 - **Grouped TileLang MoE landed (`051c152`).** The correctness fixes were
   specific: grouped-down reads compacted activation rows (not `route / 6`),
@@ -162,32 +229,9 @@ driver: `/tmp/tp4-c1-dspark-spark-*.log`.
   variant that overlapped the norm used 256 threads per dot CTA and regressed
   to about 60 ms/token. Fused Q-A/WKV and combined shared gate/up projections
   preserved the stream but were performance-neutral. All three were reverted.
-- **DSpark acceptance and packed collectives (2026-11-08).** The current
-  drafter produced only the anchor in 25 of 42 measured rounds; the 67-token
-  run averaged 13.85 tok/s despite output identity with no-spec. Packing each
-  M-row verification layer's attention and MoE reductions into one collective
-  removed 1,008 ring calls, but the four-token batch took 253 ms versus 249 ms
-  and end-to-end throughput did not improve. Reverted. Reaching 30–50 tok/s
-  needs materially higher draft acceptance or a different target-verification
-  design, not fewer collective calls under the present policy. Raw logs:
-  `/tmp/tp4-c1-dspark-current-*` and `/tmp/tp4-c1-dspark-packed-*`.
-- **DSpark failure backoff (2026-11-08).** Anchor-only rounds now skip the
-  next four draft probes; multi-token acceptance cancels the skip. This
-  preserves the four-rank stream and improves the same C1 trace from 13.85 to
-  14.16 tok/s. No-spec remains faster, so serving policy is unchanged. Full
-  GPU suite: 30/30. Raw logs: `/tmp/tp4-c1-dspark-backoff-*`.
 - **Build note:** `cargo clean -p ferroseek-cuda` without `--release` removed
   nothing useful; use `cargo clean -p ferroseek-cuda --release` when forcing
   a kernel rebuild. Normal builds were otherwise reliable.
-- **Production mHC and shared-expert TP4 (2026-11-09).** The decoder now
-  uses the production TF32 `project_streams` and mHC finalizer for 38 layers,
-  with layer 0 and Engram layers retaining the original path. Shared experts
-  are fused and sharded to 576 rows/rank, with a single routed+shared
-  reduction. The new gate covers updated streams, TF32 projection, collapse,
-  final norm, shared TP4 GEMMs and BF16 row batching. Full suite: 31/31.
-  Corrected C1 is **34.56 tok/s** (28.94 ms/token); collective average fell
-  from 258 to 115 µs. DSpark currently accepts no drafts on this trace and is
-  not a throughput improvement. Raw log: `/tmp/tp4-c1-mhc-direct-*`.
 
 TP4 M-batch prefill measured separately on the same checkpoint: a
 132-token window-crossing prompt took 9.625 s versus 12.964 s with

@@ -34,6 +34,7 @@ extern "C" __global__ void hc_mixes(
     const float* w = hc_fn + (size_t)row * hc_dim;
     const int lane = threadIdx.x;
     float part = 0.0f;
+#pragma unroll 8
     for (int i = lane; i < hc_dim; i += 32) part += x[i] * w[i];
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)

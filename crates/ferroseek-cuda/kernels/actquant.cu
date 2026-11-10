@@ -47,8 +47,9 @@ extern "C" __global__ void act_quant_ue8m0_snap(
 extern "C" __global__ void act_quant_fp8_emit(
     const float* __restrict__ x,   // [n]
     uint8_t* __restrict__ q,       // [n] e4m3 bytes
-    uint8_t* __restrict__ s,       // [n/32] ue8m0 scale bytes
-    int n) // multiple of 32
+    uint8_t* __restrict__ s,       // [n/32] ue8m0 scale bytes + optional packed tail
+    int n,                         // multiple of 32
+    int packed_offset)             // 0 = raw only, else packed tail byte offset
 {
     int group = blockIdx.x;
     const float* g = x + (size_t)group * 32;
@@ -68,7 +69,11 @@ extern "C" __global__ void act_quant_fp8_emit(
     // boundary and pick a different scale).
     int bits = __float_as_int(amax / 448.0f);
     int e = ((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0 ? 1 : 0);
-    if (threadIdx.x == 0) s[group] = (uint8_t)(e + 127);
+    if (threadIdx.x == 0) {
+        const uint8_t scale_byte = (uint8_t)(e + 127);
+        s[group] = scale_byte;
+        if (packed_offset > 0) s[packed_offset + group] = scale_byte;
+    }
     float scale = exp2f((float)e);
     if (threadIdx.x < 32) {
         float y = g[threadIdx.x] / scale;
@@ -85,9 +90,9 @@ extern "C" __global__ void pack_scale_words(
     int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (n + 127) / 128) return;
-    dst[i] = 0;
-    for (int j = 0; j < 4; j++) {
-        if (i * 4 + j < n / 32) dst[i] |= (uint32_t)src[i * 4 + j] << (8 * j);
-    }
+    if (i >= n / 128) return;
+    dst[i] = (uint32_t)src[i * 4]
+        | ((uint32_t)src[i * 4 + 1] << 8)
+        | ((uint32_t)src[i * 4 + 2] << 16)
+        | ((uint32_t)src[i * 4 + 3] << 24);
 }

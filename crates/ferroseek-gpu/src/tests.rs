@@ -16,6 +16,7 @@ use ferroseek_cuda::gpu::Cuda;
 use ferroseek_ref::config::RefConfig;
 use ferroseek_ref::model::RefModel;
 use ferroseek_ref::store::SyntheticWeights;
+use ferroseek_ref::store::WeightStore;
 
 /// Logit tolerance ladder:
 ///
@@ -173,6 +174,100 @@ fn f32_to_e4m3_bits(v: f32) -> u8 {
 }
 
 #[test]
+fn wo_a_tp4_shard_matches_cpu_dequant() {
+    let path = "/home/msuiche/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170";
+    let mut ckpt = ferroseek_core::Checkpoint::open(std::path::Path::new(path)).unwrap();
+    let mut store = ferroseek_ref::store::CkptStore::new(&mut ckpt);
+    let guard = Cuda::global();
+    let c = guard.as_ref().unwrap();
+    let name = "layers.0.attn.wo_a.weight";
+    let dev = crate::engine::load_wo_a(&mut store, c, name, 8192, 4096, 0, 2048).unwrap();
+    let mut raw = vec![0u16; 2048 * 4096];
+    dev.index(0..raw.len()).copy_to(&mut raw).unwrap();
+    let got: Vec<f32> = raw
+        .iter()
+        .map(|&v| ferroseek_core::quant::bf16_to_f32(v))
+        .collect();
+    let (weight, scale) = store.get2(name, "layers.0.attn.wo_a.scale").unwrap();
+    let expected =
+        ferroseek_core::quant::dequant_fp8_blockwise(weight.bytes, scale.bytes, 8192, 4096);
+    assert!(max_abs_diff(&got, &expected) < 1e-3);
+
+    let raw8 = crate::engine::load_wo_a_fp8(&mut store, c, name, 8192, 4096, 0, 2048)
+        .unwrap()
+        .unwrap();
+    let x = rand_vec(4096, 1771);
+    let d_x = DeviceBuffer::from_slice(&x).unwrap();
+    let d_bf16 = dev;
+    let d_y_bf16 = DeviceBuffer::zeroed(2048).unwrap();
+    let d_y_fp8 = DeviceBuffer::zeroed(2048).unwrap();
+    crate::launch::bf16_gemv(
+        c,
+        d_bf16.as_device_ptr(),
+        d_x.as_device_ptr(),
+        d_y_bf16.as_device_ptr(),
+        2048,
+        4096,
+    );
+    crate::launch::fp8_wo_a_gemv(
+        c,
+        raw8.w.as_device_ptr(),
+        raw8.s.as_device_ptr(),
+        d_x.as_device_ptr(),
+        d_y_fp8.as_device_ptr(),
+        2048,
+        4096,
+        raw8.block,
+        raw8.scale_cols,
+    );
+    c.stream.synchronize().unwrap();
+    let mut y_bf16 = vec![0.0f32; 2048];
+    let mut y_fp8 = vec![0.0f32; 2048];
+    d_y_bf16.copy_to(&mut y_bf16).unwrap();
+    d_y_fp8.copy_to(&mut y_fp8).unwrap();
+    assert_eq!(y_fp8, y_bf16, "FP8 WO-A must equal the BF16 path");
+}
+
+#[test]
+fn glp_projection_matches_cpu() {
+    let guard = Cuda::global();
+    let c = guard.as_ref().unwrap();
+    for hc in [1usize, 4] {
+        let dim = 32usize;
+        let x = rand_vec(hc * dim, 700 + hc as u64);
+        let d = rand_vec(dim, 900 + hc as u64);
+        let mut expected = x.clone();
+        if hc == 1 {
+            ferroseek_core::glp::writer_project_cpu(&mut expected, &d, 3.5);
+        } else {
+            ferroseek_core::glp::fold_project_cpu(&mut expected, &d, 3.5, hc);
+        }
+        let d_x = DeviceBuffer::from_slice(&x).unwrap();
+        let d_d = DeviceBuffer::from_slice(&d).unwrap();
+        let d_y = DeviceBuffer::zeroed(hc * dim).unwrap();
+        crate::launch::glp_project(
+            c,
+            d_x.as_device_ptr(),
+            d_d.as_device_ptr(),
+            d_y.as_device_ptr(),
+            3.5,
+            hc,
+            dim,
+        );
+        c.stream.synchronize().unwrap();
+        let mut got = vec![0.0f32; hc * dim];
+        d_y.copy_to(&mut got).unwrap();
+        let diff = max_abs_diff(&got, &expected);
+        assert!(
+            diff < 1e-5,
+            "hc={hc} diff={diff} got={:?} expected={:?}",
+            &got[..4],
+            &expected[..4]
+        );
+    }
+}
+
+#[test]
 fn act_quant_fp8_emit_bit_exact() {
     let guard = Cuda::global();
     let c = guard.as_ref().unwrap();
@@ -204,7 +299,7 @@ fn act_quant_fp8_emit_bit_exact() {
     let f = c.actquant.get_function("act_quant_fp8_emit").unwrap();
     let stream = &c.stream;
     unsafe {
-        launch!(f<<<(n / 32) as u32, 32, 0, stream>>>(d_x.as_device_ptr(), d_q.as_device_ptr(), d_s.as_device_ptr(), n as i32)).unwrap();
+        launch!(f<<<(n / 32) as u32, 32, 0, stream>>>(d_x.as_device_ptr(), d_q.as_device_ptr(), d_s.as_device_ptr(), n as i32, 0i32)).unwrap();
     }
     stream.synchronize().unwrap();
     let mut got_q = vec![0u8; n];
@@ -674,9 +769,12 @@ fn fp8_gemm_tile_matches_cpu_and_m1() {
 
 #[test]
 fn tilelang_fp8_gemm_matches_scalar() {
-    fn check(n: usize, k: usize, kind: crate::launch::TlGemm) {
-        let guard = Cuda::global();
-        let c = guard.as_ref().unwrap();
+    let guard = Cuda::global();
+    let c = guard.as_ref().unwrap();
+    for (n, k, kind) in [
+        (8192usize, 1280usize, crate::launch::TlGemm::Qb),
+        (4608usize, 5120usize, crate::launch::TlGemm::SharedW13Fused),
+    ] {
         let m = 1usize;
         let kb = k / 32;
         let a: Vec<u8> = rand_vec(m * k, 991)
@@ -708,7 +806,7 @@ fn tilelang_fp8_gemm_matches_scalar() {
         let packed = crate::engine::pack_weight_scales(&sb, n, k);
         let d_packed = DeviceBuffer::from_slice(&packed).unwrap();
         let d_sa_packed =
-            DeviceBuffer::from_slice(&vec![0u8; kb + 16 + k.div_ceil(128) * 4]).unwrap();
+            DeviceBuffer::from_slice(&vec![0u8; kb.next_multiple_of(16) + kb]).unwrap();
         d_sa_packed.index(0..kb).copy_from(&sa).unwrap();
         let packed_a = crate::launch::U32::from_raw(
             d_sa_packed.as_device_ptr().as_raw() + kb.next_multiple_of(16) as u64,
@@ -733,10 +831,6 @@ fn tilelang_fp8_gemm_matches_scalar() {
         let d = max_abs_diff(&got, &want);
         assert!(d < 1e-3, "TileLang vs scalar max diff {d:.3e}");
     }
-
-    check(8192, 1280, crate::launch::TlGemm::Qb);
-    check(1152, 5120, crate::launch::TlGemm::SharedGateUpTp4);
-    check(5120, 576, crate::launch::TlGemm::SharedDownTp4);
 }
 
 #[test]
@@ -1434,152 +1528,6 @@ fn hc_block_matches_cpu_mirror() {
     assert_eq!(split_pre, pre, "split HC changed pre bits");
     assert_eq!(split_post, post, "split HC changed post bits");
     assert_eq!(split_comb, comb, "split HC changed comb bits");
-}
-
-#[test]
-fn production_mhc_post_pre_matches_cpu() {
-    let guard = Cuda::global();
-    let c = guard.as_ref().unwrap();
-    let (hc, dim) = (4usize, 5120usize);
-    let (mix, splits) = (24usize, 40usize);
-    let r: Vec<u16> = rand_vec(hc * dim, 71)
-        .iter()
-        .map(|&v| ferroseek_core::quant::f32_to_bf16(v * 0.01))
-        .collect();
-    let x: Vec<u16> = rand_vec(dim, 72)
-        .iter()
-        .map(|&v| ferroseek_core::quant::f32_to_bf16(v * 0.01))
-        .collect();
-    let fnc: Vec<f32> = rand_vec(mix * hc * dim, 73)
-        .iter()
-        .map(|v| v * 0.01)
-        .collect();
-    let pre_in = vec![1.0f32, 0.25, -0.5, 0.75];
-    let post = vec![0.5f32, -0.25, 0.75, 1.0];
-    let comb: Vec<f32> = rand_vec(16, 74).iter().map(|v| v * 0.1).collect();
-    let base: Vec<f32> = rand_vec(mix, 75).iter().map(|v| v * 0.01).collect();
-    let scale = vec![1.0f32, 0.8, 1.2];
-    let weight: Vec<u16> = rand_vec(dim, 76)
-        .iter()
-        .map(|&v| ferroseek_core::quant::f32_to_bf16(v * 0.1 + 1.0))
-        .collect();
-    let d_r = DeviceBuffer::from_slice(&r).unwrap();
-    let d_r_out = DeviceBuffer::from_slice(&vec![0u16; hc * dim]).unwrap();
-    let d_x = DeviceBuffer::from_slice(&x).unwrap();
-    let d_fn = DeviceBuffer::from_slice(&fnc).unwrap();
-    let d_pre = DeviceBuffer::from_slice(&pre_in).unwrap();
-    let d_post = DeviceBuffer::from_slice(&post).unwrap();
-    let d_comb = DeviceBuffer::from_slice(&comb).unwrap();
-    let d_base = DeviceBuffer::from_slice(&base).unwrap();
-    let d_scale = DeviceBuffer::from_slice(&scale).unwrap();
-    let d_weight = DeviceBuffer::from_slice(&weight).unwrap();
-    let d_p = DeviceBuffer::from_slice(&vec![0f32; splits * mix]).unwrap();
-    let d_s = DeviceBuffer::from_slice(&vec![0f32; splits]).unwrap();
-    let d_q = DeviceBuffer::from_slice(&vec![0f32; splits]).unwrap();
-    let d_c = DeviceBuffer::from_slice(&vec![0u16; dim]).unwrap();
-    let d_y = DeviceBuffer::from_slice(&vec![0u16; dim]).unwrap();
-    crate::launch::mhc_post_pre(
-        c,
-        d_c.as_device_ptr(),
-        d_fn.as_device_ptr(),
-        d_p.as_device_ptr(),
-        d_q.as_device_ptr(),
-        d_r.as_device_ptr(),
-        d_r_out.as_device_ptr(),
-        d_s.as_device_ptr(),
-        d_x.as_device_ptr(),
-        d_comb.as_device_ptr(),
-        d_post.as_device_ptr(),
-        d_pre.as_device_ptr(),
-        1,
-        dim,
-    );
-    crate::launch::mhc_finalize(
-        c,
-        d_c.as_device_ptr(),
-        d_p.as_device_ptr(),
-        d_q.as_device_ptr(),
-        d_s.as_device_ptr(),
-        d_base.as_device_ptr(),
-        d_comb.as_device_ptr(),
-        d_post.as_device_ptr(),
-        d_pre.as_device_ptr(),
-        d_scale.as_device_ptr(),
-        d_weight.as_device_ptr(),
-        d_y.as_device_ptr(),
-        1,
-    );
-    c.stream.synchronize().unwrap();
-
-    let rf: Vec<f32> = r
-        .iter()
-        .map(|&v| ferroseek_core::quant::bf16_to_f32(v))
-        .collect();
-    let xf: Vec<f32> = x
-        .iter()
-        .map(|&v| ferroseek_core::quant::bf16_to_f32(v))
-        .collect();
-    let mut expected_r = vec![0u16; hc * dim];
-    let mut expected_c = vec![0u16; dim];
-    for i in 0..dim {
-        let mut collapsed = 0.0f32;
-        for n in 0..hc {
-            let mut v = post[n] * xf[i];
-            for m in 0..hc {
-                v += comb[m * hc + n] * rf[m * dim + i];
-            }
-            expected_r[n * dim + i] = ferroseek_core::quant::f32_to_bf16(v);
-            collapsed += pre_in[n] * ferroseek_core::quant::bf16_to_f32(expected_r[n * dim + i]);
-        }
-        expected_c[i] = ferroseek_core::quant::f32_to_bf16(collapsed);
-    }
-    let mut got_r = vec![0u16; hc * dim];
-    let mut got_c = vec![0u16; dim];
-    d_r_out.copy_to(&mut got_r).unwrap();
-    d_c.copy_to(&mut got_c).unwrap();
-    assert_eq!(got_r, expected_r, "mHC updated streams differ");
-    assert_eq!(got_c, expected_c, "mHC collapse differs");
-
-    let mut expected_p = vec![0f32; splits * mix];
-    for sp in 0..splits {
-        for j in 0..mix {
-            for n in 0..hc {
-                for h in 0..128 {
-                    let i = n * dim + sp * 128 + h;
-                    let a = ferroseek_core::quant::bf16_to_f32(expected_r[i]);
-                    let f = fnc[j * hc * dim + i];
-                    let high = f32::from_bits(f.to_bits() & 0xffffe000);
-                    let rest = f - high;
-                    let mid = f32::from_bits(rest.to_bits() & 0xffffe000);
-                    let low = rest - mid;
-                    expected_p[sp * mix + j] += a * high + a * mid + a * low;
-                }
-            }
-        }
-    }
-    let mut got_p = vec![0f32; splits * mix];
-    d_p.copy_to(&mut got_p).unwrap();
-    let dp = max_abs_diff(&got_p, &expected_p);
-    assert!(dp < 1e-3, "mHC projection max diff {dp:.3e}");
-
-    let cf: Vec<f32> = expected_c
-        .iter()
-        .map(|&v| ferroseek_core::quant::bf16_to_f32(v))
-        .collect();
-    let wf: Vec<f32> = weight
-        .iter()
-        .map(|&v| ferroseek_core::quant::bf16_to_f32(v))
-        .collect();
-    let sumq: f32 = cf.iter().map(|v| v * v).sum();
-    let rstd = (sumq / dim as f32 + 1e-20).sqrt().recip();
-    let expected_y: Vec<u16> = cf
-        .iter()
-        .zip(&wf)
-        .map(|(&v, w)| ferroseek_core::quant::f32_to_bf16(v * rstd * w))
-        .collect();
-    let mut got_y = vec![0u16; dim];
-    d_y.copy_to(&mut got_y).unwrap();
-    assert_eq!(got_y, expected_y, "mHC final norm differs");
 }
 
 #[test]

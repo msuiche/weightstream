@@ -4,6 +4,7 @@
 //! CUDA lives in later crates.
 
 pub mod config;
+pub mod glp;
 pub mod kv;
 pub mod loader;
 pub mod quant;

@@ -277,14 +277,45 @@ extern "C" __global__ void f32_to_bf16(
     if (i < n) y[i] = __float2bfloat16(x[i]);
 }
 
-extern "C" __global__ void bf16_to_f32(
-    const __nv_bfloat16* __restrict__ x,
+// GLP rank-1 projection. hc=1 is the companion attention writer; hc=4 is
+// the fold over hyper-connection copies. x and y may alias: every read for
+// the reduction completes before the output writes begin.
+extern "C" __global__ void glp_project(
+    const float* __restrict__ x,
+    const float* __restrict__ d,
     float* __restrict__ y,
+    float alpha,
+    int hc,
     int n)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    y[i] = __bfloat162float(x[i]);
+    __shared__ float partials[256];
+    __shared__ float dot;
+    float partial = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        if (hc == 1) {
+            partial += x[i] * d[i];
+        } else {
+            float mean = 0.0f;
+            for (int c = 0; c < hc; c++) mean += x[c * n + i] / hc;
+            partial += mean * d[i];
+        }
+    }
+    partials[threadIdx.x] = partial;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        for (int j = 0; j < blockDim.x; j++) total += partials[j];
+        dot = total;
+    }
+    __syncthreads();
+    const float coef = alpha * dot;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        for (int c = 0; c < hc; c++) {
+            const int j = c * n + i;
+            y[j] = x[j] - coef * d[i];
+        }
+    }
+    __syncthreads();
 }
 
 extern "C" __global__ void copy_u8(
