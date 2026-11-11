@@ -15,27 +15,27 @@ output-identity checks pass.
 
 ## What works today
 
-- **CPU reference engine** (`ferroseek-ref`) — full DS4.1F decode on the real
+- **CPU reference engine** (`weightstream-ref`) — full DS4.1F decode on the real
   475 GB checkpoint, **gate-passed against the production vLLM TP4 stack**
   (teacher-forced top-1 identity, transport-bounded logprob deltas)
-- **16 GPU kernels** (`ferroseek-cuda`) — every DS4.1F primitive, each gated
+- **16 GPU kernels** (`weightstream-cuda`) — every DS4.1F primitive, each gated
   on GB10 (sparse attention, DSA indexer, CSA compressor, hc Sinkhorn, MoE
   routing, FP8/FP4 block-scaled GEMMs, engram, quant snaps)
-- **GPU decode engine** (`ferroseek-gpu`) — real-checkpoint decode via
+- **GPU decode engine** (`weightstream-gpu`) — real-checkpoint decode via
   unified-memory weight streaming from page-cache mmaps; tokens identical to
   the CPU engine (` Paris.`)
 - **Fused sparse-MLA attention** — TileLang split/merge kernels consume FP8
   sliding-window records and FP4 compressed records directly; valid window
   entries are packed into the kernel's prefix contract. The FP32 attention
-  path remains available as `FERROSEEK_SPARSE_FP32=1` for A/B checks.
-- **TP4 transport** (`ferroseek-transport`) — one-shot two-hop fp32
+  path remains available as `WEIGHTSTREAM_SPARSE_FP32=1` for A/B checks.
+- **TP4 transport** (`weightstream-transport`) — one-shot two-hop fp32
   all-reduce over the 4-node switchless RoCE ring, bit-exact on all ranks,
   ~10 µs/4 KB, zero packet loss in a 100k soak
-- **TP4 sharded decode** — `ferroseek decode --engine gpu --stream --tp4
+- **TP4 sharded decode** — `weightstream decode --engine gpu --stream --tp4
   --rank N --ring nodes-ring4.local.json`: per-rank slices (16 heads,
   96 experts, vocab shard) with all-reduces at the spec's three reduction
   points plus the logits all-gather
-- **TP4 M-batch prefill (opt-in)** — `FERROSEEK_MBATCH_PREFILL=1` enables
+- **TP4 M-batch prefill (opt-in)** — `WEIGHTSTREAM_MBATCH_PREFILL=1` enables
   TP-local `decode_m` batches; sequential prefill is the default until its
   real-checkpoint greedy-stream divergence is root-caused. The measured
   132-token A/B was 9.625 s vs 12.964 s sequential (25.8% faster).
@@ -44,13 +44,13 @@ output-identity checks pass.
   verification. Quantized M=1 decode is 13.29 tok/s on the C1 story;
   no-spec is faster at about 19 tok/s, so serving keeps speculation disabled.
   High-acceptance streaks use targeted-checkpoint M=5 verification; ordinary
-  calls remain sequential (`FERROSEEK_SEQ_SPEC=1` forces that fallback).
+  calls remain sequential (`WEIGHTSTREAM_SEQ_SPEC=1` forces that fallback).
 - **GLP-27 fold-site steering** — set `WEIGHTLESS_STEER_PATH` to a spec-v3
   `.pt` or `.gguf` vector, optionally `WEIGHTLESS_STEER_ALPHA`,
   `WEIGHTLESS_STEER_LAYERS`, and `WEIGHTLESS_STEER_HOOK=hc_fold_pre_engram`.
   CPU and TP4 GPU decode apply the same fold and companion attention-writer
   projection. Unset path disables steering.
-- **Serving** — `ferroseek serve --tp4 --ring ...`: OpenAI-compatible
+- **Serving** — `weightstream serve --tp4 --ring ...`: OpenAI-compatible
   endpoint on the head rank, SSE streaming, `temperature`/`top_p`/`seed`
   broadcast with `Phase::Next` so all ranks draw identically
 
@@ -74,13 +74,13 @@ rewriting mature matmul kernels.
 
 | path | what it is |
 |---|---|
-| `crates/ferroseek` | CLI front door (`info`, `weights`, `tokens`, `decode`, `serve`) |
-| `crates/ferroseek-core` | config, safetensors/mmap loader, quant primitives, KV sizing |
-| `crates/ferroseek-ref` | CPU reference decode engine (the numerics gate) |
-| `crates/ferroseek-cuda` | CUDA runtime + the 16 gated kernels (sm_121) |
-| `crates/ferroseek-gpu` | GPU decode engine + unified-memory streaming |
-| `crates/ferroseek-transport` | TP4 ring collectives (one-shot RoCE all-reduce) |
-| `crates/ferroseek-tokenizer` | HF tokenizer + engram compressed token map |
+| `crates/weightstream` | CLI front door (`info`, `weights`, `tokens`, `decode`, `serve`) |
+| `crates/weightstream-core` | config, safetensors/mmap loader, quant primitives, KV sizing |
+| `crates/weightstream-ref` | CPU reference decode engine (the numerics gate) |
+| `crates/weightstream-cuda` | CUDA runtime + the 16 gated kernels (sm_121) |
+| `crates/weightstream-gpu` | GPU decode engine + unified-memory streaming |
+| `crates/weightstream-transport` | TP4 ring collectives (one-shot RoCE all-reduce) |
+| `crates/weightstream-tokenizer` | HF tokenizer + engram compressed token map |
 | `docs/` | model-spec, architecture, kernels, streaming, transport |
 | `scripts/gate.py` | teacher-forced logit gate vs the serving stack |
 
@@ -99,16 +99,16 @@ cargo test                                  # host-only suite
 
 # on a DGX Spark:
 cargo build --release --features cuda
-cargo test --release -p ferroseek-cuda --features cuda
-cargo test --release -p ferroseek-gpu --features cuda -- --test-threads=1
+cargo test --release -p weightstream-cuda --features cuda
+cargo test --release -p weightstream-gpu --features cuda -- --test-threads=1
 
-./target/release/ferroseek decode /path/to/DeepSeek-V4.1-Flash-1017 \
+./target/release/weightstream decode /path/to/DeepSeek-V4.1-Flash-1017 \
     "The capital of France is" 6                 # CPU reference engine
-./target/release/ferroseek decode /path/to/DeepSeek-V4.1-Flash-1017 \
+./target/release/weightstream decode /path/to/DeepSeek-V4.1-Flash-1017 \
     "The capital of France is" 6 --engine gpu --stream
 
 # TP4: run on each node, replacing N with its rank (0, 1, 2, or 3):
-./target/release/ferroseek decode /path/to/DeepSeek-V4.1-Flash-1017 \
+./target/release/weightstream decode /path/to/DeepSeek-V4.1-Flash-1017 \
     "The capital of France is" 6 --engine gpu --tp4 --rank N \
     --ring nodes-ring4.local.json --no-spec
 ```

@@ -1,0 +1,222 @@
+//! Checkpoint loader: config + index + lazily-mmapped shards.
+//!
+//! Shards stay on disk until a tensor is requested; each shard is mmapped
+//! on first touch and its header parsed once. Payload slices are zero-copy
+//! borrows of the mapping — the GPU staging path reads straight from page
+//! cache.
+
+use crate::config::ModelConfig;
+use crate::safetensors::{self, ShardHeader, TensorMeta};
+use memmap2::Mmap;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+struct Shard {
+    header: ShardHeader,
+    mmap: Mmap,
+}
+
+pub struct Checkpoint {
+    pub dir: PathBuf,
+    pub config: ModelConfig,
+    index: BTreeMap<String, String>,
+    shards: BTreeMap<String, Shard>,
+}
+
+impl Checkpoint {
+    pub fn open(dir: &Path) -> std::io::Result<Self> {
+        let config = ModelConfig::from_file(&dir.join("config.json"))?;
+        let index = safetensors::parse_index(&dir.join("model.safetensors.index.json"))?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            config,
+            index,
+            shards: BTreeMap::new(),
+        })
+    }
+
+    pub fn tensor_names(&self) -> impl Iterator<Item = &String> {
+        self.index.keys()
+    }
+
+    fn shard(&mut self, name: &str) -> std::io::Result<&Shard> {
+        if !self.shards.contains_key(name) {
+            let path = self.dir.join(name);
+            let file = std::fs::File::open(&path)?;
+            let mmap = unsafe { Mmap::map(&file)? };
+            let header = safetensors::parse_header(&mut &mmap[..])?;
+            self.shards.insert(name.to_string(), Shard { header, mmap });
+        }
+        Ok(self.shards.get(name).unwrap())
+    }
+
+    pub fn meta(&mut self, tensor: &str) -> std::io::Result<TensorMeta> {
+        let shard = self
+            .index
+            .get(tensor)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, tensor))?
+            .clone();
+        let shard = self.shard(&shard)?;
+        shard.header.tensors.get(tensor).cloned().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{tensor} not in shard header"),
+            )
+        })
+    }
+
+    /// Zero-copy payload bytes for `tensor` (raw on-disk dtype).
+    pub fn bytes(&mut self, tensor: &str) -> std::io::Result<&[u8]> {
+        let shard_name = self
+            .index
+            .get(tensor)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, tensor))?
+            .clone();
+        let shard = self.shard(&shard_name)?;
+        let meta = shard.header.tensors.get(tensor).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{tensor} not in shard header"),
+            )
+        })?;
+        let start = shard.header.data_start + meta.data_offsets[0];
+        let end = shard.header.data_start + meta.data_offsets[1];
+        Ok(&shard.mmap[start as usize..end as usize])
+    }
+
+    /// Zero-copy payload bytes for two tensors at once (e.g. a quantized
+    /// weight and its scale tensor, which may live in different shards).
+    pub fn bytes2(&mut self, a: &str, b: &str) -> std::io::Result<(&[u8], &[u8])> {
+        let shard_a = self
+            .index
+            .get(a)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, a))?
+            .clone();
+        let shard_b = self
+            .index
+            .get(b)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, b))?
+            .clone();
+        // map both shards first (mutable), then take two immutable borrows
+        self.shard(&shard_a)?;
+        self.shard(&shard_b)?;
+        let bounds = |map: &BTreeMap<String, Shard>,
+                      shard: &str,
+                      name: &str|
+         -> std::io::Result<(usize, usize)> {
+            let shard = map
+                .get(shard)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, shard))?;
+            let meta = shard.header.tensors.get(name).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{name} not in shard header"),
+                )
+            })?;
+            Ok((
+                (shard.header.data_start + meta.data_offsets[0]) as usize,
+                (shard.header.data_start + meta.data_offsets[1]) as usize,
+            ))
+        };
+        let (sa, ea) = bounds(&self.shards, &shard_a, a)?;
+        let (sb, eb) = bounds(&self.shards, &shard_b, b)?;
+        let (a_slice, b_slice) = match (
+            &shard_a == &shard_b,
+            (&self.shards.get(&shard_a), &self.shards.get(&shard_b)),
+        ) {
+            (true, (Some(x), _)) => (&x.mmap[sa..ea], &x.mmap[sb..eb]),
+            (false, (Some(x), Some(y))) => (&x.mmap[sa..ea], &y.mmap[sb..eb]),
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "shard vanished",
+                ))
+            }
+        };
+        Ok((a_slice, b_slice))
+    }
+
+    /// Every mapped shard's full payload region as `(mmap_base, mmap_len,
+    /// shard_file)`, mapping all index shards first. For unified-memory
+    /// weight streaming (docs/streaming.md): the caller registers these
+    /// regions with `cudaHostRegister(…Mapped)` and hands kernels device
+    /// pointers into them. The mappings stay valid while the `Checkpoint`
+    /// is alive.
+    pub fn data_regions(&mut self) -> std::io::Result<Vec<(usize, usize, String)>> {
+        let names: std::collections::BTreeSet<String> = self.index.values().cloned().collect();
+        for n in &names {
+            self.shard(n)?;
+        }
+        Ok(self
+            .shards
+            .iter()
+            .map(|(name, shard)| (shard.mmap.as_ptr() as usize, shard.mmap.len(), name.clone()))
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kv::tests::fixture_json;
+
+    fn write_checkpoint(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("config.json"), fixture_json()).unwrap();
+        let hdr = serde_json::json!({
+            "embed.weight": {"dtype": "BF16", "shape": [4, 2], "data_offsets": [0, 16]}
+        });
+        let json = serde_json::to_vec(&hdr).unwrap();
+        let mut shard = (json.len() as u64).to_le_bytes().to_vec();
+        shard.extend_from_slice(&json);
+        shard.extend_from_slice(&[7u8; 16]);
+        std::fs::write(dir.join("model-00001-of-00001.safetensors"), &shard).unwrap();
+        let idx = serde_json::json!({
+            "metadata": {"total_size": 16},
+            "weight_map": {"embed.weight": "model-00001-of-00001.safetensors"}
+        });
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&idx).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn roundtrips_a_tensor() {
+        let dir = std::env::temp_dir().join(format!("weightstream-test-{}", std::process::id()));
+        write_checkpoint(&dir);
+        let mut ckpt = Checkpoint::open(&dir).unwrap();
+        let meta = ckpt.meta("embed.weight").unwrap();
+        assert_eq!(meta.dtype, "BF16");
+        assert_eq!(meta.shape, vec![4, 2]);
+        let bytes = ckpt.bytes("embed.weight").unwrap();
+        assert_eq!(bytes, &[7u8; 16]);
+        assert!(ckpt.meta("nope").is_err());
+
+        let regions = ckpt.data_regions().unwrap();
+        assert_eq!(regions.len(), 1);
+        let (base, len, name) = &regions[0];
+        assert_eq!(name, "model-00001-of-00001.safetensors");
+        assert_eq!(
+            *len,
+            std::fs::metadata(dir.join(name)).unwrap().len() as usize
+        );
+        // region base matches the shard payload: header json + 8-byte prefix
+        let meta = ckpt.meta("embed.weight").unwrap();
+        // the fixture writes the header inline; payload = 8-byte prefix +
+        // header json + data_offsets[0]
+        let offs = 8
+            + serde_json::to_vec(&serde_json::json!({
+                "embed.weight": {"dtype": "BF16", "shape": [4, 2], "data_offsets": [0, 16]}
+            }))
+            .unwrap()
+            .len()
+            + meta.data_offsets[0] as usize;
+        unsafe {
+            let byte = *((base + offs) as *const u8);
+            assert_eq!(byte, 7);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

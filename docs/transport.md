@@ -56,7 +56,7 @@ no channel setup per step.
 
 ## Milestones
 
-1. `ferroseek-transport`: ring discovery from nodes JSON, QP bring-up,
+1. `weightstream-transport`: ring discovery from nodes JSON, QP bring-up,
    ping/pong latency probe per link
 2. one-shot all-reduce + the bit-exact 4-rank gate
 3. wire into GpuModel behind a `tp4` feature: TP1 engine + all-reduces at
@@ -74,7 +74,7 @@ the collective no longer allocates a QP-key vector per call. A 2,000-iteration
 p99, with the bit-exact gate and zero packet loss. In-decode collectives are
 slower because they also wait for rank arrival skew; the isolated figure is
 not a per-token collective budget.
-3. done. `ferroseek decode --engine gpu --tp4 --rank N --ring
+3. done. `weightstream decode --engine gpu --tp4 --rank N --ring
 nodes-ring4.local.json` (upload mode, the production path since the
 DEVICEMAP registration ceiling was measured — see below) loads rank
 `N`'s slice (16 heads, 2 o-groups, 8 index heads, 96 experts, one
@@ -92,10 +92,10 @@ aborted rank 3 before the first collective. With that fix, a fresh
 real-checkpoint upload run completed on all four ranks (` Paris.`, 620
 collectives, 92.7–93.0 ms/token).
 4. done (2026-10-26). Two layers, both over one model load:
-   - `ferroseek decode --prompts-file`: batch requests from a file
+   - `weightstream decode --prompts-file`: batch requests from a file
      (CLI prompt first, one request per line), every rank in lockstep
      (verified: 3 requests, identical completions on all four ranks).
-   - `ferroseek serve`: the OpenAI-compatible endpoint on the head rank
+   - `weightstream serve`: the OpenAI-compatible endpoint on the head rank
      (std-only HTTP; POST /v1/completions and /v1/chat/completions,
      greedy, `stream:true` gives SSE token events). The head's decode
      owner broadcasts each request with `Phase::Next`; workers loop on

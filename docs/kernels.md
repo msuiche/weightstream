@@ -1,9 +1,9 @@
 # weightstream kernel plan
 
 Every kernel lands with the same gate: output compared against the pure-Rust
-CPU reference (`ferroseek-ref`) on identical inputs, tolerance policy per
+CPU reference (`weightstream-ref`) on identical inputs, tolerance policy per
 kernel below. Gates run on a DGX Spark via
-`cargo test -p ferroseek-cuda --features cuda`.
+`cargo test -p weightstream-cuda --features cuda`.
 
 Order is dependency order: later kernels reuse earlier ones' device buffers
 and conventions.
@@ -66,7 +66,7 @@ sequential — bit-exact (0.0) on every position AND on two further
 sequential continuation steps; wall 8.0 ms vs 13.9 ms (1.7x) on the
 `decode_prefill` uses the sequential loop by default because the real
 64-token story stream diverged from M-batch prefill even though the
-synthetic gate above is bit-exact. `FERROSEEK_MBATCH_PREFILL=1` opts into
+synthetic gate above is bit-exact. `WEIGHTSTREAM_MBATCH_PREFILL=1` opts into
 decode_m chunks for A/B; drafter-loaded models always use sequential
 prefill. TP4 is supported: local head/expert shapes, per-position
 index/attention/MoE all-reduces and the vocab all-gather. Sparse attention
@@ -83,7 +83,7 @@ For the real DS4.1F shape (16 local heads, head dimension 512), the default
 attention path uses `tilelang/sparse_mla_decode.cu`: a split kernel over FP8
 SWA records and FP4 compressed records, followed by the merge kernel with
 conjugate output RoPE and FP8 activation snapping. Set
-`FERROSEEK_SPARSE_FP32=1` to use the older FP32 gather/attention path for
+`WEIGHTSTREAM_SPARSE_FP32=1` to use the older FP32 gather/attention path for
 A/B debugging.
 
 The kernel's `SwaLengths` is a **valid-prefix length**, not a physical ring

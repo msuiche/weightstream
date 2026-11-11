@@ -31,7 +31,7 @@ cache holds the hot experts once the engine's access pattern settles.
 
 ## Design consequences
 
-- `ferroseek-gpu` gains a streaming weight mode: fp4 expert tables and fp8
+- `weightstream-gpu` gains a streaming weight mode: fp4 expert tables and fp8
   projections stay in registered shard mmaps; small hot tensors (norms,
   hc params, compressor state, gate, KV caches, scratch) are device
   allocations.
@@ -42,7 +42,7 @@ cache holds the hot experts once the engine's access pattern settles.
   gate earlier than needed — a one-layer-deep prefetch thread can fault
   those pages in ahead of the GEMM.
 
-## Implementation notes (ferroseek-gpu, measured on the first real run)
+## Implementation notes (weightstream-gpu, measured on the first real run)
 
 - `cuMemHostRegister` needs a current context (register after
   `Cuda::global()`), is serialized per process, and on this driver
@@ -50,13 +50,13 @@ cache holds the hot experts once the engine's access pattern settles.
   shard 19 of 48 fails with "range already mapped". The engine therefore
   registers each shard independently, tracks the registered ranges, and
   any tensor outside them silently falls back to a device upload
-  (`ferroseek-gpu/src/stream.rs`). Registration itself faults the range's
+  (`weightstream-gpu/src/stream.rs`). Registration itself faults the range's
   pages (~30 s per 10 GB shard, cold): a full 475 GB registration pass is
   a one-time per-process cost worth eliminating — register only the
   projections + engram tables (~340 GB of the 475 GB), or lazily
   per-shard on first touch.
 - Prefetch hook: the MoE gate readback in
-  `ferroseek-gpu/src/engine.rs::moe_step` is where each layer's top-6
+  `weightstream-gpu/src/engine.rs::moe_step` is where each layer's top-6
   expert page addresses become known; a background thread can
   `madvise(MADV_WILLNEED)`/read those 17.7 MB-per-expert ranges one
   layer ahead of the GEMMs (TODO(gpu-prefetch)).
@@ -69,7 +69,7 @@ cache holds the hot experts once the engine's access pattern settles.
   (use-after-unmap, not the primary failure). Same behavior at e834f0c
   and 2c381c7 — not the decode_m changes; the 2026-10-26 TP4 run used
   the same default cleanly, so the threshold is driver/RM-state
-  dependent, not a fixed ceiling. `FERROSEEK_STREAM_BUDGET_GB=24` runs
+  dependent, not a fixed ceiling. `WEIGHTSTREAM_STREAM_BUDGET_GB=24` runs
   the full single-node decode clean: load 18 s, prefill 8.3 s,
   1.5-2.3 s/token, ` Paris. The Eiffel`. Treat 96 GB as suspect until
   the ceiling is bisected. GPU clocks were locked to 2418 MHz

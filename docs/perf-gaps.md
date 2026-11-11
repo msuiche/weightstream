@@ -75,7 +75,7 @@ driver: `/tmp/tp4-c1-dspark-spark-*.log`.
 - **Clean-build discipline is required on the ring.** Mixed lockfiles and
   stale CUDA artifacts produced `misaligned address` in single-node prefill
   and divergent TP4 output. A full source/lockfile sync plus
-  `cargo clean --release -p ferroseek-cuda -p ferroseek-gpu -p ferroseek`
+  `cargo clean --release -p weightstream-cuda -p weightstream-gpu -p weightstream`
   restored the known-answer single-node stream (` Paris. The Eiffel`) and
   identical TP4 output. Use `cargo build --release --features cuda --locked`
   on every rank and never compare binaries from mixed workspace states.
@@ -155,13 +155,13 @@ driver: `/tmp/tp4-c1-dspark-spark-*.log`.
 - **M-batch prefill is now opt-in.** A 64-token story diverged between
   M-batch-prefill no-spec and sequential-prefill DSpark. Use sequential
   prefill by default so speculation and no-spec share the same target
-  state; `FERROSEEK_MBATCH_PREFILL=1` enables the faster experimental path
+  state; `WEIGHTSTREAM_MBATCH_PREFILL=1` enables the faster experimental path
   for A/B. This does not affect steady-state decode throughput.
 - **Offline M-batch selection fix (GPU validation pending).**
   `attention_step_m` now passes the valid selection length instead of always
   processing `window + index_topk` entries. The tail was already -1-padded,
   so this skips only invalid work and directly targets the slow M=5
-  verification path. `cargo check -p ferroseek-gpu` passes; no timing or GPU
+  verification path. `cargo check -p weightstream-gpu` passes; no timing or GPU
   correctness claim is made while the ring is offline.
 - **TMA tensor-map caching (GPU validation pending).** Grouped MoE layers now
   encode each weight's tensor map once at upload instead of 120 times per
@@ -229,13 +229,13 @@ driver: `/tmp/tp4-c1-dspark-spark-*.log`.
   variant that overlapped the norm used 256 threads per dot CTA and regressed
   to about 60 ms/token. Fused Q-A/WKV and combined shared gate/up projections
   preserved the stream but were performance-neutral. All three were reverted.
-- **Build note:** `cargo clean -p ferroseek-cuda` without `--release` removed
-  nothing useful; use `cargo clean -p ferroseek-cuda --release` when forcing
+- **Build note:** `cargo clean -p weightstream-cuda` without `--release` removed
+  nothing useful; use `cargo clean -p weightstream-cuda --release` when forcing
   a kernel rebuild. Normal builds were otherwise reliable.
 
 TP4 M-batch prefill measured separately on the same checkpoint: a
 132-token window-crossing prompt took 9.625 s versus 12.964 s with
-`FERROSEEK_SEQ_PREFILL=1`, a 25.8% reduction. All four ranks produced
+`WEIGHTSTREAM_SEQ_PREFILL=1`, a 25.8% reduction. All four ranks produced
 `The capital of Japan`. Logs: `spark-*:/tmp/tp4-shortwin-rank{0..3}.log`
 (M-batch) and `spark-*:/tmp/tp4-shortseq-rank{0..3}.log` (sequential).
 
@@ -251,7 +251,7 @@ TP4 M-batch prefill measured separately on the same checkpoint: a
 weightstream data points:
 
 - 2026-10-30, `spark-4687`, single-node `--engine gpu --stream`,
-  `FERROSEEK_STREAM_BUDGET_GB=24`, clocks locked 2418 MHz (diagnostic):
+  `WEIGHTSTREAM_STREAM_BUDGET_GB=24`, clocks locked 2418 MHz (diagnostic):
   load 18.3 s, prefill 5 tok in 8.3 s, decode 1.5–2.3 s/tok, output
   ` Paris. The Eiffel` — correct. Real runs at the thermal cap are
   slower.
@@ -288,7 +288,7 @@ Multiplicative, ordered by impact:
 6. **Separate bug class: 96 GB registration budget → RM pathology.**
    Default budget wedges single-node streaming (RM `irq 429` storms,
    minutes-long expert stalls; teardown Xid 31 is an artifact, not the
-   cause). Workaround: `FERROSEEK_STREAM_BUDGET_GB=24`. Reproduced at
+   cause). Workaround: `WEIGHTSTREAM_STREAM_BUDGET_GB=24`. Reproduced at
    e834f0c and HEAD — not a decode_m regression. Full writeup:
    `docs/streaming.md` (2026-10-30 note). Ceiling unbisected.
 
@@ -302,12 +302,12 @@ Multiplicative, ordered by impact:
 3. **P1 — batching** (multi-request per lockstep step) and
    prefix-cache reuse on the serving path.
 4. **P2 — bisect the registration-budget ceiling** (24 GB clean,
-   96 GB wedges) to retune the `FERROSEEK_STREAM_BUDGET_GB` default.
+   96 GB wedges) to retune the `WEIGHTSTREAM_STREAM_BUDGET_GB` default.
 
 ## Already verified — do not redo
 
 - Synthetic GPU suite 29/29 on `spark-4687` (2026-11-01):
-  `cargo test --release -p ferroseek-gpu --features cuda -- --test-threads=1`.
+  `cargo test --release -p weightstream-gpu --features cuda -- --test-threads=1`.
 - Real-checkpoint streaming decode (above) — known-answer green.
 - Ring transport: 10.5 µs p50 4 KB all-reduce, zero loss in 100k soak
   (`docs/transport.md`).
@@ -318,38 +318,38 @@ Multiplicative, ordered by impact:
 
 ## Repro commands
 
-(spark-4687, `~/ferroseek`; binary `target/release/ferroseek` rebuilt
+(spark-4687, `~/weightstream`; binary `target/release/weightstream` rebuilt
 2026-10-31 with cuda; toolchain `~/.cargo/bin/cargo`,
 `/usr/local/cuda/bin/nvcc`)
 
 ```bash
 # build
-cargo build --release --features ferroseek/cuda
+cargo build --release --features weightstream/cuda
 
 # real-checkpoint streaming validation (the green config)
 S=~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170
-FERROSEEK_STREAM_BUDGET_GB=24 ./target/release/ferroseek decode "$S" \
+WEIGHTSTREAM_STREAM_BUDGET_GB=24 ./target/release/weightstream decode "$S" \
   "The capital of France is" 6 --engine gpu --stream
 # expect: " Paris. The Eiffel"
 
 # TP4 upload validation: per rank
-./target/release/ferroseek decode "$S" "The capital of France is" 6 \
+./target/release/weightstream decode "$S" "The capital of France is" 6 \
   --engine gpu --tp4 --rank N --ring nodes-ring4.local.json
 ```
 
-Env knobs: `FERROSEEK_STREAM_BUDGET_GB` (registration budget, default
-96, 0 = off), `FERROSEEK_PROF=1` (per-section decode profiler, prints
-at exit), `FERROSEEK_DUMP_GPU=<dir>` (per-layer/op tensor dumps),
-`FERROSEEK_MBATCH_PREFILL=1` (opt into M-batch prefill; sequential is the
+Env knobs: `WEIGHTSTREAM_STREAM_BUDGET_GB` (registration budget, default
+96, 0 = off), `WEIGHTSTREAM_PROF=1` (per-section decode profiler, prints
+at exit), `WEIGHTSTREAM_DUMP_GPU=<dir>` (per-layer/op tensor dumps),
+`WEIGHTSTREAM_MBATCH_PREFILL=1` (opt into M-batch prefill; sequential is the
 correctness default).
 
 ## Key code locations
 
-- `crates/ferroseek-gpu/src/engine.rs` — `moe_step` (host-dispatch
+- `crates/weightstream-gpu/src/engine.rs` — `moe_step` (host-dispatch
   loop + `dump_u8` expert staging probes), `moe_step_m` (M-batch),
   grouped path behind `layer.w1_all`, `W8`/`Q4` staging (~line 359),
   `decode_m` (~line 3581), `decode_prefill` fallback (~line 1460).
-- `crates/ferroseek-gpu/src/stream.rs` — `HostArena` registration /
+- `crates/weightstream-gpu/src/stream.rs` — `HostArena` registration /
   prefault / `device_ptr`, `PinnedBuf` staging.
 - `docs/streaming.md` — bandwidth table (226/163/37 GB/s), budget
   pathology note. `docs/transport.md` — milestones, upload-vs-stream

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Numerics gate: teacher-forced logit comparison, ferroseek vs serving stack.
+"""Numerics gate: teacher-forced logit comparison, weightstream vs serving stack.
 
 For each prompt: the vLLM endpoint greedy-completes it; the full sequence
 (prompt + completion) is then teacher-forced through BOTH engines and the
@@ -61,12 +61,12 @@ def vllm_prompt_logprobs(endpoint, model, text):
     return r["choices"][0]["prompt_logprobs"]
 
 
-def ferroseek_logprobs(ferroseek, model_dir, text):
+def weightstream_logprobs(weightstream, model_dir, text):
     out = subprocess.run(
-        [ferroseek, "decode", model_dir, text, "1", "--logits-out", "/tmp/fs-logits.json"],
+        [weightstream, "decode", model_dir, text, "1", "--logits-out", "/tmp/fs-logits.json"],
         capture_output=True, text=True, timeout=7200)
     if out.returncode != 0:
-        raise RuntimeError(f"ferroseek failed: {out.stderr[-400:]}")
+        raise RuntimeError(f"weightstream failed: {out.stderr[-400:]}")
     with open("/tmp/fs-logits.json") as f:
         return json.load(f)
 
@@ -76,9 +76,9 @@ def main() -> int:
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--endpoint", required=True)
     ap.add_argument("--model", default="deepseek-v4.1-flash")
-    ap.add_argument("--ferroseek", default="./target/release/ferroseek")
+    ap.add_argument("--weightstream", default="./target/release/weightstream")
     ap.add_argument("--max-tokens", type=int, default=6)
-    ap.add_argument("--tokenizer", required=True, help="model dir for ferroseek tokens")
+    ap.add_argument("--tokenizer", required=True, help="model dir for weightstream tokens")
     args = ap.parse_args()
 
     failed = 0
@@ -86,14 +86,14 @@ def main() -> int:
         completion = vllm_completion(args.endpoint, args.model, prompt, args.max_tokens)
         full = prompt + completion
 
-        # vLLM token ids for the full sequence, via ferroseek's tokenizer
+        # vLLM token ids for the full sequence, via weightstream's tokenizer
         ids_out = subprocess.run(
-            [args.ferroseek, "tokens", args.tokenizer, full],
+            [args.weightstream, "tokens", args.tokenizer, full],
             capture_output=True, text=True, check=True).stdout
         ids = json.loads(ids_out.splitlines()[0])
 
         ref = vllm_prompt_logprobs(args.endpoint, args.model, full)
-        fs = {r["pos"]: r for r in ferroseek_logprobs(args.ferroseek, args.model_dir, full)}
+        fs = {r["pos"]: r for r in weightstream_logprobs(args.weightstream, args.model_dir, full)}
 
         worst = 0.0
         top1_diff = 0

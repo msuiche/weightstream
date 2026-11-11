@@ -1,11 +1,11 @@
 """Synthetic bisection: run the reference model.py forward on the synthetic
-mini-model dumped by ferroseek-ref's dump-synth binary, then write the same
+mini-model dumped by weightstream-ref's dump-synth binary, then write the same
 per-layer per-position stream files with a `py_` prefix for comparison.
 
 Usage (inside the reference container, model.py reachable):
     REF_DIR=/bisect/ref OUT=/bisect/out python3 run_ref.py
 
-Assumptions baked in (see crates/ferroseek-ref/src/bin/dump-synth.rs):
+Assumptions baked in (see crates/weightstream-ref/src/bin/dump-synth.rs):
 - TP1, bf16 torch default dtype, args.dtype "fp8" / expert_dtype "fp4"
 - identity compressed token map (synthetic vocab == engram compressed vocab)
 - one prefill chunk over the whole token list; per-token outputs equal

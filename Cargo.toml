@@ -1,19 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/ferroseek",
-    "crates/ferroseek-core",
-    "crates/ferroseek-cuda",
-    "crates/ferroseek-gpu",
-    "crates/ferroseek-ref",
-    "crates/ferroseek-tokenizer",
-    "crates/ferroseek-transport",
+    "crates/weightstream",
+    "crates/weightstream-core",
+    "crates/weightstream-cuda",
+    "crates/weightstream-gpu",
+    "crates/weightstream-ref",
+    "crates/weightstream-tokenizer",
+    "crates/weightstream-transport",
 ]
 
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/msuiche/ferroseek"
+repository = "https://github.com/msuiche/weightstream"
 
 [profile.release]
 lto = "thin"

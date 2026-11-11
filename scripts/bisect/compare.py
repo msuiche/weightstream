@@ -1,4 +1,4 @@
-"""Compare the ferroseek-ref (rust) and model.py (py) per-layer dumps.
+"""Compare the weightstream-ref (rust) and model.py (py) per-layer dumps.
 
 Pairs every `*.f32` / `*.i32` dump with its `py_` counterpart (raw
 little-endian) and reports max-abs and relative-L2 differences per file.
