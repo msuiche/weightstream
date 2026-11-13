@@ -127,6 +127,33 @@ driver: `/tmp/tp4-c1-dspark-spark-*.log`.
   expert on the auxiliary stream before grouped dispatch contends with W3,
   raises MoE from ~21 to ~26 ms, and does not improve steady token latency
   (~52.4 ms). The shared expert remains overlapped only with host all-reduce.
+- **FFN CUDA graphs (2026-11-13, implemented; first TP4 attempt exposed a
+  boundary mistake).** `GraphExec` in `weightstream-cuda/src/gpu.rs` plus
+  `WEIGHTSTREAM_CUDA_GRAPHS=1` capture one FFN graph per
+  `(layer, position slot)`: FFN HC block → `hc_pre` → `rmsnorm`, ending
+  before the grouped MoE. Host collectives stay outside the graph;
+  `reset()` clears captures; dump, streaming, drafter capture, and position
+  0 never capture. The previous neutral experiment was structurally
+  different: three tiny graphs per layer (attention, fold, MoE), so graph
+  launches ate the launch savings and the TP4/`w1_tl` gate missed `w1_all`.
+  Two corrections came from the first real TP4 run:
+  1. **Graph boundary cannot include `moe_grouped_tl_step`** because its
+     dual-stream event (`main → aux → main`) is not capturable with the
+     legacy default stream; the first attempt panicked in
+     `act_quant_fp8_emit` with `UnknownError` while capture was active.
+     The FFN preamble graph is the safe region.
+  2. **Grouped MoE slabs exist only at world_size == 4**, so a TP1 synthetic
+     gate cannot exercise the graph path. A synthetic `gpu_cuda_graph_replay_matches_eager`
+     test that expected graphs on TP1 was wrong and has been removed; TP4 is
+     the only configuration that can validate this feature. The full suite
+     still passes 32/32.
+  **Verdict: reverted.** The first graph replay on the real checkpoint
+  completed but produced ` not the` instead of ` Paris.` on every rank,
+  so the captured FFN preamble changed model state. The graph code was
+  removed completely; full suite passes 32/32 and the four-rank known-answer
+  run after the revert produced ` Paris.` identically on all four ranks
+  (steady token ~59.35 ms). Do not retry without a graph-aware
+  position/state invariant proof.
 - **Rejected performance variants.** Shared-expert TP4 sharding reached
   ~50 ms/token but changed the story by changing reduction order and was
   reverted. L2 next-layer prefetch was neutral/slightly worse and removed.
@@ -291,6 +318,18 @@ Multiplicative, ordered by impact:
    cause). Workaround: `WEIGHTSTREAM_STREAM_BUDGET_GB=24`. Reproduced at
    e834f0c and HEAD — not a decode_m regression. Full writeup:
    `docs/streaming.md` (2026-10-30 note). Ceiling unbisected.
+7. **Reference-stack configuration drift (measured 2026-11-12).** The live
+   vLLM endpoint was NOT the promoted GLP-27 setup: it ran
+   `vllm-ds41f-trace:latest` with `--enforce-eager`, no
+   `--speculative-config` (DSpark off), a different DSpark cost dir, and
+   `VLLM_SINK_REJECTION=0`. Direct streaming measurement gave **13.14 tok/s
+   C1** and **182.41 tok/s C16 aggregate**, versus 58.64/215.94 for the
+   promoted setup — a 4.46× C1 regression explained by eager execution and
+   missing speculation. Restoring the promoted profile is itself blocked:
+   the current `config/cluster.json` points at unpublished commit
+   `fa8a2ad3` and a missing GLP-39 steering file. Lesson: before any
+   cross-stack comparison, run the live-identity doctor and refuse
+   mismatched deployments, exactly as `bin/spark bench` already does.
 
 ## Current blockers (priority order)
 
@@ -298,7 +337,9 @@ Multiplicative, ordered by impact:
    host-dispatch loop; gate already lives on-device. Also unlocks
    `decode_m` (M-batch prefill) in streaming/TP — it currently declines
    and falls back to sequential per-token decode.
-2. **P1 — CUDA graphs for the decode step.**
+2. **P1 — CUDA graphs for the decode step.** FFN-region graphs are
+   implemented behind `WEIGHTSTREAM_CUDA_GRAPHS=1`; validation and timing
+   need a drained ring (see the 2026-11-13 experiment-log entry and gap #7).
 3. **P1 — batching** (multi-request per lockstep step) and
    prefix-cache reuse on the serving path.
 4. **P2 — bisect the registration-budget ceiling** (24 GB clean,
