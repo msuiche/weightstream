@@ -117,6 +117,15 @@ worse than eager (~16.85 tok/s). The pair knob was removed after measurement;
 the default `spec_accept >= 5` gate remains. DSpark batching is now rejected
 at both 2 and 5 drafts on this hardware/config.
 
+**Attention-side investigation (2026-11-13):** with the ring drained, a
+12-token eager story profile on all four ranks showed attention remains the
+largest wall cost: **30.2–50.3 ms/step** by rank, versus MoE **20.7–21.5 ms**.
+The output tail is strictly dependent (`sparse_mla_decode → wo_a →
+emit8_packed → wo_b`), and the `wo_b` all-reduce is consumed immediately by
+`hc_post`, so overlapping it would change model state. No safe small
+attention overlap was implemented. The next attention win needs kernel
+fusion or a collective-schedule redesign, not another launch-order variant.
+
 **Measured on a drained ring (2026-11-13):** DSpark on the dragon prompt
 emitted 12 tokens in **1,274 ms (~9.42 tok/s)**. Acceptance pattern:
 `1,1,1,1,1,1,3,2,1`; only two of nine steps accepted multiple drafts, so the
