@@ -93,6 +93,30 @@ fallback, and batch verification is **not viable** until the M-batch
 attention/indexer path gets much cheaper or acceptance is substantially
 higher. CUDA suite passes 32/32 after the revert.
 
+**Next-step decision (2026-11-13):** do **not** retry CUDA graphs now and do
+**not** use the full five-draft `decode_m` verifier. The architecture
+comparison with `basetenlabs/deepseek-ultrafast` shows why it wins: its
+normal speculative step verifies a draft block through the same fast forward
+path and only then wraps it in a graph. Our `decode_m` path is a separate
+expensive M-batch path, so batching costs more than it saves. The next
+highest-confidence experiment is a **2-draft verification path** that uses
+the existing `decode_m` machinery only for pairs, because the measured
+acceptance pattern sometimes reaches 2–3 tokens/step but full five-draft
+batching is unambiguously slower. If 2-draft verification still loses to
+sequential DSpark and eager, leave speculation disabled for serving and
+pursue attention/step-cost work instead.
+
+**2-draft verification measured and rejected (2026-11-13):**
+`WEIGHTSTREAM_SPEC_PAIR=1` used `decode_m` only for pairs and preserved the
+same snapshot/rollback boundary. Four-rank output identity passed
+(` who hasisas (... I'm not sure what you mean`), but C1 remained slower than
+sequential DSpark: **12 tokens in ~2.0 s (~5.98 tok/s)** versus **1.27 s
+(~9.42 tok/s)**, with 3,719 collectives versus 2,061. It is better than the
+full five-draft batch (~4.07 tok/s) but still worse than sequential and far
+worse than eager (~16.85 tok/s). The pair knob was removed after measurement;
+the default `spec_accept >= 5` gate remains. DSpark batching is now rejected
+at both 2 and 5 drafts on this hardware/config.
+
 **Measured on a drained ring (2026-11-13):** DSpark on the dragon prompt
 emitted 12 tokens in **1,274 ms (~9.42 tok/s)**. Acceptance pattern:
 `1,1,1,1,1,1,3,2,1`; only two of nine steps accepted multiple drafts, so the
