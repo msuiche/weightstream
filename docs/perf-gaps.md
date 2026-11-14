@@ -143,7 +143,12 @@ to compute multiple outputs, changing every output's reduction order.
 Keeping the existing 256-thread-per-output geometry leaves no block-local
 32-value group to quantize. Therefore exact-preserving fusion is impossible
 without accepting a new reduction order and a new numerics gate. This is a
-larger kernel project, not a safe optimization step.
+larger kernel project, not a safe optimization step. The follow-on numerics
+review found the harder blocker: `fp8_wo_a_gemv` is gated **bit-exact**
+against the BF16 path, so any new reduction order fails the project's
+correctness contract. Weakening that gate to tolerance only to win speed is
+not allowed. Fused attention output-tail work is therefore closed, not just
+blocked.
 
 **wo_b collective inspection (2026-11-13):** the attention `wo_b`
 all-reduce cannot reuse the MoE overlap trick. MoE overlaps the host
