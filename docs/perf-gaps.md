@@ -152,6 +152,29 @@ memory and changes the core engine design. Serving therefore remains
 sequential by design; this is an architectural boundary, not an
 implementation oversight.
 
+## Decision boundary (2026-11-13)
+
+All small optimization directions measured this session are now closed:
+
+- CUDA graphs: attempted twice, neutral or wrong-output; fully reverted.
+- DSpark batched verification: rejected at two and five drafts.
+- Attention/collective overlap: structurally unsafe.
+- Independent request batching: requires per-request engine state and a new
+  scheduler.
+
+The project therefore needs an explicit architectural choice before more
+work:
+
+1. **Serving throughput:** build a new multi-request engine/serving
+   architecture, or use the reference vLLM stack for aggregate traffic.
+2. **Single-stream latency:** undertake a real attention/kernel redesign,
+   not another overlap/gate variant.
+3. **Speculation:** revisit only after a cheaper verification architecture
+   and substantially higher acceptance exist.
+
+Until one of those is chosen, the correct serving configuration remains
+eager/no-spec; serving keeps speculation disabled.
+
 **Measured on a drained ring (2026-11-13):** DSpark on the dragon prompt
 emitted 12 tokens in **1,274 ms (~9.42 tok/s)**. Acceptance pattern:
 `1,1,1,1,1,1,3,2,1`; only two of nine steps accepted multiple drafts, so the
@@ -406,7 +429,10 @@ Multiplicative, ordered by impact:
    unreachable with per-op launch+sync. Needs step capture/replay.
 4. **No batching.** m=1 everywhere in the measured paths; the original
    scales C1→C16 (98→465 t/s aggregate). Serving exists (OpenAI
-   endpoint, SSE, sampling) but is one-request lockstep by design.
+   endpoint, SSE, sampling) but is one-request lockstep by design. The
+   2026-11-13 review closed this as an architectural boundary: independent
+   request batching requires per-request engine state and a new scheduler;
+   it is not an incremental optimization (see Aggregate batching inspection).
 5. **Not a factor: clocks.** Both stacks measured under the same
    thermal cap.
 6. **Separate bug class: 96 GB registration budget → RM pathology.**
