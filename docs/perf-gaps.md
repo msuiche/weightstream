@@ -136,6 +136,15 @@ Only removing the final HtoD is possible, but that saves a small copy and
 does not address collective latency, while complicating GLP/dump semantics.
 No code change was made.
 
+**Aggregate batching inspection (2026-11-13):** serving is one request at a
+time by design because TP4 is lockstep — every rank decodes the same
+request at the same step. `decode_m` batches **multiple tokens from one
+sequence**, not multiple independent requests: it has one KV state, one
+prompt prefix, and one position vector per engine instance. Independent
+C16 requests need per-request caches/positions and a scheduler that can
+advance only requests whose states are compatible. There is no safe
+incremental change here; a real batching design must be explicit.
+
 **Measured on a drained ring (2026-11-13):** DSpark on the dragon prompt
 emitted 12 tokens in **1,274 ms (~9.42 tok/s)**. Acceptance pattern:
 `1,1,1,1,1,1,3,2,1`; only two of nine steps accepted multiple drafts, so the
