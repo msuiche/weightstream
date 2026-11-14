@@ -143,7 +143,14 @@ sequence**, not multiple independent requests: it has one KV state, one
 prompt prefix, and one position vector per engine instance. Independent
 C16 requests need per-request caches/positions and a scheduler that can
 advance only requests whose states are compatible. There is no safe
-incremental change here; a real batching design must be explicit.
+incremental change here; a real batching design must be explicit. The
+2026-11-13 review also found that independent-request batching cannot reuse
+the current TP4 engine state: each request owns KV caches, logits, and
+positions on device, while upload-mode TP4 already dedicates those buffers
+to one sequence. Cloning them per request is infeasible within current
+memory and changes the core engine design. Serving therefore remains
+sequential by design; this is an architectural boundary, not an
+implementation oversight.
 
 **Measured on a drained ring (2026-11-13):** DSpark on the dragon prompt
 emitted 12 tokens in **1,274 ms (~9.42 tok/s)**. Acceptance pattern:
