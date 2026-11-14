@@ -64,6 +64,44 @@ the trained drafter (64 Italy tokens, 7.137 s, mean 111.509 ms/token), versus
 Target verification is sequential; no speedup is claimed. Raw logs on the
 driver: `/tmp/tp4-c1-dspark-spark-*.log`.
 
+### Speculative-decode note (2026-11-13)
+
+The current engine implements DSpark but the speedup path is disabled by
+acceptance gating: `speculate` runs `decode(anchor)`, drafts five tokens,
+then **only uses `decode_m` batch verification when the previous step had
+`spec_accept >= 5`** (all five drafts accepted). Otherwise it verifies
+drafts one-by-one with sequential `decode` calls. `WEIGHTSTREAM_SEQ_SPEC=1`
+forces the sequential fallback. This is why DSpark is slower than no-spec
+(8.97 tok/s vs 10.24 measured 2026-10-31): ordinary steps never reach the
+batched fast path, and a rejection costs the whole anchor step plus every
+verified draft. The baseten `deepseek-ultrafast` project shows the intended
+shape: 7-token draft blocks + anchor verified as an 8-row batch inside one
+CUDA graph, yielding ~5.6 accepted tokens/step. Before any graph work, our
+goal is batched verification with a correct rollback boundary, not launch
+overhead.
+
+**Gate fix measured and reverted (2026-11-13):** the fast path already
+existed in `GpuModel::speculate`, but was gated on `spec_accept >= 5`, which
+requires the previous step to accept all five drafts. I changed the gate to
+use `decode_m(batch)` whenever at least two drafts fit, preserving the
+snapshot/rollback boundary. The four-rank real-checkpoint result was
+**slower, not faster**: 12 tokens in ~2.95 s (~4.07 tok/s), versus 1.27 s
+(~9.42 tok/s) sequential. `decode_m` costs ~240–370 ms per speculative step
+and ring collectives rose from 2,061 to 6,551. Acceptance did not improve.
+The gate is reverted; `WEIGHTSTREAM_SEQ_SPEC=1` remains the sequential
+fallback, and batch verification is **not viable** until the M-batch
+attention/indexer path gets much cheaper or acceptance is substantially
+higher. CUDA suite passes 32/32 after the revert.
+
+**Measured on a drained ring (2026-11-13):** DSpark on the dragon prompt
+emitted 12 tokens in **1,274 ms (~9.42 tok/s)**. Acceptance pattern:
+`1,1,1,1,1,1,3,2,1`; only two of nine steps accepted multiple drafts, so the
+`spec_accept >= 5` batch gate never triggers. Rank 0 profiler over 21
+speculative steps: attention 31.9 ms, MoE 23.8 ms, gate 0.5 ms, Engram 3.3 ms,
+head 1.7 ms. The sequential verify path makes DSpark a clear C1 regression
+versus the same eager decoder's ~59 ms/token. Output remained identical on all
+four ranks: ` who hasisas (... I'm not sure what you mean`.
+
 ## Experiment log (2026-11-01) — do not duplicate blindly
 
 - **Production mHC (`eb15ef9`) is rejected (2026-11-09).** Its
