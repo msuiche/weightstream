@@ -126,6 +126,14 @@ emit8_packed → wo_b`), and the `wo_b` all-reduce is consumed immediately by
 attention overlap was implemented. The next attention win needs kernel
 fusion or a collective-schedule redesign, not another launch-order variant.
 
+**Fused attention tail design rejected before build (2026-11-13):** fusing
+`fp8_wo_a_gemv` with `emit8_packed` is not a safe incremental patch. The
+GEMV uses 256-thread block reductions per output; emit8 uses one 32-thread
+block per 32-value group. A naive merged kernel either changes dot-product
+accumulation order or cannot see the whole 32-value group. A correct fused
+kernel needs a warp/sub-warp-aware redesign and a new numerics proof, not a
+quick merge. The sketch was removed before build; no code change remains.
+
 **wo_b collective inspection (2026-11-13):** the attention `wo_b`
 all-reduce cannot reuse the MoE overlap trick. MoE overlaps the host
 all-reduce with the independent shared expert; attention has no independent
