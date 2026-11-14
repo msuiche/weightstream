@@ -134,6 +134,17 @@ accumulation order or cannot see the whole 32-value group. A correct fused
 kernel needs a warp/sub-warp-aware redesign and a new numerics proof, not a
 quick merge. The sketch was removed before build; no code change remains.
 
+**Exact-preserving fusion proof (2026-11-13):** a fused `wo_a + emit8`
+kernel cannot preserve the existing dot-product order and also quantize a
+32-value group. The current GEMV uses one 256-thread block per output; each
+thread adds columns strided by 256 and `block_reduce_sum` defines the exact
+accumulation tree. A fused 32-output block would need each warp/sub-block
+to compute multiple outputs, changing every output's reduction order.
+Keeping the existing 256-thread-per-output geometry leaves no block-local
+32-value group to quantize. Therefore exact-preserving fusion is impossible
+without accepting a new reduction order and a new numerics gate. This is a
+larger kernel project, not a safe optimization step.
+
 **wo_b collective inspection (2026-11-13):** the attention `wo_b`
 all-reduce cannot reuse the MoE overlap trick. MoE overlaps the host
 all-reduce with the independent shared expert; attention has no independent
