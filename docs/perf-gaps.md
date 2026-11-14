@@ -126,6 +126,16 @@ emit8_packed → wo_b`), and the `wo_b` all-reduce is consumed immediately by
 attention overlap was implemented. The next attention win needs kernel
 fusion or a collective-schedule redesign, not another launch-order variant.
 
+**wo_b collective inspection (2026-11-13):** the attention `wo_b`
+all-reduce cannot reuse the MoE overlap trick. MoE overlaps the host
+all-reduce with the independent shared expert; attention has no independent
+compute after `wo_b` — the reduced value is consumed immediately by
+`hc_post`, and the FFN HC block depends on that post value. An async
+`wo_b` overlap would therefore change state scheduling, not just timing.
+Only removing the final HtoD is possible, but that saves a small copy and
+does not address collective latency, while complicating GLP/dump semantics.
+No code change was made.
+
 **Measured on a drained ring (2026-11-13):** DSpark on the dragon prompt
 emitted 12 tokens in **1,274 ms (~9.42 tok/s)**. Acceptance pattern:
 `1,1,1,1,1,1,3,2,1`; only two of nine steps accepted multiple drafts, so the
